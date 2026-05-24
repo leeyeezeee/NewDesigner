@@ -10,6 +10,7 @@ import copy
 from GDesigner.graph.graph import Graph
 from experiments.accuracy import Accuracy
 from GDesigner.utils.globals import Cost, PromptTokens, CompletionTokens
+from GDesigner.utils.uncertainty import answer_uncertainty, uncertainty_adjusted_utility
 
 async def train(graph:Graph,
             dataset,
@@ -17,6 +18,7 @@ async def train(graph:Graph,
             num_rounds:int=1,
             lr:float=0.1,
             batch_size:int = 4,
+            uncertainty_lambda: float = 0.0,
           ) -> None:
     
     def infinite_data_loader() -> Iterator[pd.DataFrame]:
@@ -28,18 +30,20 @@ async def train(graph:Graph,
     
     loader = infinite_data_loader()
     
-    optimizer = torch.optim.Adam(graph.gcn.parameters(), lr=lr)    
+    optimizer = torch.optim.Adam(list(graph.gcn.parameters()) + list(graph.mlp.parameters()), lr=lr)
     graph.gcn.train()
     for i_iter in range(num_iters):
         print(f"Iter {i_iter}", 80*'-')
         start_ts = time.time()
         correct_answers = []
         answer_log_probs = []
+        realized_graphs = []
 
         for i_record, record in zip(range(batch_size), loader):
             realized_graph = copy.deepcopy(graph)
             realized_graph.gcn = graph.gcn
             realized_graph.mlp = graph.mlp
+            realized_graphs.append(realized_graph)
             input_dict = dataset.record_to_input(record)
             print(input_dict)
             answer_log_probs.append(asyncio.create_task(realized_graph.arun(input_dict,num_rounds)))
@@ -52,18 +56,22 @@ async def train(graph:Graph,
         utilities: List[float] = []
         answers: List[str] = []
         
-        for raw_answer, log_prob, correct_answer in zip(raw_answers, log_probs, correct_answers):
+        for raw_answer, log_prob, correct_answer, realized_graph in zip(raw_answers, log_probs, correct_answers, realized_graphs):
             answer = dataset.postprocess_answer(raw_answer)
             answers.append(answer)
             assert isinstance(correct_answer, str), \
                     f"String expected but got {correct_answer} of type {type(correct_answer)} (1)"
             accuracy = Accuracy()
             accuracy.update(answer, correct_answer)
-            utility = accuracy.get()
+            correctness_reward = accuracy.get()
+            agent_outputs = [node.outputs[-1] for node in realized_graph.nodes.values() if len(node.outputs)]
+            uncertainty, uncertainty_labels = answer_uncertainty(agent_outputs, dataset.postprocess_answer)
+            utility = uncertainty_adjusted_utility(correctness_reward, uncertainty, uncertainty_lambda)
             utilities.append(utility)
             single_loss = - log_prob * utility
             loss_list.append(single_loss)
             print(f"correct answer:{correct_answer}")
+            print(f"uncertainty:{uncertainty}, uncertainty_labels:{uncertainty_labels}")
     
         total_loss = torch.mean(torch.stack(loss_list))
         optimizer.zero_grad() 

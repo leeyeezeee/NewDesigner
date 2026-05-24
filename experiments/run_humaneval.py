@@ -19,6 +19,7 @@ from GDesigner.tools.coding.python_executor import PyExecutor
 from GDesigner.utils.globals import Time
 from GDesigner.utils.const import GDesigner_ROOT
 from GDesigner.utils.globals import Cost, PromptTokens, CompletionTokens
+from GDesigner.utils.uncertainty import answer_uncertainty, uncertainty_adjusted_utility
 
 def load_result(result_file):
     if not result_file.exists():
@@ -48,6 +49,8 @@ def parse_args():
     parser.add_argument('--batch_size', type=int, default=4,help="batch size")
     parser.add_argument('--num_rounds',type=int,default=2,help="Number of optimization/inference rounds for one query")
     parser.add_argument('--pruning_rate', type=float, default=0.25,help="The Rate of Pruning. Default 0.05.")
+    parser.add_argument('--uncertainty_lambda', type=float, default=0.0,
+                        help="Weight for uncertainty-adjusted utility. Default 0 keeps original utility.")
     parser.add_argument('--num_iterations', type=int, default = 10,help="The num of training iterations.")
     parser.add_argument('--domain', type=str, default="humaneval",help="Domain (the same as dataset name), default 'humaneval'")
     parser.add_argument('--agent_names', nargs='+', type=str, default=['CodeWriting'],
@@ -88,7 +91,7 @@ async def main():
                   optimized_temporal=args.optimized_temporal,
                   **kwargs)
     graph.gcn.train()
-    optimizer = torch.optim.Adam(graph.gcn.parameters(), lr=args.lr)    
+    optimizer = torch.optim.Adam(list(graph.gcn.parameters()) + list(graph.mlp.parameters()), lr=args.lr)
     
     num_batches = int(len(dataset)/args.batch_size)
     total_solved, total_executed = (0, 0)
@@ -97,6 +100,7 @@ async def main():
         start_ts = time.time()
         answer_log_probs = []
         tests = []
+        realized_graphs = []
         
         current_batch = dataloader(dataset,args.batch_size,i_batch)
         if current_batch is None:
@@ -107,6 +111,7 @@ async def main():
             realized_graph = copy.deepcopy(graph)
             realized_graph.gcn = graph.gcn
             realized_graph.mlp = graph.mlp
+            realized_graphs.append(realized_graph)
             task = record["prompt"]
             test = record["test"]
             tests.append(test)
@@ -118,7 +123,7 @@ async def main():
         utilities: List[float] = []
         data = load_result(result_file)
         
-        for task, answer, log_prob, test in zip(current_batch, raw_answers, log_probs, tests):
+        for task, answer, log_prob, test, realized_graph in zip(current_batch, raw_answers, log_probs, tests, realized_graphs):
             if not isinstance(answer,list):
                 raise TypeError(f"Expected a list for the answer, but got {type(answer).__name__}")
             answer = answer[0].lstrip("```python\n").rstrip("\n```")
@@ -126,7 +131,14 @@ async def main():
             total_solved = total_solved + is_solved
             total_executed = total_executed + 1
             accuracy = total_solved/ total_executed
-            utility = is_solved
+            def code_test_label(output):
+                code = output.lstrip("```python\n").rstrip("\n```")
+                is_candidate_solved, _, _ = PyExecutor().execute(code, [test], timeout=100)
+                return "pass" if is_candidate_solved else "fail"
+
+            agent_outputs = [node.outputs[-1] for node in realized_graph.nodes.values() if len(node.outputs)]
+            uncertainty, uncertainty_labels = answer_uncertainty(agent_outputs, code_test_label)
+            utility = uncertainty_adjusted_utility(is_solved, uncertainty, args.uncertainty_lambda)
             utilities.append(utility)
             single_loss = -log_prob * utility
             loss_list.append(single_loss)
@@ -140,6 +152,10 @@ async def main():
                 "Total executed": total_executed,
                 "Accuracy": accuracy
             }
+            if args.uncertainty_lambda > 0:
+                updated_item["Uncertainty"] = uncertainty
+                updated_item["Uncertainty labels"] = uncertainty_labels
+                updated_item["Utility"] = utility
             data.append(updated_item)
         with open(result_file, 'w',encoding='utf-8') as file:
             json.dump(data, file, indent=4)

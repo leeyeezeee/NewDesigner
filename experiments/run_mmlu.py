@@ -39,6 +39,8 @@ def parse_args():
                         help="Number of optimization/inference rounds for one query")
     parser.add_argument('--pruning_rate', type=float, default=0.25,
                         help="The Rate of Pruning. Default 0.05.")
+    parser.add_argument('--uncertainty_lambda', type=float, default=0.0,
+                        help="Weight for uncertainty-adjusted utility. Default 0 keeps original utility.")
     parser.add_argument('--llm_name', type=str, default="gpt-4o",
                         help="Model name, None runs the default ChatGPT4")
     parser.add_argument('--domain', type=str, default="mmlu",
@@ -77,7 +79,7 @@ async def main():
     
     if args.optimized_spatial or args.optimized_temporal:
         await train(graph=graph,dataset=dataset_train,num_iters=args.num_iterations,num_rounds=args.num_rounds,
-                    lr=args.lr,batch_size=args.batch_size)
+                    lr=args.lr,batch_size=args.batch_size, uncertainty_lambda=args.uncertainty_lambda)
         
     
     score = await evaluate(graph=graph,dataset=dataset_val,num_rounds=args.num_rounds,limit_questions=limit_questions,eval_batch_size=args.batch_size)

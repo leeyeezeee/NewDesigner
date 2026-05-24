@@ -18,6 +18,7 @@ from GDesigner.graph.graph import Graph
 from GDesigner.tools.reader.readers import JSONLReader
 from GDesigner.utils.globals import Time
 from GDesigner.utils.globals import Cost, PromptTokens, CompletionTokens
+from GDesigner.utils.uncertainty import answer_uncertainty, uncertainty_adjusted_utility
 from datasets.gsm8k_dataset import gsm_data_process,gsm_get_predict
 
 def load_result(result_file):
@@ -48,6 +49,8 @@ def parse_args():
     parser.add_argument('--batch_size', type=int, default=4,help="batch size")
     parser.add_argument('--num_rounds',type=int,default=1,help="Number of optimization/inference rounds for one query")
     parser.add_argument('--pruning_rate', type=float, default=0.25,help="The Rate of Pruning. Default 0.05.")
+    parser.add_argument('--uncertainty_lambda', type=float, default=0.0,
+                        help="Weight for uncertainty-adjusted utility. Default 0 keeps original utility.")
     parser.add_argument('--num_iterations', type=int, default=10,help="The num of training iterations.")
     parser.add_argument('--domain', type=str, default="gsm8k",help="Domain (the same as dataset name), default 'gsm8k'")
     parser.add_argument('--agent_names', nargs='+', type=str, default=['MathSolver'],
@@ -88,7 +91,7 @@ async def main():
                   optimized_temporal=args.optimized_temporal,
                   **kwargs)
     graph.gcn.train()
-    optimizer = torch.optim.Adam(graph.gcn.parameters(), lr=args.lr)   
+    optimizer = torch.optim.Adam(list(graph.gcn.parameters()) + list(graph.mlp.parameters()), lr=args.lr)
     
     num_batches = int(len(dataset)/args.batch_size)
     total_solved, total_executed = (0, 0)
@@ -98,6 +101,7 @@ async def main():
         start_ts = time.time()
         answer_log_probs = []
         answers = []
+        realized_graphs = []
         
         current_batch = dataloader(dataset,args.batch_size,i_batch)
         if current_batch is None:
@@ -108,6 +112,7 @@ async def main():
             realized_graph = copy.deepcopy(graph)
             realized_graph.gcn = graph.gcn
             realized_graph.mlp = graph.mlp
+            realized_graphs.append(realized_graph)
             task = record["task"]
             step = record["step"]
             answer = record["answer"]
@@ -120,13 +125,15 @@ async def main():
         utilities: List[float] = []
         data = load_result(result_file)
         
-        for task, answer, log_prob, true_answer in zip(current_batch, raw_answers, log_probs, answers):
+        for task, answer, log_prob, true_answer, realized_graph in zip(current_batch, raw_answers, log_probs, answers, realized_graphs):
             predict_answer = gsm_get_predict(answer[0])
             is_solved = float(predict_answer)==float(true_answer)
             total_solved = total_solved + is_solved
             total_executed = total_executed + 1
             accuracy = total_solved/ total_executed
-            utility = is_solved
+            agent_outputs = [node.outputs[-1] for node in realized_graph.nodes.values() if len(node.outputs)]
+            uncertainty, uncertainty_labels = answer_uncertainty(agent_outputs, gsm_get_predict)
+            utility = uncertainty_adjusted_utility(is_solved, uncertainty, args.uncertainty_lambda)
             utilities.append(utility)
             single_loss = -log_prob * utility
             loss_list.append(single_loss)
@@ -141,6 +148,10 @@ async def main():
                 "Total executed": total_executed,
                 "Accuracy": accuracy
             }
+            if args.uncertainty_lambda > 0:
+                updated_item["Uncertainty"] = uncertainty
+                updated_item["Uncertainty labels"] = uncertainty_labels
+                updated_item["Utility"] = utility
             data.append(updated_item)
         with open(result_file, 'w',encoding='utf-8') as file:
             json.dump(data, file, indent=4)
