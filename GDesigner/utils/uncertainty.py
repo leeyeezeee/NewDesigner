@@ -1,27 +1,10 @@
 import math
 import os
 from collections import Counter
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, TypeVar
+from typing import Any, Dict, Iterable, List, Optional, Tuple, TypeVar
 
 
 T = TypeVar("T")
-
-
-def normalized_entropy(labels: Iterable[str]) -> float:
-    valid_labels = [label for label in labels if label]
-    if len(valid_labels) <= 1:
-        return 0.0
-
-    counts = Counter(valid_labels)
-    if len(counts) <= 1:
-        return 0.0
-
-    total = len(valid_labels)
-    entropy = 0.0
-    for count in counts.values():
-        probability = count / total
-        entropy -= probability * math.log(probability)
-    return entropy / math.log(len(counts))
 
 
 def semantic_entropy(labels: Iterable[str]) -> float:
@@ -36,19 +19,6 @@ def semantic_entropy(labels: Iterable[str]) -> float:
         probability = count / total
         entropy -= probability * math.log(probability)
     return entropy
-
-
-def answer_uncertainty(
-    outputs: Iterable[T],
-    label_fn: Callable[[T], str],
-) -> Tuple[float, List[str]]:
-    labels = []
-    for output in outputs:
-        try:
-            labels.append(label_fn(output))
-        except Exception:
-            labels.append("")
-    return normalized_entropy(labels), labels
 
 
 class SemanticEntailmentJudge:
@@ -145,75 +115,6 @@ async def semantic_uncertainty(
 ) -> Tuple[float, List[str]]:
     labels = await judge.cluster_outputs(question, outputs)
     return semantic_entropy(labels), labels
-
-
-async def semantic_entropy_reduction(
-    question: str,
-    round_outputs: Iterable[Iterable[T]],
-    judge: SemanticEntailmentJudge,
-) -> Tuple[float, List[float], List[List[str]]]:
-    entropies = []
-    labels_by_round = []
-    for outputs in round_outputs:
-        entropy, labels = await semantic_uncertainty(question, outputs, judge)
-        entropies.append(entropy)
-        labels_by_round.append(labels)
-
-    if len(entropies) <= 1:
-        return 0.0, entropies, labels_by_round
-
-    return max(entropies[0] - entropies[-1], 0.0), entropies, labels_by_round
-
-
-def semantic_utility(
-    correctness_reward: float,
-    entropy_reduction: float,
-    semantic_lambda: float,
-) -> float:
-    if semantic_lambda <= 0:
-        return correctness_reward
-    return correctness_reward * (1.0 + semantic_lambda * max(entropy_reduction, 0.0))
-
-
-def collect_round_outputs(graph, num_rounds: int) -> List[List[str]]:
-    round_outputs: List[List[str]] = []
-    for round_idx in range(num_rounds):
-        outputs = []
-        for node in graph.nodes.values():
-            for history_item in node.execution_history:
-                if history_item["round"] == round_idx and len(history_item["outputs"]):
-                    outputs.append(history_item["outputs"][-1])
-                    break
-        round_outputs.append(outputs)
-    return round_outputs
-
-
-async def node_entropy_reductions(graph, question: str, judge: SemanticEntailmentJudge) -> Tuple[dict, dict]:
-    reductions = {}
-    details = {}
-    for node_id, node in graph.nodes.items():
-        node_reductions = []
-        node_details = []
-        for history_item in node.execution_history:
-            baseline_outputs = history_item.get("baseline_outputs", [])
-            outputs = history_item.get("outputs", [])
-            if not baseline_outputs or not outputs:
-                continue
-            before_entropy, before_labels = await semantic_uncertainty(question, baseline_outputs, judge)
-            after_entropy, after_labels = await semantic_uncertainty(question, outputs, judge)
-            reduction = max(before_entropy - after_entropy, 0.0)
-            node_reductions.append(reduction)
-            node_details.append({
-                "round": history_item["round"],
-                "before_entropy": before_entropy,
-                "after_entropy": after_entropy,
-                "reduction": reduction,
-                "before_labels": before_labels,
-                "after_labels": after_labels,
-            })
-        reductions[node_id] = max(node_reductions) if node_reductions else 0.0
-        details[node_id] = node_details
-    return reductions, details
 
 
 def edge_key(edge_info: Dict[str, Any]) -> str:
@@ -374,14 +275,3 @@ def total_reward_with_edges(correctness_reward: float, edge_rewards: Dict[str, f
     if semantic_lambda <= 0:
         return correctness_reward
     return correctness_reward + semantic_lambda * sum(edge_rewards.values())
-
-
-def uncertainty_adjusted_utility(
-    correctness_reward: float,
-    uncertainty: float,
-    uncertainty_lambda: float,
-) -> float:
-    if uncertainty_lambda <= 0:
-        return correctness_reward
-    uncertainty = min(max(uncertainty, 0.0), 1.0)
-    return correctness_reward * (1.0 + uncertainty_lambda * (1.0 - uncertainty))
