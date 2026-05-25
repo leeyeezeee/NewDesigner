@@ -17,6 +17,7 @@ test.py
 token/
 attack/
 log/
+result/
 ps_list/
 paper/
 HeatMap/

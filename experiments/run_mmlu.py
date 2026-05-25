@@ -13,6 +13,7 @@ from datasets.MMLU.download import download
 from experiments.train_mmlu import train
 from experiments.evaluate_mmlu import evaluate
 from GDesigner.utils.const import GDesigner_ROOT
+from GDesigner.utils.metrics import write_metrics_record
 
 
 
@@ -61,6 +62,8 @@ def parse_args():
                         help="Domain (the same as dataset name), default 'MMLU'")
     parser.add_argument('--decision_method', type=str, default="FinalRefer",
                         help="the decision method of the final node")
+    parser.add_argument('--metrics_file', type=str, default="result/mmlu.jsonl",
+                        help="JSONL file to overwrite with final accuracy and cost metrics.")
     parser.add_argument('--optimized_spatial',action='store_true')
     parser.add_argument('--optimized_temporal',action='store_true')
     args = parser.parse_args()
@@ -106,6 +109,19 @@ async def main():
     
     score = await evaluate(graph=graph,dataset=dataset_val,num_rounds=args.num_rounds,limit_questions=limit_questions,eval_batch_size=args.batch_size)
     print(f"Score: {score}")
+    write_metrics_record(args.metrics_file, {
+        "dataset": "mmlu",
+        "accuracy": score,
+        "score": score,
+        "mode": args.mode,
+        "llm_name": args.llm_name,
+        "agent_nums": args.agent_nums,
+        "num_iterations": args.num_iterations,
+        "num_rounds": args.num_rounds,
+        "uncertainty_lambda": args.uncertainty_lambda,
+        "num_entropy_samples": args.num_entropy_samples,
+        "semantic_judge_llm_name": args.semantic_judge_llm_name,
+    })
 
 
 

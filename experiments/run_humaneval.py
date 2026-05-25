@@ -19,6 +19,7 @@ from GDesigner.tools.coding.python_executor import PyExecutor
 from GDesigner.utils.globals import Time
 from GDesigner.utils.const import GDesigner_ROOT
 from GDesigner.utils.globals import Cost, PromptTokens, CompletionTokens
+from GDesigner.utils.metrics import write_metrics_record
 from GDesigner.utils.uncertainty import (
     SemanticEntailmentJudge,
     edge_entropy_rewards,
@@ -80,6 +81,8 @@ def parse_args():
                         help='Specify the number of agents for each name in agent_names')
     parser.add_argument('--decision_method', type=str, default='FinalWriteCode',
                         help='The decison method of the GDesigner')
+    parser.add_argument('--metrics_file', type=str, default="result/humaneval.jsonl",
+                        help="JSONL file to overwrite with final accuracy and cost metrics.")
     parser.add_argument('--optimized_spatial',action='store_true')
     parser.add_argument('--optimized_temporal',action='store_true')
     
@@ -127,6 +130,7 @@ async def main():
     
     num_batches = int(len(dataset)/args.batch_size)
     total_solved, total_executed = (0, 0)
+    accuracy = 0.0
     for i_batch in range(num_batches):
         print(f"Batch {i_batch}",80*'-')
         start_ts = time.time()
@@ -235,6 +239,22 @@ async def main():
         print(f"Cost {Cost.instance().value}")
         print(f"PromptTokens {PromptTokens.instance().value}")
         print(f"CompletionTokens {CompletionTokens.instance().value}")
+
+    write_metrics_record(args.metrics_file, {
+        "dataset": "humaneval",
+        "accuracy": accuracy,
+        "total_solved": total_solved,
+        "total_executed": total_executed,
+        "mode": args.mode,
+        "llm_name": args.llm_name,
+        "agent_nums": args.agent_nums,
+        "num_iterations": args.num_iterations,
+        "num_rounds": args.num_rounds,
+        "uncertainty_lambda": args.uncertainty_lambda,
+        "num_entropy_samples": args.num_entropy_samples,
+        "semantic_judge_llm_name": args.semantic_judge_llm_name,
+        "result_file": str(result_file),
+    })
 
 
 
