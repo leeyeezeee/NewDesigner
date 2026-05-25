@@ -37,6 +37,24 @@ def _agent_api_key(base_url: str) -> str:
     return api_key
 
 
+def _optional_bool_env(name: str) -> Optional[bool]:
+    value = os.getenv(name)
+    if value is None or value == "":
+        return None
+    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _chat_completion_extra_body(model: str) -> Dict[str, Any]:
+    enable_thinking = _optional_bool_env("QWEN_ENABLE_THINKING")
+    if enable_thinking is None or "qwen" not in model.lower():
+        return {}
+    return {
+        "chat_template_kwargs": {
+            "enable_thinking": enable_thinking,
+        }
+    }
+
+
 @retry(wait=wait_random_exponential(max=100), stop=stop_after_attempt(3))
 async def custom_achat(
     model: str,
@@ -86,12 +104,18 @@ async def openai_compatible_achat(
     num_comps: int,
 ) -> Union[List[str], str]:
     base_url = _agent_base_url()
+    request_kwargs = {
+        "model": model,
+        "messages": msg,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "n": num_comps,
+    }
+    extra_body = _chat_completion_extra_body(model)
+    if extra_body:
+        request_kwargs["extra_body"] = extra_body
     response = await AsyncOpenAI(**_openai_client_kwargs(base_url)).chat.completions.create(
-        model=model,
-        messages=msg,
-        max_tokens=max_tokens,
-        temperature=temperature,
-        n=num_comps,
+        **request_kwargs,
     )
     outputs = [choice.message.content or "" for choice in response.choices]
     prompt = "".join([item["content"] for item in msg])
@@ -108,12 +132,18 @@ def openai_compatible_chat(
     num_comps: int,
 ) -> Union[List[str], str]:
     base_url = _agent_base_url()
+    request_kwargs = {
+        "model": model,
+        "messages": msg,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "n": num_comps,
+    }
+    extra_body = _chat_completion_extra_body(model)
+    if extra_body:
+        request_kwargs["extra_body"] = extra_body
     response = OpenAI(**_openai_client_kwargs(base_url)).chat.completions.create(
-        model=model,
-        messages=msg,
-        max_tokens=max_tokens,
-        temperature=temperature,
-        n=num_comps,
+        **request_kwargs,
     )
     outputs = [choice.message.content or "" for choice in response.choices]
     prompt = "".join([item["content"] for item in msg])
