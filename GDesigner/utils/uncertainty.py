@@ -105,7 +105,7 @@ class SemanticEntailmentJudge:
             model=self.llm_name,
             messages=messages,
             temperature=0.0,
-            max_tokens=8,
+            max_tokens=32,
         )
         verdict = response.choices[0].message.content or ""
         verdict = verdict.strip().lower()

@@ -73,7 +73,6 @@ async def train(graph:Graph,
             realized_graphs.append(realized_graph)
             input_dict = dataset.record_to_input(record)
             input_dicts.append(input_dict)
-            print(input_dict)
             answer_log_probs.append(asyncio.create_task(
                 realized_graph.arun(input_dict, num_rounds, num_entropy_samples=effective_num_entropy_samples)
             ))
@@ -94,9 +93,9 @@ async def train(graph:Graph,
             accuracy = Accuracy()
             accuracy.update(answer, correct_answer)
             correctness_reward = accuracy.get()
-            edge_rewards, edge_reward_details = ({}, {})
+            edge_rewards = {}
             if uncertainty_lambda > 0 and effective_num_entropy_samples > 1:
-                edge_rewards, edge_reward_details = await edge_entropy_rewards(
+                edge_rewards, _ = await edge_entropy_rewards(
                     realized_graph,
                     input_dict["task"],
                     input_dict,
@@ -117,7 +116,7 @@ async def train(graph:Graph,
                 single_loss = single_loss + torch.sum(torch.stack(edge_losses))
             loss_list.append(single_loss)
             print(f"correct answer:{correct_answer}")
-            print(f"edge entropy rewards:{edge_rewards}, edge_reward_details:{edge_reward_details}")
+            print(f"edge entropy rewards:{edge_rewards}")
     
         total_loss = torch.mean(torch.stack(loss_list))
         optimizer.zero_grad()
@@ -128,7 +127,6 @@ async def train(graph:Graph,
             print("spatial masks:", spatial_masks.view(graph.num_nodes, graph.num_nodes))
             print("temporal masks:", temporal_masks.view(graph.num_nodes, graph.num_nodes))
 
-        print("raw_answers:",raw_answers)
         print("answers:",answers)
         print(f"Batch time {time.time() - start_ts:.3f}")
         print("utilities:", utilities) # [0.0, 0.0, 0.0, 1.0]
