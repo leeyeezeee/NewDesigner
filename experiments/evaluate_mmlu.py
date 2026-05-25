@@ -22,6 +22,7 @@ async def evaluate(
     print(f"Evaluating gdesigner on {dataset.__class__.__name__} split {dataset.split}")
     
     graph.gcn.eval()
+    graph.mlp.eval()
     accuracy = Accuracy()
     def eval_loader(batch_size: int) -> Iterator[List[Any]]:
         records = []

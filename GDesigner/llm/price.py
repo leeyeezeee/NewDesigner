@@ -1,3 +1,5 @@
+import os
+
 from GDesigner.utils.globals import Cost, PromptTokens, CompletionTokens
 import tiktoken
 # GPT-4:  https://platform.openai.com/docs/models/gpt-4-and-gpt-4-turbo
@@ -5,7 +7,10 @@ import tiktoken
 # DALL-E: https://openai.com/pricing
 
 def cal_token(model:str, text:str):
-    encoder = tiktoken.encoding_for_model(model)
+    try:
+        encoder = tiktoken.encoding_for_model(model)
+    except KeyError:
+        encoder = tiktoken.get_encoding("cl100k_base")
     num_tokens = len(encoder.encode(text))
     return num_tokens
 
@@ -17,11 +22,17 @@ def cost_count(prompt, response, model_name):
 
     prompt_len = cal_token(model_name, prompt)
     completion_len = cal_token(model_name, response)
-    if "gpt-4" in model_name:
+    custom_input_price = os.getenv("LOCAL_MODEL_INPUT_PRICE_PER_1K")
+    custom_output_price = os.getenv("LOCAL_MODEL_OUTPUT_PRICE_PER_1K")
+    if custom_input_price is not None and custom_output_price is not None:
+        branch = "custom"
+        price = prompt_len * float(custom_input_price) / 1000 + \
+            completion_len * float(custom_output_price) / 1000
+    elif "gpt-4" in model_name and model_name in OPENAI_MODEL_INFO["gpt-4"]:
         branch = "gpt-4"
         price = prompt_len * OPENAI_MODEL_INFO[branch][model_name]["input"] /1000 + \
                 completion_len * OPENAI_MODEL_INFO[branch][model_name]["output"] /1000
-    elif "gpt-3.5" in model_name:
+    elif "gpt-3.5" in model_name and model_name in OPENAI_MODEL_INFO["gpt-3.5"]:
         branch = "gpt-3.5"
         price = prompt_len * OPENAI_MODEL_INFO[branch][model_name]["input"] /1000 + \
             completion_len * OPENAI_MODEL_INFO[branch][model_name]["output"] /1000
@@ -33,8 +44,6 @@ def cost_count(prompt, response, model_name):
     else:
         branch = "other"
         price = 0.0
-        prompt_len = 0
-        completion_len = 0
 
     Cost.instance().value += price
     PromptTokens.instance().value += prompt_len

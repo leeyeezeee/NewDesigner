@@ -112,6 +112,7 @@ async def main():
                   optimized_temporal=args.optimized_temporal,
                   **kwargs)
     graph.gcn.train()
+    graph.mlp.train()
     optimizer_params = list(graph.gcn.parameters()) + list(graph.mlp.parameters())
     if graph.optimized_temporal:
         optimizer_params.append(graph.temporal_logits)
@@ -229,6 +230,7 @@ async def main():
             total_solved = 0
             total_executed = 0
             graph.gcn.eval()
+            graph.mlp.eval()
             print("Start Eval")
             
         print(f"Cost {Cost.instance().value}")

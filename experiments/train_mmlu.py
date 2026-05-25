@@ -56,6 +56,7 @@ async def train(graph:Graph,
         optimizer_params.append(graph.temporal_logits)
     optimizer = torch.optim.Adam(optimizer_params, lr=lr)
     graph.gcn.train()
+    graph.mlp.train()
     for i_iter in range(num_iters):
         print(f"Iter {i_iter}", 80*'-')
         start_ts = time.time()

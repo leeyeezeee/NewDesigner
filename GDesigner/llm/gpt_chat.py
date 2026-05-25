@@ -4,6 +4,7 @@ from tenacity import retry, wait_random_exponential, stop_after_attempt
 from typing import Dict, Any
 from dotenv import load_dotenv
 import os
+from openai import AsyncOpenAI, OpenAI
 
 from GDesigner.llm.format import Message
 from GDesigner.llm.price import cost_count
@@ -15,16 +16,33 @@ OPENAI_API_KEYS = ['']
 BASE_URL = ''
 
 load_dotenv()
-MINE_BASE_URL = os.getenv('BASE_URL')
-MINE_API_KEYS = os.getenv('API_KEY')
+
+
+def _agent_base_url() -> str:
+    return os.getenv("AGENT_BASE_URL") or os.getenv("BASE_URL") or ""
+
+
+def _is_openai_compatible(base_url: str) -> bool:
+    api_type = os.getenv("AGENT_API_TYPE") or os.getenv("LLM_API_TYPE") or ""
+    if api_type.lower() in {"openai", "vllm", "openai-compatible"}:
+        return True
+    normalized = base_url.rstrip("/")
+    return normalized.endswith("/v1") or "/v1/" in normalized
+
+
+def _agent_api_key(base_url: str) -> str:
+    api_key = os.getenv("AGENT_API_KEY") or os.getenv("API_KEY") or ""
+    if base_url and not api_key and _is_openai_compatible(base_url):
+        return "EMPTY"
+    return api_key
 
 
 @retry(wait=wait_random_exponential(max=100), stop=stop_after_attempt(3))
-async def achat(
+async def custom_achat(
     model: str,
     msg: List[Dict],):
-    request_url = MINE_BASE_URL
-    authorization_key = MINE_API_KEYS
+    request_url = _agent_base_url()
+    authorization_key = _agent_api_key(request_url)
     headers = {
         'Content-Type': 'application/json',
         'authorization': authorization_key
@@ -42,6 +60,66 @@ async def achat(
             prompt = "".join([item['content'] for item in msg])
             cost_count(prompt,response_data['data'],model)
             return response_data['data']
+
+
+def _message_dicts(messages: List[Message]) -> List[Dict[str, Any]]:
+    if isinstance(messages, str):
+        return [{"role": "user", "content": messages}]
+    return [
+        message if isinstance(message, dict) else {"role": message.role, "content": message.content}
+        for message in messages
+    ]
+
+
+def _openai_client_kwargs(base_url: str) -> Dict[str, str]:
+    client_kwargs = {"api_key": _agent_api_key(base_url)}
+    if base_url:
+        client_kwargs["base_url"] = base_url
+    return client_kwargs
+
+
+async def openai_compatible_achat(
+    model: str,
+    msg: List[Dict],
+    max_tokens: int,
+    temperature: float,
+    num_comps: int,
+) -> Union[List[str], str]:
+    base_url = _agent_base_url()
+    response = await AsyncOpenAI(**_openai_client_kwargs(base_url)).chat.completions.create(
+        model=model,
+        messages=msg,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        n=num_comps,
+    )
+    outputs = [choice.message.content or "" for choice in response.choices]
+    prompt = "".join([item["content"] for item in msg])
+    for output in outputs:
+        cost_count(prompt, output, model)
+    return outputs[0] if num_comps == 1 else outputs
+
+
+def openai_compatible_chat(
+    model: str,
+    msg: List[Dict],
+    max_tokens: int,
+    temperature: float,
+    num_comps: int,
+) -> Union[List[str], str]:
+    base_url = _agent_base_url()
+    response = OpenAI(**_openai_client_kwargs(base_url)).chat.completions.create(
+        model=model,
+        messages=msg,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        n=num_comps,
+    )
+    outputs = [choice.message.content or "" for choice in response.choices]
+    prompt = "".join([item["content"] for item in msg])
+    for output in outputs:
+        cost_count(prompt, output, model)
+    return outputs[0] if num_comps == 1 else outputs
 
 @LLMRegistry.register('GPTChat')
 class GPTChat(LLM):
@@ -64,9 +142,11 @@ class GPTChat(LLM):
         if num_comps is None:
             num_comps = self.DEFUALT_NUM_COMPLETIONS
         
-        if isinstance(messages, str):
-            messages = [Message(role="user", content=messages)]
-        return await achat(self.model_name,messages)
+        messages = _message_dicts(messages)
+        base_url = _agent_base_url()
+        if _is_openai_compatible(base_url):
+            return await openai_compatible_achat(self.model_name, messages, max_tokens, temperature, num_comps)
+        return await custom_achat(self.model_name,messages)
     
     def gen(
         self,
@@ -75,4 +155,15 @@ class GPTChat(LLM):
         temperature: Optional[float] = None,
         num_comps: Optional[int] = None,
     ) -> Union[List[str], str]:
-        pass
+        if max_tokens is None:
+            max_tokens = self.DEFAULT_MAX_TOKENS
+        if temperature is None:
+            temperature = self.DEFAULT_TEMPERATURE
+        if num_comps is None:
+            num_comps = self.DEFUALT_NUM_COMPLETIONS
+
+        messages = _message_dicts(messages)
+        base_url = _agent_base_url()
+        if _is_openai_compatible(base_url):
+            return openai_compatible_chat(self.model_name, messages, max_tokens, temperature, num_comps)
+        raise NotImplementedError("Synchronous generation is only implemented for OpenAI-compatible agent backends.")
