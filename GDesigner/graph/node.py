@@ -1,5 +1,5 @@
 import shortuuid
-from typing import List, Any, Optional,Dict
+from typing import List, Any, Optional, Dict
 from abc import ABC, abstractmethod
 import warnings
 import asyncio
@@ -19,7 +19,8 @@ class Node(ABC):
         spatial_predecessors (List[Node]): Nodes that precede this node in the graph.
         spatial_successors (List[Node]): Nodes that succeed this node in the graph.
         inputs (List[Any]): Inputs to be processed by the node.
-        outputs (List[Any]): Results produced after node execution.
+        outputs (List[Any]): Communication outputs produced after node execution.
+        entropy_samples (List[Any]): Same-context samples used only for semantic entropy estimation.
         raw_inputs (List[Any]): The original input contains the question or math problem.
         last_memory (Dict[str,List[Any]]): Input and output of the previous timestamp.
         
@@ -59,9 +60,10 @@ class Node(ABC):
         self.temporal_successors: List[Node] = []
         self.inputs: List[Any] = []
         self.outputs: List[Any] = []
+        self.entropy_samples: List[Any] = []
         self.raw_inputs: List[Any] = []
         self.role = ""
-        self.last_memory: Dict[str,List[Any]] = {'inputs':[],'outputs':[],'raw_inputs':[]}
+        self.last_memory: Dict[str,List[Any]] = {'inputs':[],'outputs':[],'raw_inputs':[],'entropy_samples':[]}
         self.execution_history: List[Dict[str, Any]] = []
 
     @property
@@ -110,6 +112,7 @@ class Node(ABC):
         self.last_memory['inputs'] = self.inputs
         self.last_memory['outputs'] = self.outputs
         self.last_memory['raw_inputs'] = self.raw_inputs
+        self.last_memory['entropy_samples'] = self.entropy_samples
 
     def get_spatial_info(self)->Dict[str,Dict]:
         """ Return a dict that maps id to info. """
@@ -156,17 +159,35 @@ class Node(ABC):
         self.execution_history.append({
             "round": round_idx,
             "outputs": list(self.outputs),
+            "communication_outputs": list(self.outputs),
+            "entropy_samples": list(self.entropy_samples),
             "spatial_predecessors": list(spatial_info.keys()),
             "temporal_predecessors": list(temporal_info.keys()),
             "spatial_info": spatial_info_snapshot,
             "temporal_info": temporal_info_snapshot,
         })
 
+    @staticmethod
+    def _as_output_list(result: Any) -> List[Any]:
+        if isinstance(result, list):
+            return result
+        return [result]
+
+    def _set_execution_outputs(self, results: List[Any]):
+        output_groups = [self._as_output_list(result) for result in results]
+        self.entropy_samples = [
+            output
+            for output_group in output_groups
+            for output in output_group
+        ]
+        self.outputs = output_groups[0] if output_groups else []
+
     def execute(self, input:Any, **kwargs):
         round_idx = kwargs.pop("round_idx", None)
         num_entropy_samples = kwargs.pop("num_entropy_samples", 1)
         num_entropy_samples = max(1, int(num_entropy_samples))
         self.outputs = []
+        self.entropy_samples = []
         spatial_info:Dict[str,Dict] = self.get_spatial_info()
         temporal_info:Dict[str,Dict] = self.get_temporal_info()
         results = [
@@ -174,10 +195,7 @@ class Node(ABC):
             for _ in range(num_entropy_samples)
         ]
 
-        for result in results:
-            if not isinstance(result, list):
-                result = [result]
-            self.outputs.extend(result)
+        self._set_execution_outputs(results)
         self._record_execution(round_idx, spatial_info, temporal_info)
         return self.outputs
 
@@ -188,6 +206,7 @@ class Node(ABC):
         num_entropy_samples = max(1, int(num_entropy_samples))
 
         self.outputs = []
+        self.entropy_samples = []
         spatial_info:Dict[str,Any] = self.get_spatial_info()
         temporal_info:Dict[str,Any] = self.get_temporal_info()
         tasks = [
@@ -195,10 +214,7 @@ class Node(ABC):
             for _ in range(num_entropy_samples)
         ]
         results = await asyncio.gather(*tasks, return_exceptions=False)
-        for result in results:
-            if not isinstance(result, list):
-                result = [result]
-            self.outputs.extend(result)
+        self._set_execution_outputs(results)
         self._record_execution(round_idx, spatial_info, temporal_info)
         return self.outputs
                

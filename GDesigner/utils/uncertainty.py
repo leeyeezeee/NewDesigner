@@ -63,16 +63,12 @@ class SemanticEntailmentJudge:
             if self.base_url:
                 client_kwargs["base_url"] = self.base_url
             self._client = AsyncOpenAI(**client_kwargs)
-        self._cache: Dict[Tuple[str, str, str], bool] = {}
 
     @property
     def is_configured(self) -> bool:
         return bool(self._client and self.llm_name)
 
     async def entails(self, question: str, premise: str, hypothesis: str) -> bool:
-        key = (question, premise, hypothesis)
-        if key in self._cache:
-            return self._cache[key]
         if self._client is None:
             raise RuntimeError(
                 "SemanticEntailmentJudge is not configured. For remote OpenAI, set "
@@ -109,9 +105,7 @@ class SemanticEntailmentJudge:
         )
         verdict = response.choices[0].message.content or ""
         verdict = verdict.strip().lower()
-        result = verdict.startswith("entail")
-        self._cache[key] = result
-        return result
+        return verdict.startswith("entail")
 
     async def equivalent(self, question: str, output_a: str, output_b: str) -> bool:
         if output_a.strip() == output_b.strip():
@@ -251,7 +245,7 @@ async def edge_entropy_rewards(
             before_temporal_info,
             num_entropy_samples,
         )
-        after_outputs = history_item.get("outputs", [])
+        after_outputs = history_item.get("entropy_samples", [])
         if not before_outputs or not after_outputs:
             continue
 
@@ -262,6 +256,7 @@ async def edge_entropy_rewards(
         else:
             after_entropy, after_labels = await semantic_uncertainty(question, after_outputs, judge)
             after_cache[after_cache_key] = (after_entropy, after_labels)
+            history_item["entropy_samples"] = []
 
         entropy_delta = before_entropy - after_entropy
         reward = _edge_reward_from_delta(
