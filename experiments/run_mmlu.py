@@ -44,13 +44,13 @@ def parse_args():
     parser.add_argument('--num_entropy_samples', type=int, default=1,
                         help="Samples per agent before and after communication for semantic entropy. Automatically raised to 2 when uncertainty_lambda > 0.")
     parser.add_argument('--semantic_judge_llm_name', type=str, default="gpt-4o-mini",
-                        help="Small semantic consistency judge model name.")
+                        help="OpenAI-compatible semantic judge model name. Independent from --llm_name.")
     parser.add_argument('--semantic_judge_api_key', type=str, default="",
-                        help="Optional API key placeholder for semantic judge.")
+                        help="Semantic judge API key. For local vLLM, EMPTY is usually enough.")
     parser.add_argument('--semantic_judge_base_url', type=str, default="",
-                        help="Optional base URL placeholder for semantic judge.")
+                        help="Semantic judge OpenAI-compatible base URL. Use http://localhost:8000/v1 for local vLLM.")
     parser.add_argument('--semantic_judge_model_path', type=str, default="",
-                        help="Optional local model path placeholder for semantic judge.")
+                        help="Optional judge model name override kept for backward compatibility.")
     parser.add_argument('--negative_edge_reward_scale', type=float, default=1.0,
                         help="Scale for negative edge rewards when an edge increases semantic entropy.")
     parser.add_argument('--nonpositive_edge_penalty', type=float, default=0.01,

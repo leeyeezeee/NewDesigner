@@ -29,32 +29,57 @@ class SemanticEntailmentJudge:
         base_url: str = "",
         model_path: str = "",
     ):
-        self.llm_name = llm_name or ""
-        self.api_key = api_key
-        self.base_url = base_url
-        self.model_path = model_path
-        self._llm = None
-        if self.llm_name:
-            if self.api_key:
-                os.environ["API_KEY"] = self.api_key
+        try:
+            from dotenv import load_dotenv
+            load_dotenv()
+        except Exception:
+            pass
+
+        self.llm_name = (
+            model_path
+            or llm_name
+            or os.getenv("SEMANTIC_JUDGE_MODEL")
+            or "gpt-4o-mini"
+        )
+        self.api_key = (
+            api_key
+            or os.getenv("SEMANTIC_JUDGE_API_KEY")
+            or os.getenv("OPENAI_API_KEY")
+            or os.getenv("API_KEY")
+            or ""
+        )
+        self.base_url = (
+            base_url
+            or os.getenv("SEMANTIC_JUDGE_BASE_URL")
+            or os.getenv("OPENAI_BASE_URL")
+            or ""
+        )
+        if self.base_url and not self.api_key:
+            self.api_key = "EMPTY"
+        self._client = None
+        if self.llm_name and self.api_key:
+            from openai import AsyncOpenAI
+
+            client_kwargs = {"api_key": self.api_key}
             if self.base_url:
-                os.environ["BASE_URL"] = self.base_url
-            from GDesigner.llm.llm_registry import LLMRegistry
-            self._llm = LLMRegistry.get(self.llm_name)
+                client_kwargs["base_url"] = self.base_url
+            self._client = AsyncOpenAI(**client_kwargs)
         self._cache: Dict[Tuple[str, str, str], bool] = {}
 
     @property
     def is_configured(self) -> bool:
-        return bool(self._llm or self.model_path)
+        return bool(self._client and self.llm_name)
 
     async def entails(self, question: str, premise: str, hypothesis: str) -> bool:
         key = (question, premise, hypothesis)
         if key in self._cache:
             return self._cache[key]
-        if self._llm is None:
+        if self._client is None:
             raise RuntimeError(
-                "SemanticEntailmentJudge is not configured. Pass --semantic_judge_llm_name "
-                "or wire a local model through --semantic_judge_model_path."
+                "SemanticEntailmentJudge is not configured. For remote OpenAI, set "
+                "--semantic_judge_llm_name and --semantic_judge_api_key or OPENAI_API_KEY. "
+                "For local vLLM, set --semantic_judge_llm_name and "
+                "--semantic_judge_base_url, for example http://localhost:8000/v1."
             )
 
         messages = [
@@ -77,10 +102,14 @@ class SemanticEntailmentJudge:
                 ),
             },
         ]
-        response = await self._llm.agen(messages, temperature=0.0)
-        if isinstance(response, list):
-            response = response[0] if response else ""
-        verdict = str(response).strip().lower()
+        response = await self._client.chat.completions.create(
+            model=self.llm_name,
+            messages=messages,
+            temperature=0.0,
+            max_tokens=8,
+        )
+        verdict = response.choices[0].message.content or ""
+        verdict = verdict.strip().lower()
         result = verdict.startswith("entail")
         self._cache[key] = result
         return result
