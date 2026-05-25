@@ -18,7 +18,12 @@ from GDesigner.graph.graph import Graph
 from GDesigner.tools.reader.readers import JSONLReader
 from GDesigner.utils.globals import Time
 from GDesigner.utils.globals import Cost, PromptTokens, CompletionTokens
-from GDesigner.utils.uncertainty import answer_uncertainty, uncertainty_adjusted_utility
+from GDesigner.utils.uncertainty import (
+    SemanticEntailmentJudge,
+    edge_entropy_rewards,
+    edge_semantic_loss,
+    total_reward_with_edges,
+)
 from datasets.gsm8k_dataset import gsm_data_process,gsm_get_predict
 
 def load_result(result_file):
@@ -47,10 +52,26 @@ def parse_args():
                         help="Mode of operation. Default is 'FullConnected'.")
     parser.add_argument('--lr', type=float, default=0.1,help="learning rate")
     parser.add_argument('--batch_size', type=int, default=4,help="batch size")
-    parser.add_argument('--num_rounds',type=int,default=1,help="Number of optimization/inference rounds for one query")
+    parser.add_argument('--num_rounds',type=int,default=2,help="Number of optimization/inference rounds for one query. Use at least 2 to measure semantic entropy reduction after communication.")
     parser.add_argument('--pruning_rate', type=float, default=0.25,help="The Rate of Pruning. Default 0.05.")
+    parser.add_argument('--imp_per_iterations', type=int, default=5,
+                        help="Prune every few iterations. Default 5.")
     parser.add_argument('--uncertainty_lambda', type=float, default=0.0,
-                        help="Weight for uncertainty-adjusted utility. Default 0 keeps original utility.")
+                        help="Weight for edge-level semantic entropy reward. Default 0 keeps original utility.")
+    parser.add_argument('--num_entropy_samples', type=int, default=1,
+                        help="Samples per agent before and after communication for semantic entropy. Automatically raised to 2 when uncertainty_lambda > 0.")
+    parser.add_argument('--semantic_judge_llm_name', type=str, default="gpt-4o-mini",
+                        help="Small semantic consistency judge model name.")
+    parser.add_argument('--semantic_judge_api_key', type=str, default="",
+                        help="Optional API key placeholder for semantic judge.")
+    parser.add_argument('--semantic_judge_base_url', type=str, default="",
+                        help="Optional base URL placeholder for semantic judge.")
+    parser.add_argument('--semantic_judge_model_path', type=str, default="",
+                        help="Optional local model path placeholder for semantic judge.")
+    parser.add_argument('--negative_edge_reward_scale', type=float, default=1.0,
+                        help="Scale for negative edge rewards when an edge increases semantic entropy.")
+    parser.add_argument('--nonpositive_edge_penalty', type=float, default=0.01,
+                        help="Extra penalty when a selected edge does not reduce semantic entropy.")
     parser.add_argument('--num_iterations', type=int, default=10,help="The num of training iterations.")
     parser.add_argument('--domain', type=str, default="gsm8k",help="Domain (the same as dataset name), default 'gsm8k'")
     parser.add_argument('--agent_names', nargs='+', type=str, default=['MathSolver'],
@@ -91,7 +112,17 @@ async def main():
                   optimized_temporal=args.optimized_temporal,
                   **kwargs)
     graph.gcn.train()
-    optimizer = torch.optim.Adam(list(graph.gcn.parameters()) + list(graph.mlp.parameters()), lr=args.lr)
+    optimizer_params = list(graph.gcn.parameters()) + list(graph.mlp.parameters())
+    if graph.optimized_temporal:
+        optimizer_params.append(graph.temporal_logits)
+    optimizer = torch.optim.Adam(optimizer_params, lr=args.lr)
+    semantic_judge = SemanticEntailmentJudge(
+        llm_name=args.semantic_judge_llm_name,
+        api_key=args.semantic_judge_api_key,
+        base_url=args.semantic_judge_base_url,
+        model_path=args.semantic_judge_model_path,
+    )
+    effective_num_entropy_samples = max(2, int(args.num_entropy_samples)) if args.uncertainty_lambda > 0 else max(1, int(args.num_entropy_samples))
     
     num_batches = int(len(dataset)/args.batch_size)
     total_solved, total_executed = (0, 0)
@@ -102,6 +133,7 @@ async def main():
         answer_log_probs = []
         answers = []
         realized_graphs = []
+        input_dicts = []
         
         current_batch = dataloader(dataset,args.batch_size,i_batch)
         if current_batch is None:
@@ -112,30 +144,50 @@ async def main():
             realized_graph = copy.deepcopy(graph)
             realized_graph.gcn = graph.gcn
             realized_graph.mlp = graph.mlp
+            realized_graph.temporal_logits = graph.temporal_logits
             realized_graphs.append(realized_graph)
             task = record["task"]
             step = record["step"]
             answer = record["answer"]
             answers.append(answer)
             input_dict = {"task": task}
-            answer_log_probs.append(asyncio.create_task(realized_graph.arun(input_dict,args.num_rounds)))
+            input_dicts.append(input_dict)
+            answer_log_probs.append(asyncio.create_task(
+                realized_graph.arun(input_dict, args.num_rounds, num_entropy_samples=effective_num_entropy_samples)
+            ))
         raw_results = await asyncio.gather(*answer_log_probs)
         raw_answers, log_probs = zip(*raw_results)
         loss_list: List[torch.Tensor] = []
         utilities: List[float] = []
         data = load_result(result_file)
         
-        for task, answer, log_prob, true_answer, realized_graph in zip(current_batch, raw_answers, log_probs, answers, realized_graphs):
+        for task, answer, log_prob, true_answer, realized_graph, input_dict in zip(current_batch, raw_answers, log_probs, answers, realized_graphs, input_dicts):
             predict_answer = gsm_get_predict(answer[0])
             is_solved = float(predict_answer)==float(true_answer)
             total_solved = total_solved + is_solved
             total_executed = total_executed + 1
             accuracy = total_solved/ total_executed
-            agent_outputs = [node.outputs[-1] for node in realized_graph.nodes.values() if len(node.outputs)]
-            uncertainty, uncertainty_labels = answer_uncertainty(agent_outputs, gsm_get_predict)
-            utility = uncertainty_adjusted_utility(is_solved, uncertainty, args.uncertainty_lambda)
+            edge_rewards, edge_reward_details = ({}, {})
+            if args.uncertainty_lambda > 0 and effective_num_entropy_samples > 1:
+                edge_rewards, edge_reward_details = await edge_entropy_rewards(
+                    realized_graph,
+                    task["task"],
+                    input_dict,
+                    semantic_judge,
+                    effective_num_entropy_samples,
+                    negative_reward_scale=args.negative_edge_reward_scale,
+                    nonpositive_penalty=args.nonpositive_edge_penalty,
+                )
+            edge_losses = edge_semantic_loss(
+                realized_graph.edge_log_probs,
+                edge_rewards,
+                args.uncertainty_lambda,
+            )
+            utility = total_reward_with_edges(is_solved, edge_rewards, args.uncertainty_lambda)
             utilities.append(utility)
-            single_loss = -log_prob * utility
+            single_loss = -log_prob * is_solved
+            if edge_losses:
+                single_loss = single_loss + torch.sum(torch.stack(edge_losses))
             loss_list.append(single_loss)
             updated_item = {
                 "Question": task,
@@ -149,8 +201,8 @@ async def main():
                 "Accuracy": accuracy
             }
             if args.uncertainty_lambda > 0:
-                updated_item["Uncertainty"] = uncertainty
-                updated_item["Uncertainty labels"] = uncertainty_labels
+                updated_item["Edge entropy rewards"] = edge_rewards
+                updated_item["Edge entropy details"] = edge_reward_details
                 updated_item["Utility"] = utility
             data.append(updated_item)
         with open(result_file, 'w',encoding='utf-8') as file:
@@ -161,6 +213,10 @@ async def main():
             optimizer.zero_grad()
             total_loss.backward()
             optimizer.step()
+            if (i_batch + 1) % args.imp_per_iterations == 0:
+                spatial_masks, temporal_masks = graph.update_masks(args.pruning_rate)
+                print("spatial masks:", spatial_masks.view(graph.num_nodes, graph.num_nodes))
+                print("temporal masks:", temporal_masks.view(graph.num_nodes, graph.num_nodes))
         
         print(f"Batch time {time.time() - start_ts:.3f}")
         print(f"Accuracy: {accuracy}")

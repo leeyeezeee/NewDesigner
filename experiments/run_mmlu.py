@@ -35,12 +35,26 @@ def parse_args():
                         help="Number of optimization iterations. Default 10.")
     parser.add_argument('--imp_per_iterations', type=int, default=5,
                         help="Prune every few iterations. Default 5.")
-    parser.add_argument('--num_rounds',type=int,default=1,
-                        help="Number of optimization/inference rounds for one query")
+    parser.add_argument('--num_rounds',type=int,default=2,
+                        help="Number of optimization/inference rounds for one query. Use at least 2 to measure semantic entropy reduction after communication.")
     parser.add_argument('--pruning_rate', type=float, default=0.25,
                         help="The Rate of Pruning. Default 0.05.")
     parser.add_argument('--uncertainty_lambda', type=float, default=0.0,
-                        help="Weight for uncertainty-adjusted utility. Default 0 keeps original utility.")
+                        help="Weight for edge-level semantic entropy reward. Default 0 keeps original utility.")
+    parser.add_argument('--num_entropy_samples', type=int, default=1,
+                        help="Samples per agent before and after communication for semantic entropy. Automatically raised to 2 when uncertainty_lambda > 0.")
+    parser.add_argument('--semantic_judge_llm_name', type=str, default="gpt-4o-mini",
+                        help="Small semantic consistency judge model name.")
+    parser.add_argument('--semantic_judge_api_key', type=str, default="",
+                        help="Optional API key placeholder for semantic judge.")
+    parser.add_argument('--semantic_judge_base_url', type=str, default="",
+                        help="Optional base URL placeholder for semantic judge.")
+    parser.add_argument('--semantic_judge_model_path', type=str, default="",
+                        help="Optional local model path placeholder for semantic judge.")
+    parser.add_argument('--negative_edge_reward_scale', type=float, default=1.0,
+                        help="Scale for negative edge rewards when an edge increases semantic entropy.")
+    parser.add_argument('--nonpositive_edge_penalty', type=float, default=0.01,
+                        help="Extra penalty when a selected edge does not reduce semantic entropy.")
     parser.add_argument('--llm_name', type=str, default="gpt-4o",
                         help="Model name, None runs the default ChatGPT4")
     parser.add_argument('--domain', type=str, default="mmlu",
@@ -79,7 +93,15 @@ async def main():
     
     if args.optimized_spatial or args.optimized_temporal:
         await train(graph=graph,dataset=dataset_train,num_iters=args.num_iterations,num_rounds=args.num_rounds,
-                    lr=args.lr,batch_size=args.batch_size, uncertainty_lambda=args.uncertainty_lambda)
+                    lr=args.lr,batch_size=args.batch_size, uncertainty_lambda=args.uncertainty_lambda,
+                    imp_per_iterations=args.imp_per_iterations, pruning_rate=args.pruning_rate,
+                    num_entropy_samples=args.num_entropy_samples,
+                    semantic_judge_llm_name=args.semantic_judge_llm_name,
+                    semantic_judge_api_key=args.semantic_judge_api_key,
+                    semantic_judge_base_url=args.semantic_judge_base_url,
+                    semantic_judge_model_path=args.semantic_judge_model_path,
+                    negative_edge_reward_scale=args.negative_edge_reward_scale,
+                    nonpositive_edge_penalty=args.nonpositive_edge_penalty)
         
     
     score = await evaluate(graph=graph,dataset=dataset_val,num_rounds=args.num_rounds,limit_questions=limit_questions,eval_batch_size=args.batch_size)

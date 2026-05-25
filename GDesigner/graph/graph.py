@@ -67,6 +67,7 @@ class Graph(ABC):
         self.nodes:Dict[str,Node] = {}
         self.potential_spatial_edges:List[List[str, str]] = []
         self.potential_temporal_edges:List[List[str,str]] = []
+        self.edge_log_probs:List[Dict[str, Any]] = []
         self.node_kwargs = node_kwargs if node_kwargs is not None else [{} for _ in agent_names]
         
         self.init_nodes() # add nodes to the self.nodes
@@ -214,7 +215,7 @@ class Graph(ABC):
         for node_id in self.nodes.keys():
             self.nodes[node_id].add_successor(self.decision_node)
 
-    def construct_spatial_connection(self, temperature: float = 1.0, threshold: float = None,): # temperature must >= 1.0
+    def construct_spatial_connection(self, round:int = 0, temperature: float = 1.0, threshold: float = None,): # temperature must >= 1.0
         self.clear_spatial_connection()
         log_probs = [torch.tensor(0.0, requires_grad=self.optimized_spatial)]
         
@@ -233,7 +234,16 @@ class Graph(ABC):
                     edge_prob = torch.tensor(1 if edge_prob > threshold else 0)
                 if torch.rand(1) < edge_prob:
                     out_node.add_successor(in_node,'spatial')
-                    log_probs.append(torch.log(edge_prob))
+                    edge_log_prob = torch.log(edge_prob)
+                    log_probs.append(edge_log_prob)
+                    self.edge_log_probs.append({
+                        "type": "spatial",
+                        "round": round,
+                        "source": out_node.id,
+                        "target": in_node.id,
+                        "edge_key": f"spatial:{round}:{out_node.id}->{in_node.id}",
+                        "log_prob": edge_log_prob,
+                    })
                 else:
                     log_probs.append(torch.log(1 - edge_prob))
                     
@@ -259,7 +269,16 @@ class Graph(ABC):
                 edge_prob = torch.tensor(1 if edge_prob > threshold else 0)
             if torch.rand(1) < edge_prob:
                 out_node.add_successor(in_node,'temporal')
-                log_probs.append(torch.log(edge_prob))
+                edge_log_prob = torch.log(edge_prob)
+                log_probs.append(edge_log_prob)
+                self.edge_log_probs.append({
+                    "type": "temporal",
+                    "round": round,
+                    "source": out_node.id,
+                    "target": in_node.id,
+                    "edge_key": f"temporal:{round}:{out_node.id}->{in_node.id}",
+                    "log_prob": edge_log_prob,
+                })
             else:
                 log_probs.append(torch.log(1 - edge_prob))
                     
@@ -269,11 +288,13 @@ class Graph(ABC):
     def run(self, inputs: Any, 
                   num_rounds:int = 3, 
                   max_tries: int = 3, 
-                  max_time: int = 600,) -> List[Any]:
+                  max_time: int = 600,
+                  num_entropy_samples: int = 1,) -> List[Any]:
         # inputs:{'task':"xxx"}
         log_probs = 0
+        self.edge_log_probs = []
         for round in range(num_rounds):
-            log_probs += self.construct_spatial_connection()
+            log_probs += self.construct_spatial_connection(round)
             log_probs += self.construct_temporal_connection(round)
             
             in_degree = {node_id: len(node.spatial_predecessors) for node_id, node in self.nodes.items()}
@@ -284,7 +305,7 @@ class Graph(ABC):
                 tries = 0
                 while tries < max_tries:
                     try:
-                        self.nodes[current_node_id].execute(inputs) # output is saved in the node.outputs
+                        self.nodes[current_node_id].execute(inputs, round_idx=round, num_entropy_samples=num_entropy_samples) # output is saved in the node.outputs
                         break
                     except Exception as e:
                         print(f"Error during execution of node {current_node_id}: {e}")
@@ -309,9 +330,11 @@ class Graph(ABC):
     async def arun(self, input: Dict[str,str], 
                   num_rounds:int = 3, 
                   max_tries: int = 3, 
-                  max_time: int = 600,) -> List[Any]:
+                  max_time: int = 600,
+                  num_entropy_samples: int = 1,) -> List[Any]:
         # inputs:{'task':"xxx"}
         log_probs = 0
+        self.edge_log_probs = []
         new_features = self.construct_new_features(input['task'])
         logits = self.gcn(new_features,self.role_adj_matrix)
         logits = self.mlp(logits)
@@ -319,7 +342,7 @@ class Graph(ABC):
         self.spatial_logits = min_max_norm(torch.flatten(self.spatial_logits))
 
         for round in range(num_rounds):
-            log_probs += self.construct_spatial_connection()
+            log_probs += self.construct_spatial_connection(round)
             log_probs += self.construct_temporal_connection(round)
             
             in_degree = {node_id: len(node.spatial_predecessors) for node_id, node in self.nodes.items()}
@@ -330,7 +353,7 @@ class Graph(ABC):
                 tries = 0
                 while tries < max_tries:
                     try:
-                        await asyncio.wait_for(self.nodes[current_node_id].async_execute(input),timeout=max_time) # output is saved in the node.outputs
+                        await asyncio.wait_for(self.nodes[current_node_id].async_execute(input, round_idx=round, num_entropy_samples=num_entropy_samples),timeout=max_time) # output is saved in the node.outputs
                         break
                     except Exception as e:
                         print(f"Error during execution of node {current_node_id}: {e}")
@@ -393,4 +416,3 @@ def min_max_norm(tensor:torch.Tensor):
     normalized_0_to_1 = (tensor - min_val) / (max_val - min_val)
     normalized_minus1_to_1 = normalized_0_to_1 * 2 - 1
     return normalized_minus1_to_1
-    

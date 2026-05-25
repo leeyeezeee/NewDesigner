@@ -61,7 +61,8 @@ class Node(ABC):
         self.outputs: List[Any] = []
         self.raw_inputs: List[Any] = []
         self.role = ""
-        self.last_memory: Dict[str,List[Any]] = {'inputs':[],'outputs':[],'raw_inputs':[]}        
+        self.last_memory: Dict[str,List[Any]] = {'inputs':[],'outputs':[],'raw_inputs':[]}
+        self.execution_history: List[Dict[str, Any]] = []
 
     @property
     def node_name(self):
@@ -141,30 +142,88 @@ class Node(ABC):
         
         return temporal_info
     
+    def _record_execution(self, round_idx: int, spatial_info: Dict[str, Any], temporal_info: Dict[str, Any]):
+        if round_idx is None:
+            return
+        spatial_info_snapshot = {
+            node_id: dict(info)
+            for node_id, info in spatial_info.items()
+        }
+        temporal_info_snapshot = {
+            node_id: dict(info)
+            for node_id, info in temporal_info.items()
+        }
+        self.execution_history.append({
+            "round": round_idx,
+            "outputs": list(self.outputs),
+            "baseline_outputs": list(getattr(self, "_last_baseline_outputs", [])),
+            "spatial_predecessors": list(spatial_info.keys()),
+            "temporal_predecessors": list(temporal_info.keys()),
+            "spatial_info": spatial_info_snapshot,
+            "temporal_info": temporal_info_snapshot,
+        })
+
     def execute(self, input:Any, **kwargs):
+        round_idx = kwargs.pop("round_idx", None)
+        num_entropy_samples = kwargs.pop("num_entropy_samples", 1)
+        collect_baseline_outputs = kwargs.pop("collect_baseline_outputs", False)
+        num_entropy_samples = max(1, int(num_entropy_samples))
         self.outputs = []
+        self._last_baseline_outputs = []
         spatial_info:Dict[str,Dict] = self.get_spatial_info()
         temporal_info:Dict[str,Dict] = self.get_temporal_info()
-        results = [self._execute(input, spatial_info, temporal_info, **kwargs)]
+        if collect_baseline_outputs and num_entropy_samples > 1:
+            baseline_results = [
+                self._execute(input, {}, {}, **kwargs)
+                for _ in range(num_entropy_samples)
+            ]
+            for result in baseline_results:
+                if not isinstance(result, list):
+                    result = [result]
+                self._last_baseline_outputs.extend(result)
+        results = [
+            self._execute(input, spatial_info, temporal_info, **kwargs)
+            for _ in range(num_entropy_samples)
+        ]
 
         for result in results:
             if not isinstance(result, list):
                 result = [result]
             self.outputs.extend(result)
+        self._record_execution(round_idx, spatial_info, temporal_info)
         return self.outputs
 
 
     async def async_execute(self, input:Any, **kwargs):
+        round_idx = kwargs.pop("round_idx", None)
+        num_entropy_samples = kwargs.pop("num_entropy_samples", 1)
+        collect_baseline_outputs = kwargs.pop("collect_baseline_outputs", False)
+        num_entropy_samples = max(1, int(num_entropy_samples))
 
         self.outputs = []
+        self._last_baseline_outputs = []
         spatial_info:Dict[str,Any] = self.get_spatial_info()
         temporal_info:Dict[str,Any] = self.get_temporal_info()
-        tasks = [asyncio.create_task(self._async_execute(input, spatial_info, temporal_info, **kwargs))]
+        if collect_baseline_outputs and num_entropy_samples > 1:
+            baseline_tasks = [
+                asyncio.create_task(self._async_execute(input, {}, {}, **kwargs))
+                for _ in range(num_entropy_samples)
+            ]
+            baseline_results = await asyncio.gather(*baseline_tasks, return_exceptions=False)
+            for result in baseline_results:
+                if not isinstance(result, list):
+                    result = [result]
+                self._last_baseline_outputs.extend(result)
+        tasks = [
+            asyncio.create_task(self._async_execute(input, spatial_info, temporal_info, **kwargs))
+            for _ in range(num_entropy_samples)
+        ]
         results = await asyncio.gather(*tasks, return_exceptions=False)
         for result in results:
             if not isinstance(result, list):
                 result = [result]
             self.outputs.extend(result)
+        self._record_execution(round_idx, spatial_info, temporal_info)
         return self.outputs
                
     @abstractmethod

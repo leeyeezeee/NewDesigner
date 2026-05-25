@@ -10,7 +10,12 @@ import copy
 from GDesigner.graph.graph import Graph
 from experiments.accuracy import Accuracy
 from GDesigner.utils.globals import Cost, PromptTokens, CompletionTokens
-from GDesigner.utils.uncertainty import answer_uncertainty, uncertainty_adjusted_utility
+from GDesigner.utils.uncertainty import (
+    SemanticEntailmentJudge,
+    edge_entropy_rewards,
+    edge_semantic_loss,
+    total_reward_with_edges,
+)
 
 async def train(graph:Graph,
             dataset,
@@ -19,6 +24,15 @@ async def train(graph:Graph,
             lr:float=0.1,
             batch_size:int = 4,
             uncertainty_lambda: float = 0.0,
+            imp_per_iterations: int = 5,
+            pruning_rate: float = 0.25,
+            num_entropy_samples: int = 1,
+            semantic_judge_llm_name: str = "gpt-4o-mini",
+            semantic_judge_api_key: str = "",
+            semantic_judge_base_url: str = "",
+            semantic_judge_model_path: str = "",
+            negative_edge_reward_scale: float = 1.0,
+            nonpositive_edge_penalty: float = 0.01,
           ) -> None:
     
     def infinite_data_loader() -> Iterator[pd.DataFrame]:
@@ -29,8 +43,18 @@ async def train(graph:Graph,
                     yield record
     
     loader = infinite_data_loader()
+    semantic_judge = SemanticEntailmentJudge(
+        llm_name=semantic_judge_llm_name,
+        api_key=semantic_judge_api_key,
+        base_url=semantic_judge_base_url,
+        model_path=semantic_judge_model_path,
+    )
+    effective_num_entropy_samples = max(2, int(num_entropy_samples)) if uncertainty_lambda > 0 else max(1, int(num_entropy_samples))
     
-    optimizer = torch.optim.Adam(list(graph.gcn.parameters()) + list(graph.mlp.parameters()), lr=lr)
+    optimizer_params = list(graph.gcn.parameters()) + list(graph.mlp.parameters())
+    if graph.optimized_temporal:
+        optimizer_params.append(graph.temporal_logits)
+    optimizer = torch.optim.Adam(optimizer_params, lr=lr)
     graph.gcn.train()
     for i_iter in range(num_iters):
         print(f"Iter {i_iter}", 80*'-')
@@ -38,15 +62,20 @@ async def train(graph:Graph,
         correct_answers = []
         answer_log_probs = []
         realized_graphs = []
+        input_dicts = []
 
         for i_record, record in zip(range(batch_size), loader):
             realized_graph = copy.deepcopy(graph)
             realized_graph.gcn = graph.gcn
             realized_graph.mlp = graph.mlp
+            realized_graph.temporal_logits = graph.temporal_logits
             realized_graphs.append(realized_graph)
             input_dict = dataset.record_to_input(record)
+            input_dicts.append(input_dict)
             print(input_dict)
-            answer_log_probs.append(asyncio.create_task(realized_graph.arun(input_dict,num_rounds)))
+            answer_log_probs.append(asyncio.create_task(
+                realized_graph.arun(input_dict, num_rounds, num_entropy_samples=effective_num_entropy_samples)
+            ))
             correct_answer = dataset.record_to_target_answer(record)
             correct_answers.append(correct_answer)
         
@@ -56,7 +85,7 @@ async def train(graph:Graph,
         utilities: List[float] = []
         answers: List[str] = []
         
-        for raw_answer, log_prob, correct_answer, realized_graph in zip(raw_answers, log_probs, correct_answers, realized_graphs):
+        for raw_answer, log_prob, correct_answer, realized_graph, input_dict in zip(raw_answers, log_probs, correct_answers, realized_graphs, input_dicts):
             answer = dataset.postprocess_answer(raw_answer)
             answers.append(answer)
             assert isinstance(correct_answer, str), \
@@ -64,19 +93,39 @@ async def train(graph:Graph,
             accuracy = Accuracy()
             accuracy.update(answer, correct_answer)
             correctness_reward = accuracy.get()
-            agent_outputs = [node.outputs[-1] for node in realized_graph.nodes.values() if len(node.outputs)]
-            uncertainty, uncertainty_labels = answer_uncertainty(agent_outputs, dataset.postprocess_answer)
-            utility = uncertainty_adjusted_utility(correctness_reward, uncertainty, uncertainty_lambda)
+            edge_rewards, edge_reward_details = ({}, {})
+            if uncertainty_lambda > 0 and effective_num_entropy_samples > 1:
+                edge_rewards, edge_reward_details = await edge_entropy_rewards(
+                    realized_graph,
+                    input_dict["task"],
+                    input_dict,
+                    semantic_judge,
+                    effective_num_entropy_samples,
+                    negative_reward_scale=negative_edge_reward_scale,
+                    nonpositive_penalty=nonpositive_edge_penalty,
+                )
+            edge_losses = edge_semantic_loss(
+                realized_graph.edge_log_probs,
+                edge_rewards,
+                uncertainty_lambda,
+            )
+            utility = total_reward_with_edges(correctness_reward, edge_rewards, uncertainty_lambda)
             utilities.append(utility)
-            single_loss = - log_prob * utility
+            single_loss = - log_prob * correctness_reward
+            if edge_losses:
+                single_loss = single_loss + torch.sum(torch.stack(edge_losses))
             loss_list.append(single_loss)
             print(f"correct answer:{correct_answer}")
-            print(f"uncertainty:{uncertainty}, uncertainty_labels:{uncertainty_labels}")
+            print(f"edge entropy rewards:{edge_rewards}, edge_reward_details:{edge_reward_details}")
     
         total_loss = torch.mean(torch.stack(loss_list))
-        optimizer.zero_grad() 
+        optimizer.zero_grad()
         total_loss.backward()
         optimizer.step()
+        if (graph.optimized_spatial or graph.optimized_temporal) and (i_iter + 1) % imp_per_iterations == 0:
+            spatial_masks, temporal_masks = graph.update_masks(pruning_rate)
+            print("spatial masks:", spatial_masks.view(graph.num_nodes, graph.num_nodes))
+            print("temporal masks:", temporal_masks.view(graph.num_nodes, graph.num_nodes))
 
         print("raw_answers:",raw_answers)
         print("answers:",answers)
