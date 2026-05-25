@@ -45,7 +45,6 @@ class SemanticEntailmentJudge:
             api_key
             or os.getenv("SEMANTIC_JUDGE_API_KEY")
             or os.getenv("OPENAI_API_KEY")
-            or os.getenv("API_KEY")
             or ""
         )
         self.base_url = (
