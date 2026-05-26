@@ -386,12 +386,19 @@ class Graph(ABC):
                 return True
         return False
 
-    def update_masks(self, pruning_rate: float) -> torch.Tensor:
+    def update_masks(self, pruning_rate: float, spatial_logits: Optional[torch.Tensor] = None) -> torch.Tensor:
         if self.optimized_spatial:
             num_edges = (self.spatial_masks > 0).sum()
             num_masks = (self.spatial_masks == 0).sum()
             prune_num_edges = torch.round(num_edges*pruning_rate) if torch.round(num_edges*pruning_rate)>0 else 1
-            _edge_logits = self.spatial_logits.clone()
+            edge_logits = spatial_logits if spatial_logits is not None else getattr(self, "spatial_logits", None)
+            if edge_logits is None:
+                raise RuntimeError(
+                    "spatial_logits are required for spatial pruning. Pass batch-level "
+                    "spatial_logits to update_masks because spatial logits are computed "
+                    "per query in arun()."
+                )
+            _edge_logits = edge_logits.detach().clone().view(-1)
             min_edge_logit = _edge_logits.min()
             _edge_logits[self.spatial_masks == 0] = min_edge_logit - 1.0
             sorted_edges_idx = torch.argsort(_edge_logits)
