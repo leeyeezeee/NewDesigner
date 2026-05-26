@@ -173,7 +173,7 @@ async def main():
             total_executed = total_executed + 1
             accuracy = total_solved/ total_executed
             edge_rewards, edge_reward_details = ({}, {})
-            if args.uncertainty_lambda > 0 and effective_num_entropy_samples > 1:
+            if is_solved and args.uncertainty_lambda > 0 and effective_num_entropy_samples > 1:
                 edge_rewards, edge_reward_details = await edge_entropy_rewards(
                     realized_graph,
                     task["task"],
@@ -187,6 +187,7 @@ async def main():
                 realized_graph.edge_log_probs,
                 edge_rewards,
                 args.uncertainty_lambda,
+                is_solved,
             )
             utility = total_reward_with_edges(is_solved, edge_rewards, args.uncertainty_lambda)
             utilities.append(utility)

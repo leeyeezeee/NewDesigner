@@ -363,8 +363,13 @@ async def edge_entropy_rewards(
     return rewards, details
 
 
-def edge_semantic_loss(edge_log_probs, edge_rewards: dict, semantic_lambda: float):
-    if semantic_lambda <= 0 or not edge_log_probs:
+def edge_semantic_loss(
+    edge_log_probs,
+    edge_rewards: dict,
+    semantic_lambda: float,
+    correctness_reward: float = 1.0,
+):
+    if semantic_lambda <= 0 or not edge_log_probs or correctness_reward <= 0:
         return None
 
     losses = []
@@ -377,6 +382,6 @@ def edge_semantic_loss(edge_log_probs, edge_rewards: dict, semantic_lambda: floa
 
 
 def total_reward_with_edges(correctness_reward: float, edge_rewards: Dict[str, float], semantic_lambda: float) -> float:
-    if semantic_lambda <= 0:
+    if semantic_lambda <= 0 or correctness_reward <= 0:
         return correctness_reward
     return correctness_reward + semantic_lambda * sum(edge_rewards.values())

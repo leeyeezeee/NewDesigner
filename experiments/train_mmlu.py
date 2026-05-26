@@ -94,7 +94,7 @@ async def train(graph:Graph,
             accuracy.update(answer, correct_answer)
             correctness_reward = accuracy.get()
             edge_rewards = {}
-            if uncertainty_lambda > 0 and effective_num_entropy_samples > 1:
+            if correctness_reward > 0 and uncertainty_lambda > 0 and effective_num_entropy_samples > 1:
                 edge_rewards, _ = await edge_entropy_rewards(
                     realized_graph,
                     input_dict["task"],
@@ -108,6 +108,7 @@ async def train(graph:Graph,
                 realized_graph.edge_log_probs,
                 edge_rewards,
                 uncertainty_lambda,
+                correctness_reward,
             )
             utility = total_reward_with_edges(correctness_reward, edge_rewards, uncertainty_lambda)
             utilities.append(utility)
