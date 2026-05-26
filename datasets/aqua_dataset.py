@@ -1,23 +1,24 @@
 import re
 
-def gsm_data_process(dataset):
-    # extract the question, step and answer
+
+def aqua_data_process(dataset):
     list_data_dict = []
     for data in dataset:
-        item = {"task":data["question"]}
-        raw_answer = data["answer"]
-        raw_answer_list = raw_answer.split("\n####")
-        item["step"] = raw_answer_list[0].strip()
-        item["answer"] = raw_answer_list[-1].replace(",", "").strip()
+        task = data["question"] + ' ' + 'Choices:'
+        for option in data["options"]:
+            task = task + ' ' + option
+        item = {"task": task}
+        item["step"] = data["rationale"]
+        item["answer"] = data["correct"]
         list_data_dict.append(item)
 
     return list_data_dict
 
 
-def gsm_get_predict(pred_str):
-    if('The answer is ' in pred_str):
+def aqua_get_predict(pred_str):
+    if ('The answer is ' in pred_str):
         pred = pred_str.split('The answer is ')[-1].strip()
-    elif('the answer is ' in pred_str):
+    elif ('the answer is ' in pred_str):
         pred = pred_str.split('the answer is ')[-1].strip()
     elif 'boxed' in pred_str:
         ans = pred_str.split('boxed')[-1]
@@ -37,23 +38,23 @@ def gsm_get_predict(pred_str):
         else:
             a = ans.split('$')[0].strip()
         a = _strip_string(a)
-        pred=a
+        pred = a
     else:
-        pattern = '-?\d*\.?\d+'
+        pattern = r'[A-Z]'
         pred = re.findall(pattern, pred_str)
-        if(len(pred) >= 1):
-            # print(pred_str)
+        if (len(pred) >= 1):
             pred = pred[-1]
-        else: pred = ''
-    
+        else:
+            pred = ''
+
     if pred != "":
         if pred[-1] == ".":
             pred = pred[:-1]
         if pred[-1] == "/":
             pred = pred[:-1]
-            
-    pred=_strip_string(pred)
-    
+
+    pred = _strip_string(pred)
+
     if 'boxed' in pred:
         ans = pred.split('boxed')[-1]
         if (ans[0] == '{'):
@@ -72,13 +73,13 @@ def gsm_get_predict(pred_str):
         else:
             a = ans.split('$')[0].strip()
         a = _strip_string(a)
-        pred=a
-        
-    if pred.isdigit():
+        pred = a
+
+    if len(pred) == 1 and pred.isupper():
         return pred
     else:
-        matches = re.findall(r'\d+', pred)
-        return matches[-1] if matches else '0'
+        matches = re.findall(r'[A-Z]', pred)
+        return matches[-1] if matches else 'None.'
 
 
 def _fix_sqrt(string):
@@ -95,9 +96,10 @@ def _fix_sqrt(string):
         new_string += new_substr
     return new_string
 
+
 def delete_extra_zero(n):
     try:
-        n=float(n)
+        n = float(n)
     except:
         print("None {}".format(n))
         return n
@@ -106,8 +108,9 @@ def delete_extra_zero(n):
     if isinstance(n, float):
         n = str(n).rstrip('0')
         n = int(n.rstrip('.')) if n.endswith('.') else float(n)
-        n=str(n)
+        n = str(n)
         return n
+
 
 def _fix_fracs(string):
     substrs = string.split("\\frac")
@@ -140,6 +143,7 @@ def _fix_fracs(string):
     string = new_str
     return string
 
+
 def _fix_a_slash_b(string):
     if len(string.split("/")) != 2:
         return string
@@ -154,8 +158,8 @@ def _fix_a_slash_b(string):
     except:
         return string
 
+
 def _remove_right_units(string):
-    # "\\text{ " only ever occurs (at least in the val set) when describing units
     if "\\text{ " in string:
         splits = string.split("\\text{ ")
         assert len(splits) == 2
@@ -163,98 +167,50 @@ def _remove_right_units(string):
     else:
         return string
 
+
 def _strip_string(string):
-    # linebreaks
     string = string.replace("\n", "")
-    # print(string)
 
-    # remove inverse spaces
     string = string.replace("\\!", "")
-    # print(string)
 
-    # replace \\ with \
     string = string.replace("\\\\", "\\")
-    # print(string)
 
-    # replace tfrac and dfrac with frac
     string = string.replace("tfrac", "frac")
     string = string.replace("dfrac", "frac")
-    # print(string)
 
-    # remove \left and \right
     string = string.replace("\\left", "")
     string = string.replace("\\right", "")
-    # print(string)
 
-    # Remove circ (degrees)
     string = string.replace("^{\\circ}", "")
     string = string.replace("^\\circ", "")
 
-    # remove dollar signs
     string = string.replace("\\$", "")
 
-    # remove units (on the right)
     string = _remove_right_units(string)
 
-    # remove percentage
     string = string.replace("\\%", "")
     string = string.replace("\%", "")
 
-    # " 0." equivalent to " ." and "{0." equivalent to "{." Alternatively, add "0" if "." is the start of the string
     string = string.replace(" .", " 0.")
     string = string.replace("{.", "{0.")
-    # if empty, return empty string
     if len(string) == 0:
         return string
     if string[0] == ".":
         string = "0" + string
 
-    # to consider: get rid of e.g. "k = " or "q = " at beginning
     if len(string.split("=")) == 2:
         if len(string.split("=")[0]) <= 2:
             string = string.split("=")[1]
 
-    # fix sqrt3 --> sqrt{3}
     string = _fix_sqrt(string)
 
-    # remove spaces
     string = string.replace(" ", "")
 
-    # \frac1b or \frac12 --> \frac{1}{b} and \frac{1}{2}, etc. Even works with \frac1{72} (but not \frac{72}1). Also does a/b --> \\frac{a}{b}
     string = _fix_fracs(string)
 
-    # manually change 0.5 --> \frac{1}{2}
     if string == "0.5":
         string = "\\frac{1}{2}"
 
-    # NOTE: X/Y changed to \frac{X}{Y} in dataset, but in simple cases fix in case the model output is X/Y
     string = _fix_a_slash_b(string)
 
     return string
-
-
-def svamp_data_process(dataset):
-    list_data_dict = []
-    for data in dataset:
-        task = f"{data['Body'].strip()} {data['Question'].strip()}"
-        answer = str(data['Answer'])
-        list_data_dict.append({
-            "task": task,
-            "answer": answer,
-            "step": "",
-        })
-    return list_data_dict
-
-
-def multiarith_data_process(dataset):
-    list_data_dict = []
-    for data in dataset:
-        task = data['sQuestion'].strip()
-        ans = data['lSolutions']
-        answer = str(ans[0]) if isinstance(ans, list) else str(ans)
-        list_data_dict.append({
-            "task": task,
-            "answer": answer,
-            "step": "",
-        })
-    return list_data_dict

@@ -5,6 +5,8 @@ import numpy as np
 import torch
 import asyncio
 
+import GDesigner.agents
+import GDesigner.prompt
 from GDesigner.graph.node import Node
 from GDesigner.agents.agent_registry import AgentRegistry
 from GDesigner.prompt.prompt_set_registry import PromptSetRegistry

@@ -54,9 +54,9 @@ def parse_args():
     parser.add_argument('--lr', type=float, default=0.1,help="learning rate")
     parser.add_argument('--batch_size', type=int, default=4,help="batch size")
     parser.add_argument('--num_rounds',type=int,default=2,help="Number of optimization/inference rounds for one query")
-    parser.add_argument('--pruning_rate', type=float, default=0.25,help="The Rate of Pruning. Default 0.05.")
+    parser.add_argument('--pruning_rate', type=float, default=0.25,help="Deprecated compatibility option. No pruning is performed.")
     parser.add_argument('--imp_per_iterations', type=int, default=5,
-                        help="Prune every few iterations. Default 5.")
+                        help="Deprecated compatibility option. No pruning is performed.")
     parser.add_argument('--uncertainty_lambda', type=float, default=0.0,
                         help="Weight for edge-level semantic entropy reward. Default 0 keeps original utility.")
     parser.add_argument('--num_entropy_samples', type=int, default=1,
@@ -219,22 +219,6 @@ async def main():
             optimizer.zero_grad()
             total_loss.backward()
             optimizer.step()
-            if (i_batch + 1) % args.imp_per_iterations == 0:
-                batch_spatial_logits = None
-                if graph.optimized_spatial:
-                    spatial_logit_tensors = [
-                        realized_graph.spatial_logits.detach()
-                        for realized_graph in realized_graphs
-                        if hasattr(realized_graph, "spatial_logits")
-                    ]
-                    if spatial_logit_tensors:
-                        batch_spatial_logits = torch.mean(torch.stack(spatial_logit_tensors), dim=0)
-                spatial_masks, temporal_masks = graph.update_masks(
-                    args.pruning_rate,
-                    spatial_logits=batch_spatial_logits,
-                )
-                print("spatial masks:", spatial_masks.view(graph.num_nodes, graph.num_nodes))
-                print("temporal masks:", temporal_masks.view(graph.num_nodes, graph.num_nodes))
         print(f"Batch time {time.time() - start_ts:.3f}")
         print(f"Accuracy: {accuracy}")
         print("utilities:", utilities)

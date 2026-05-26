@@ -123,22 +123,6 @@ async def train(graph:Graph,
         optimizer.zero_grad()
         total_loss.backward()
         optimizer.step()
-        if (graph.optimized_spatial or graph.optimized_temporal) and (i_iter + 1) % imp_per_iterations == 0:
-            batch_spatial_logits = None
-            if graph.optimized_spatial:
-                spatial_logit_tensors = [
-                    realized_graph.spatial_logits.detach()
-                    for realized_graph in realized_graphs
-                    if hasattr(realized_graph, "spatial_logits")
-                ]
-                if spatial_logit_tensors:
-                    batch_spatial_logits = torch.mean(torch.stack(spatial_logit_tensors), dim=0)
-            spatial_masks, temporal_masks = graph.update_masks(
-                pruning_rate,
-                spatial_logits=batch_spatial_logits,
-            )
-            print("spatial masks:", spatial_masks.view(graph.num_nodes, graph.num_nodes))
-            print("temporal masks:", temporal_masks.view(graph.num_nodes, graph.num_nodes))
 
         print("answers:",answers)
         print(f"Batch time {time.time() - start_ts:.3f}")

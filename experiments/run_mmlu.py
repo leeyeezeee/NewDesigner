@@ -35,11 +35,11 @@ def parse_args():
     parser.add_argument('--num_iterations', type=int, default=10,
                         help="Number of optimization iterations. Default 10.")
     parser.add_argument('--imp_per_iterations', type=int, default=5,
-                        help="Prune every few iterations. Default 5.")
+                        help="Deprecated compatibility option. No pruning is performed.")
     parser.add_argument('--num_rounds',type=int,default=2,
                         help="Number of optimization/inference rounds for one query. Use at least 2 to measure semantic entropy reduction after communication.")
     parser.add_argument('--pruning_rate', type=float, default=0.25,
-                        help="The Rate of Pruning. Default 0.05.")
+                        help="Deprecated compatibility option. No pruning is performed.")
     parser.add_argument('--uncertainty_lambda', type=float, default=0.0,
                         help="Weight for edge-level semantic entropy reward. Default 0 keeps original utility.")
     parser.add_argument('--num_entropy_samples', type=int, default=1,
