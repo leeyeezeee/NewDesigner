@@ -123,6 +123,13 @@ async def train(graph:Graph,
         optimizer.zero_grad()
         total_loss.backward()
         optimizer.step()
+        if (
+            graph.optimized_temporal
+            and (i_iter + 1) % imp_per_iterations == 0
+        ):
+            temporal_masks, pruned_temporal_idx = graph.prune_temporal_edges(pruning_rate)
+            print(f"pruned temporal edges: {pruned_temporal_idx.numel()}")
+            print("temporal masks:", temporal_masks.view(graph.num_nodes, graph.num_nodes))
 
         print("answers:",answers)
         print(f"Batch time {time.time() - start_ts:.3f}")

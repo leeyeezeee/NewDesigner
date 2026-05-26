@@ -34,7 +34,10 @@ from bs4 import BeautifulSoup
 from pylatexenc.latex2text import LatexNodes2Text
 from pptx import Presentation
 
-from GDesigner.llm import VisualLLMRegistry
+try:
+    from GDesigner.llm import VisualLLMRegistry
+except ImportError:
+    VisualLLMRegistry = None
 from GDesigner.utils.log import logger
 from GDesigner.utils.globals import Cost
 
@@ -45,6 +48,16 @@ import requests
 from openai import OpenAI, AsyncOpenAI
 
 OPENAI_API_KEY=os.getenv("OPENAI_API_KEY")
+
+
+def _get_visual_llm_runner():
+    if VisualLLMRegistry is None:
+        raise ImportError(
+            "VisualLLMRegistry is not available in GDesigner.llm. "
+            "Text readers can still be used, but image/video readers require "
+            "restoring or implementing the visual LLM registry."
+        )
+    return VisualLLMRegistry.get()
 
 
 # Refs: https://platform.openai.com/docs/api-reference
@@ -269,14 +282,14 @@ class PythonReader(Reader):
 class IMGReader(Reader):
     def parse(self, file_path: Path, task: str = "Describe this image as detail as possible." ) -> str:
         logger.info(f"Reading image file from {file_path}.")
-        runner = VisualLLMRegistry.get()
+        runner = _get_visual_llm_runner()
         answer = runner.gen(task, file_path)
         return answer
 
 class VideoReader(Reader): 
     def parse(self, file_path: Path, task: str = "Describe this image as detail as possible.", frame_interval: int = 30, used_audio: bool = True) -> list:
         logger.info(f"Processing video file from {file_path} with frame interval {frame_interval}.")
-        runner = VisualLLMRegistry.get()
+        runner = _get_visual_llm_runner()
         answer = runner.gen_video(task, file_path, frame_interval)
 
         if used_audio:

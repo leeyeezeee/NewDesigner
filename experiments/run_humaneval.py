@@ -54,9 +54,10 @@ def parse_args():
     parser.add_argument('--lr', type=float, default=0.1,help="learning rate")
     parser.add_argument('--batch_size', type=int, default=4,help="batch size")
     parser.add_argument('--num_rounds',type=int,default=2,help="Number of optimization/inference rounds for one query")
-    parser.add_argument('--pruning_rate', type=float, default=0.25,help="Deprecated compatibility option. No pruning is performed.")
+    parser.add_argument('--pruning_rate', type=float, default=0.25,
+                        help="Rate for temporal edge pruning when --optimized_temporal is set.")
     parser.add_argument('--imp_per_iterations', type=int, default=5,
-                        help="Deprecated compatibility option. No pruning is performed.")
+                        help="Prune temporal edges every few iterations when --optimized_temporal is set.")
     parser.add_argument('--uncertainty_lambda', type=float, default=0.0,
                         help="Weight for edge-level semantic entropy reward. Default 0 keeps original utility.")
     parser.add_argument('--num_entropy_samples', type=int, default=1,
@@ -219,6 +220,13 @@ async def main():
             optimizer.zero_grad()
             total_loss.backward()
             optimizer.step()
+            if (
+                graph.optimized_temporal
+                and (i_batch + 1) % args.imp_per_iterations == 0
+            ):
+                temporal_masks, pruned_temporal_idx = graph.prune_temporal_edges(args.pruning_rate)
+                print(f"pruned temporal edges: {pruned_temporal_idx.numel()}")
+                print("temporal masks:", temporal_masks.view(graph.num_nodes, graph.num_nodes))
         print(f"Batch time {time.time() - start_ts:.3f}")
         print(f"Accuracy: {accuracy}")
         print("utilities:", utilities)

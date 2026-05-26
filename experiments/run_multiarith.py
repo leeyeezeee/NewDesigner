@@ -27,6 +27,10 @@ def parse_args():
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--num_rounds", type=int, default=2)
     parser.add_argument("--num_iterations", type=int, default=10)
+    parser.add_argument("--imp_per_iterations", type=int, default=5,
+                        help="Prune temporal edges every few iterations when --optimized_temporal is set.")
+    parser.add_argument("--pruning_rate", type=float, default=0.25,
+                        help="Rate for temporal edge pruning when --optimized_temporal is set.")
     parser.add_argument("--domain", type=str, default="gsm8k")
     parser.add_argument("--agent_names", nargs="+", type=str, default=["MathSolver"])
     parser.add_argument("--agent_nums", nargs="+", type=int, default=[4])

@@ -388,6 +388,22 @@ class Graph(ABC):
                 return True
         return False
 
+    def prune_temporal_edges(self, pruning_rate: float) -> Tuple[torch.Tensor, torch.Tensor]:
+        if not self.optimized_temporal or pruning_rate <= 0:
+            return self.temporal_masks, torch.empty(0, dtype=torch.long)
+
+        active_idx = torch.nonzero(self.temporal_masks > 0, as_tuple=False).view(-1)
+        if active_idx.numel() == 0:
+            return self.temporal_masks, active_idx
+
+        prune_num_edges = int(torch.round(active_idx.numel() * torch.tensor(pruning_rate)).item())
+        prune_num_edges = min(max(1, prune_num_edges), active_idx.numel())
+        temporal_logits = self.temporal_logits.detach().view(-1)
+        prune_idx = active_idx[torch.argsort(temporal_logits[active_idx])[:prune_num_edges]]
+        with torch.no_grad():
+            self.temporal_masks[prune_idx] = 0
+        return self.temporal_masks, prune_idx
+
     def update_masks(self, pruning_rate: float, spatial_logits: Optional[torch.Tensor] = None) -> torch.Tensor:
         if self.optimized_spatial:
             num_edges = (self.spatial_masks > 0).sum()
