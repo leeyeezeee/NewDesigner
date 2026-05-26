@@ -3,8 +3,39 @@ import os
 from collections import Counter
 from typing import Any, Dict, Iterable, List, Optional, Tuple, TypeVar
 
+import httpx
+from openai import APIConnectionError, APITimeoutError, RateLimitError
+from tenacity import (
+    AsyncRetrying,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_random_exponential,
+)
+
 
 T = TypeVar("T")
+
+_DEFAULT_JUDGE_TIMEOUT = 120.0
+_DEFAULT_JUDGE_CONNECT_TIMEOUT = 10.0
+_DEFAULT_JUDGE_MAX_RETRIES = 3
+
+
+def _float_env(name: str, default: float) -> float:
+    value = os.getenv(name)
+    if value is None or value == "":
+        return default
+    return float(value)
+
+
+def _int_env(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None or value == "":
+        return default
+    return int(value)
+
+
+def _judge_http_timeout(read_timeout: float, connect_timeout: float) -> httpx.Timeout:
+    return httpx.Timeout(timeout=read_timeout, connect=connect_timeout)
 
 
 def semantic_entropy(labels: Iterable[str]) -> float:
@@ -21,6 +52,18 @@ def semantic_entropy(labels: Iterable[str]) -> float:
     return entropy
 
 
+def _semantic_judge_extra_body(model: str) -> Dict[str, Any]:
+    """Qwen backends (e.g. vveai) require enable_thinking=false for non-streaming judge calls."""
+    if "qwen" not in model.lower():
+        return {}
+    return {
+        "enable_thinking": False,
+        "chat_template_kwargs": {
+            "enable_thinking": False,
+        },
+    }
+
+
 class SemanticEntailmentJudge:
     def __init__(
         self,
@@ -28,12 +71,31 @@ class SemanticEntailmentJudge:
         api_key: str = "",
         base_url: str = "",
         model_path: str = "",
+        timeout: Optional[float] = None,
+        connect_timeout: Optional[float] = None,
+        max_retries: Optional[int] = None,
     ):
         try:
             from dotenv import load_dotenv
             load_dotenv()
         except Exception:
             pass
+
+        self.timeout = (
+            timeout
+            if timeout is not None
+            else _float_env("SEMANTIC_JUDGE_TIMEOUT", _DEFAULT_JUDGE_TIMEOUT)
+        )
+        self.connect_timeout = (
+            connect_timeout
+            if connect_timeout is not None
+            else _float_env("SEMANTIC_JUDGE_CONNECT_TIMEOUT", _DEFAULT_JUDGE_CONNECT_TIMEOUT)
+        )
+        self.max_retries = (
+            max_retries
+            if max_retries is not None
+            else _int_env("SEMANTIC_JUDGE_MAX_RETRIES", _DEFAULT_JUDGE_MAX_RETRIES)
+        )
 
         self.llm_name = (
             model_path
@@ -59,7 +121,11 @@ class SemanticEntailmentJudge:
         if self.llm_name and self.api_key:
             from openai import AsyncOpenAI
 
-            client_kwargs = {"api_key": self.api_key}
+            client_kwargs = {
+                "api_key": self.api_key,
+                "timeout": _judge_http_timeout(self.timeout, self.connect_timeout),
+                "max_retries": 0,
+            }
             if self.base_url:
                 client_kwargs["base_url"] = self.base_url
             self._client = AsyncOpenAI(**client_kwargs)
@@ -67,6 +133,18 @@ class SemanticEntailmentJudge:
     @property
     def is_configured(self) -> bool:
         return bool(self._client and self.llm_name)
+
+    async def _create_completion(self, request_kwargs: Dict[str, Any]):
+        async for attempt in AsyncRetrying(
+            wait=wait_random_exponential(multiplier=1, max=60),
+            stop=stop_after_attempt(max(1, self.max_retries)),
+            retry=retry_if_exception_type(
+                (APITimeoutError, APIConnectionError, RateLimitError)
+            ),
+            reraise=True,
+        ):
+            with attempt:
+                return await self._client.chat.completions.create(**request_kwargs)
 
     async def entails(self, question: str, premise: str, hypothesis: str) -> bool:
         if self._client is None:
@@ -97,12 +175,16 @@ class SemanticEntailmentJudge:
                 ),
             },
         ]
-        response = await self._client.chat.completions.create(
-            model=self.llm_name,
-            messages=messages,
-            temperature=0.0,
-            max_tokens=32,
-        )
+        request_kwargs: Dict[str, Any] = {
+            "model": self.llm_name,
+            "messages": messages,
+            "temperature": 0.0,
+            "max_tokens": 32,
+        }
+        extra_body = _semantic_judge_extra_body(self.llm_name)
+        if extra_body:
+            request_kwargs["extra_body"] = extra_body
+        response = await self._create_completion(request_kwargs)
         verdict = response.choices[0].message.content or ""
         verdict = verdict.strip().lower()
         return verdict.startswith("entail")
