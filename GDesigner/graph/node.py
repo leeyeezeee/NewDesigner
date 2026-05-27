@@ -185,6 +185,7 @@ class Node(ABC):
     def execute(self, input:Any, **kwargs):
         round_idx = kwargs.pop("round_idx", None)
         num_entropy_samples = kwargs.pop("num_entropy_samples", 1)
+        record_execution_history = kwargs.pop("record_execution_history", True)
         num_entropy_samples = max(1, int(num_entropy_samples))
         self.outputs = []
         self.entropy_samples = []
@@ -196,13 +197,15 @@ class Node(ABC):
         ]
 
         self._set_execution_outputs(results)
-        self._record_execution(round_idx, spatial_info, temporal_info)
+        if record_execution_history:
+            self._record_execution(round_idx, spatial_info, temporal_info)
         return self.outputs
 
 
     async def async_execute(self, input:Any, **kwargs):
         round_idx = kwargs.pop("round_idx", None)
         num_entropy_samples = kwargs.pop("num_entropy_samples", 1)
+        record_execution_history = kwargs.pop("record_execution_history", True)
         num_entropy_samples = max(1, int(num_entropy_samples))
 
         self.outputs = []
@@ -215,7 +218,8 @@ class Node(ABC):
         ]
         results = await asyncio.gather(*tasks, return_exceptions=False)
         self._set_execution_outputs(results)
-        self._record_execution(round_idx, spatial_info, temporal_info)
+        if record_execution_history:
+            self._record_execution(round_idx, spatial_info, temporal_info)
         return self.outputs
                
     @abstractmethod

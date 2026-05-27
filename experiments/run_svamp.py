@@ -61,7 +61,6 @@ async def main():
         dataset,
         dataset_name="svamp",
         graph_domain=args.domain,
-        result_prefix="svamp",
         answer_parser=gsm_get_predict,
         correctness_fn=numeric_correct,
     )

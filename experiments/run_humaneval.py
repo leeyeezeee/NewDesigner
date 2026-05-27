@@ -2,10 +2,8 @@ import sys
 import os
 import argparse
 import yaml
-import json
 import time
 import asyncio
-from pathlib import Path
 import torch
 import copy
 from typing import List,Union,Literal
@@ -26,15 +24,6 @@ from GDesigner.utils.uncertainty import (
     edge_semantic_loss,
     total_reward_with_edges,
 )
-
-def load_result(result_file):
-    if not result_file.exists():
-        with open(result_file, 'w',encoding='utf-8') as file:
-            json.dump([], file)
-
-    with open(result_file, 'r',encoding='utf-8') as file:
-        data = json.load(file)
-    return data
 
 def dataloader(data_list, batch_size, i_batch):
     return data_list[i_batch*batch_size:i_batch*batch_size + batch_size]
@@ -97,14 +86,10 @@ def parse_args():
 
 async def main():
     args = parse_args()
-    result_file = None
     dataset = JSONLReader.parse_file(args.dataset_json)
     current_time = Time.instance().value or time.strftime("%Y-%m-%d-%H-%M-%S", time.localtime())
     Time.instance().value = current_time
-    result_dir = Path(f"{GDesigner_ROOT}/result/eval")
-    result_dir.mkdir(parents=True, exist_ok=True)
-    result_file = result_dir / f"{args.llm_name}_{current_time}.json"
-    
+
     agent_names = [name for name,num in zip(args.agent_names,args.agent_nums) for _ in range(num)]
     decision_method = args.decision_method
     kwargs = get_kwargs(args.mode,len(agent_names))
@@ -121,18 +106,25 @@ async def main():
     if graph.optimized_temporal:
         optimizer_params.append(graph.temporal_logits)
     optimizer = torch.optim.Adam(optimizer_params, lr=args.lr)
-    semantic_judge = SemanticEntailmentJudge(
-        llm_name=args.semantic_judge_llm_name,
-        api_key=args.semantic_judge_api_key,
-        base_url=args.semantic_judge_base_url,
-        model_path=args.semantic_judge_model_path,
-    )
     effective_num_entropy_samples = max(2, int(args.num_entropy_samples)) if args.uncertainty_lambda > 0 else max(1, int(args.num_entropy_samples))
+    optimize_enabled = args.optimized_spatial or args.optimized_temporal
+    use_semantic_edges_for_training = optimize_enabled and args.uncertainty_lambda > 0 and effective_num_entropy_samples > 1
+    semantic_judge = None
+    if use_semantic_edges_for_training:
+        semantic_judge = SemanticEntailmentJudge(
+            llm_name=args.semantic_judge_llm_name,
+            api_key=args.semantic_judge_api_key,
+            base_url=args.semantic_judge_base_url,
+            model_path=args.semantic_judge_model_path,
+        )
     
     num_batches = int(len(dataset)/args.batch_size)
     total_solved, total_executed = (0, 0)
     accuracy = 0.0
     for i_batch in range(num_batches):
+        train_updates_enabled = optimize_enabled and i_batch < args.num_iterations
+        use_semantic_edges = use_semantic_edges_for_training and train_updates_enabled
+        batch_entropy_samples = effective_num_entropy_samples if use_semantic_edges else 1
         print(f"Batch {i_batch}",80*'-')
         start_ts = time.time()
         answer_log_probs = []
@@ -157,14 +149,19 @@ async def main():
             input_dict = {"task": task}
             input_dicts.append(input_dict)
             answer_log_probs.append(asyncio.create_task(
-                realized_graph.arun(input_dict, args.num_rounds, num_entropy_samples=effective_num_entropy_samples)
+                realized_graph.arun(
+                    input_dict,
+                    args.num_rounds,
+                    num_entropy_samples=batch_entropy_samples,
+                    record_execution_history=use_semantic_edges,
+                    track_grad=train_updates_enabled,
+                )
             ))
         raw_results = await asyncio.gather(*answer_log_probs)
         raw_answers, log_probs = zip(*raw_results)
         loss_list: List[torch.Tensor] = []
         utilities: List[float] = []
-        data = load_result(result_file)
-        
+
         for task, answer, log_prob, test, realized_graph, input_dict in zip(current_batch, raw_answers, log_probs, tests, realized_graphs, input_dicts):
             if not isinstance(answer,list):
                 raise TypeError(f"Expected a list for the answer, but got {type(answer).__name__}")
@@ -174,9 +171,9 @@ async def main():
             total_executed = total_executed + 1
             accuracy = total_solved/ total_executed
 
-            edge_rewards, edge_reward_details = ({}, {})
-            if is_solved and args.uncertainty_lambda > 0 and effective_num_entropy_samples > 1:
-                edge_rewards, edge_reward_details = await edge_entropy_rewards(
+            edge_rewards = {}
+            if is_solved and use_semantic_edges:
+                edge_rewards, _ = await edge_entropy_rewards(
                     realized_graph,
                     task["prompt"],
                     input_dict,
@@ -185,6 +182,7 @@ async def main():
                     negative_reward_scale=args.negative_edge_reward_scale,
                     nonpositive_penalty=args.nonpositive_edge_penalty,
                 )
+            realized_graph.clear_execution_history()
             edge_losses = edge_semantic_loss(
                 realized_graph.edge_log_probs,
                 edge_rewards,
@@ -197,26 +195,9 @@ async def main():
             if edge_losses:
                 single_loss = single_loss + torch.sum(torch.stack(edge_losses))
             loss_list.append(single_loss)
-            updated_item = {
-                "Question": task,
-                "Tests": test,
-                "Attempt answer": answer,
-                "Solved": is_solved,
-                "Solution": answer,
-                "Total solved": total_solved,
-                "Total executed": total_executed,
-                "Accuracy": accuracy
-            }
-            if args.uncertainty_lambda > 0:
-                updated_item["Edge entropy rewards"] = edge_rewards
-                updated_item["Edge entropy details"] = edge_reward_details
-                updated_item["Utility"] = utility
-            data.append(updated_item)
-        with open(result_file, 'w',encoding='utf-8') as file:
-            json.dump(data, file, indent=4)
-        
+
         total_loss = torch.mean(torch.stack(loss_list))
-        if args.optimized_spatial or args.optimized_temporal:
+        if train_updates_enabled:
             optimizer.zero_grad()
             total_loss.backward()
             optimizer.step()
@@ -233,10 +214,9 @@ async def main():
         print("loss:", total_loss.item())
 
         if i_batch+1 == args.num_iterations:
-            args.optimized_spatial = False
-            args.optimized_temporal = False
             total_solved = 0
             total_executed = 0
+            accuracy = 0.0
             graph.gcn.eval()
             graph.mlp.eval()
             print("Start Eval")
@@ -245,20 +225,16 @@ async def main():
         print(f"PromptTokens {PromptTokens.instance().value}")
         print(f"CompletionTokens {CompletionTokens.instance().value}")
 
+    print(f"Final Eval Accuracy: {accuracy}")
+    print(f"Final Cost {Cost.instance().value}")
+    print(f"Final PromptTokens {PromptTokens.instance().value}")
+    print(f"Final CompletionTokens {CompletionTokens.instance().value}")
     write_metrics_record(args.metrics_file, {
         "dataset": "humaneval",
         "accuracy": accuracy,
         "total_solved": total_solved,
         "total_executed": total_executed,
-        "mode": args.mode,
         "llm_name": args.llm_name,
-        "agent_nums": args.agent_nums,
-        "num_iterations": args.num_iterations,
-        "num_rounds": args.num_rounds,
-        "uncertainty_lambda": args.uncertainty_lambda,
-        "num_entropy_samples": args.num_entropy_samples,
-        "semantic_judge_llm_name": args.semantic_judge_llm_name,
-        "result_file": str(result_file),
     })
 
 

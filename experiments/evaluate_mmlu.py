@@ -52,7 +52,15 @@ async def evaluate(
             realized_graph.mlp = graph.mlp
             input_dict = dataset.record_to_input(record)
             # print(input_dict)
-            answer_log_probs.append(asyncio.create_task(realized_graph.arun(input_dict,num_rounds)))
+            answer_log_probs.append(asyncio.create_task(
+                realized_graph.arun(
+                    input_dict,
+                    num_rounds,
+                    num_entropy_samples=1,
+                    record_execution_history=False,
+                    track_grad=False,
+                )
+            ))
         raw_results = await asyncio.gather(*answer_log_probs)
         raw_answers, log_probs = zip(*raw_results)
         print(f"Batch time {time.time() - start_ts:.3f}")

@@ -61,7 +61,6 @@ async def main():
         dataset,
         dataset_name="aqua",
         graph_domain=args.domain,
-        result_prefix=args.domain,
         answer_parser=aqua_get_predict,
         correctness_fn=choice_correct,
     )

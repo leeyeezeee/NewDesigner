@@ -61,7 +61,6 @@ async def main():
         dataset,
         dataset_name="multiarith",
         graph_domain=args.domain,
-        result_prefix="multiarith",
         answer_parser=gsm_get_predict,
         correctness_fn=numeric_correct,
     )

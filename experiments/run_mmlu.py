@@ -108,19 +108,11 @@ async def main():
         
     
     score = await evaluate(graph=graph,dataset=dataset_val,num_rounds=args.num_rounds,limit_questions=limit_questions,eval_batch_size=args.batch_size)
-    print(f"Score: {score}")
+    print(f"Final Eval Accuracy: {score}")
     write_metrics_record(args.metrics_file, {
         "dataset": "mmlu",
         "accuracy": score,
-        "score": score,
-        "mode": args.mode,
         "llm_name": args.llm_name,
-        "agent_nums": args.agent_nums,
-        "num_iterations": args.num_iterations,
-        "num_rounds": args.num_rounds,
-        "uncertainty_lambda": args.uncertainty_lambda,
-        "num_entropy_samples": args.num_entropy_samples,
-        "semantic_judge_llm_name": args.semantic_judge_llm_name,
     })
 
 

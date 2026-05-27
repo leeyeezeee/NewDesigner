@@ -1,16 +1,13 @@
 import asyncio
 import copy
-import json
 import os
 import random
 import time
-from pathlib import Path
 from typing import Callable, Dict, List, Literal, Tuple, Union
 
 import torch
 
 from GDesigner.graph.graph import Graph
-from GDesigner.utils.const import GDesigner_ROOT
 from GDesigner.utils.globals import CompletionTokens, Cost, PromptTokens, Time
 from GDesigner.utils.metrics import write_metrics_record
 from GDesigner.utils.uncertainty import (
@@ -23,15 +20,6 @@ from GDesigner.utils.uncertainty import (
 
 AnswerParser = Callable[[str], str]
 CorrectnessFn = Callable[[str, str], bool]
-
-
-def load_result(result_file: Path):
-    if not result_file.exists():
-        with open(result_file, "w", encoding="utf-8") as file:
-            json.dump([], file)
-
-    with open(result_file, "r", encoding="utf-8") as file:
-        return json.load(file)
 
 
 def dataloader(data_list, batch_size, i_batch):
@@ -55,15 +43,11 @@ async def run_math_dataset(
     *,
     dataset_name: str,
     graph_domain: str,
-    result_prefix: str,
     answer_parser: AnswerParser,
     correctness_fn: CorrectnessFn,
 ) -> None:
     current_time = Time.instance().value or time.strftime("%Y-%m-%d-%H-%M-%S", time.localtime())
     Time.instance().value = current_time
-    result_dir = Path(f"{GDesigner_ROOT}/result/{dataset_name}")
-    result_dir.mkdir(parents=True, exist_ok=True)
-    result_file = result_dir / f"{result_prefix}_{args.llm_name}_{current_time}.json"
 
     agent_names = [
         name
@@ -87,23 +71,34 @@ async def run_math_dataset(
         optimizer_params.append(graph.temporal_logits)
     optimizer = torch.optim.Adam(optimizer_params, lr=args.lr)
 
-    semantic_judge = SemanticEntailmentJudge(
-        llm_name=args.semantic_judge_llm_name,
-        api_key=args.semantic_judge_api_key,
-        base_url=args.semantic_judge_base_url,
-        model_path=args.semantic_judge_model_path,
-    )
     effective_num_entropy_samples = (
         max(2, int(args.num_entropy_samples))
         if args.uncertainty_lambda > 0
         else max(1, int(args.num_entropy_samples))
     )
+    optimize_enabled = args.optimized_spatial or args.optimized_temporal
+    use_semantic_edges_for_training = (
+        optimize_enabled
+        and args.uncertainty_lambda > 0
+        and effective_num_entropy_samples > 1
+    )
+    semantic_judge = None
+    if use_semantic_edges_for_training:
+        semantic_judge = SemanticEntailmentJudge(
+            llm_name=args.semantic_judge_llm_name,
+            api_key=args.semantic_judge_api_key,
+            base_url=args.semantic_judge_base_url,
+            model_path=args.semantic_judge_model_path,
+        )
 
     num_batches = int(len(dataset) / args.batch_size)
     total_solved, total_executed = (0, 0)
     accuracy = 0.0
 
     for i_batch in range(num_batches):
+        train_updates_enabled = optimize_enabled and i_batch < args.num_iterations
+        use_semantic_edges = use_semantic_edges_for_training and train_updates_enabled
+        batch_entropy_samples = effective_num_entropy_samples if use_semantic_edges else 1
         print(f"Batch {i_batch}", 80 * "-")
         start_ts = time.time()
         answer_log_probs = []
@@ -131,7 +126,9 @@ async def run_math_dataset(
                     realized_graph.arun(
                         input_dict,
                         args.num_rounds,
-                        num_entropy_samples=effective_num_entropy_samples,
+                        num_entropy_samples=batch_entropy_samples,
+                        record_execution_history=use_semantic_edges,
+                        track_grad=train_updates_enabled,
                     )
                 )
             )
@@ -140,7 +137,6 @@ async def run_math_dataset(
         raw_answers, log_probs = zip(*raw_results)
         loss_list: List[torch.Tensor] = []
         utilities: List[float] = []
-        data = load_result(result_file)
 
         for record, answer, log_prob, true_answer, realized_graph, input_dict in zip(
             current_batch,
@@ -157,13 +153,12 @@ async def run_math_dataset(
             total_executed += 1
             accuracy = total_solved / total_executed
 
-            edge_rewards, edge_reward_details = ({}, {})
+            edge_rewards = {}
             if (
                 is_solved
-                and args.uncertainty_lambda > 0
-                and effective_num_entropy_samples > 1
+                and use_semantic_edges
             ):
-                edge_rewards, edge_reward_details = await edge_entropy_rewards(
+                edge_rewards, _ = await edge_entropy_rewards(
                     realized_graph,
                     record["task"],
                     input_dict,
@@ -172,6 +167,7 @@ async def run_math_dataset(
                     negative_reward_scale=args.negative_edge_reward_scale,
                     nonpositive_penalty=args.nonpositive_edge_penalty,
                 )
+            realized_graph.clear_execution_history()
             edge_losses = edge_semantic_loss(
                 realized_graph.edge_log_probs,
                 edge_rewards,
@@ -189,28 +185,8 @@ async def run_math_dataset(
                 single_loss = single_loss + torch.sum(torch.stack(edge_losses))
             loss_list.append(single_loss)
 
-            updated_item = {
-                "Question": record["task"],
-                "Answer": true_answer,
-                "Step": record.get("step", ""),
-                "Response": answer,
-                "Attempt answer": predict_answer,
-                "Solved": is_solved,
-                "Total solved": total_solved,
-                "Total executed": total_executed,
-                "Accuracy": accuracy,
-            }
-            if args.uncertainty_lambda > 0:
-                updated_item["Edge entropy rewards"] = edge_rewards
-                updated_item["Edge entropy details"] = edge_reward_details
-                updated_item["Utility"] = utility
-            data.append(updated_item)
-
-        with open(result_file, "w", encoding="utf-8") as file:
-            json.dump(data, file, indent=4)
-
         total_loss = torch.mean(torch.stack(loss_list))
-        if args.optimized_spatial or args.optimized_temporal:
+        if train_updates_enabled:
             optimizer.zero_grad()
             total_loss.backward()
             optimizer.step()
@@ -228,10 +204,9 @@ async def run_math_dataset(
         print("loss:", total_loss.item())
 
         if i_batch + 1 == args.num_iterations:
-            args.optimized_spatial = False
-            args.optimized_temporal = False
             total_solved = 0
             total_executed = 0
+            accuracy = 0.0
             graph.gcn.eval()
             graph.mlp.eval()
             print("Start Eval")
@@ -240,20 +215,16 @@ async def run_math_dataset(
         print(f"PromptTokens {PromptTokens.instance().value}")
         print(f"CompletionTokens {CompletionTokens.instance().value}")
 
+    print(f"Final Eval Accuracy: {accuracy}")
+    print(f"Final Cost {Cost.instance().value}")
+    print(f"Final PromptTokens {PromptTokens.instance().value}")
+    print(f"Final CompletionTokens {CompletionTokens.instance().value}")
     write_metrics_record(args.metrics_file, {
         "dataset": dataset_name,
         "accuracy": accuracy,
         "total_solved": total_solved,
         "total_executed": total_executed,
-        "mode": args.mode,
         "llm_name": args.llm_name,
-        "agent_nums": args.agent_nums,
-        "num_iterations": args.num_iterations,
-        "num_rounds": args.num_rounds,
-        "uncertainty_lambda": args.uncertainty_lambda,
-        "num_entropy_samples": args.num_entropy_samples,
-        "semantic_judge_llm_name": args.semantic_judge_llm_name,
-        "result_file": str(result_file),
     })
 
 

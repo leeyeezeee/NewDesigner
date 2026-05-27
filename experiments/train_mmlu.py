@@ -43,13 +43,16 @@ async def train(graph:Graph,
                     yield record
     
     loader = infinite_data_loader()
-    semantic_judge = SemanticEntailmentJudge(
-        llm_name=semantic_judge_llm_name,
-        api_key=semantic_judge_api_key,
-        base_url=semantic_judge_base_url,
-        model_path=semantic_judge_model_path,
-    )
     effective_num_entropy_samples = max(2, int(num_entropy_samples)) if uncertainty_lambda > 0 else max(1, int(num_entropy_samples))
+    use_semantic_edges = uncertainty_lambda > 0 and effective_num_entropy_samples > 1
+    semantic_judge = None
+    if use_semantic_edges:
+        semantic_judge = SemanticEntailmentJudge(
+            llm_name=semantic_judge_llm_name,
+            api_key=semantic_judge_api_key,
+            base_url=semantic_judge_base_url,
+            model_path=semantic_judge_model_path,
+        )
     
     optimizer_params = list(graph.gcn.parameters()) + list(graph.mlp.parameters())
     if graph.optimized_temporal:
@@ -74,7 +77,13 @@ async def train(graph:Graph,
             input_dict = dataset.record_to_input(record)
             input_dicts.append(input_dict)
             answer_log_probs.append(asyncio.create_task(
-                realized_graph.arun(input_dict, num_rounds, num_entropy_samples=effective_num_entropy_samples)
+                realized_graph.arun(
+                    input_dict,
+                    num_rounds,
+                    num_entropy_samples=effective_num_entropy_samples,
+                    record_execution_history=use_semantic_edges,
+                    track_grad=True,
+                )
             ))
             correct_answer = dataset.record_to_target_answer(record)
             correct_answers.append(correct_answer)
@@ -94,7 +103,7 @@ async def train(graph:Graph,
             accuracy.update(answer, correct_answer)
             correctness_reward = accuracy.get()
             edge_rewards = {}
-            if correctness_reward > 0 and uncertainty_lambda > 0 and effective_num_entropy_samples > 1:
+            if correctness_reward > 0 and use_semantic_edges:
                 edge_rewards, _ = await edge_entropy_rewards(
                     realized_graph,
                     input_dict["task"],
@@ -104,6 +113,7 @@ async def train(graph:Graph,
                     negative_reward_scale=negative_edge_reward_scale,
                     nonpositive_penalty=nonpositive_edge_penalty,
                 )
+            realized_graph.clear_execution_history()
             edge_losses = edge_semantic_loss(
                 realized_graph.edge_log_probs,
                 edge_rewards,
