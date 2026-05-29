@@ -59,6 +59,8 @@ def parse_args():
                         help="Semantic judge OpenAI-compatible base URL. Use http://localhost:8000/v1 for local vLLM.")
     parser.add_argument('--semantic_judge_model_path', type=str, default="",
                         help="Optional judge model name override kept for backward compatibility.")
+    parser.add_argument('--semantic_judge_max_concurrency', type=int, default=None,
+                        help="Maximum concurrent semantic judge API requests. Defaults to SEMANTIC_JUDGE_MAX_CONCURRENCY or 16.")
     parser.add_argument('--negative_edge_reward_scale', type=float, default=1.0,
                         help="Scale for negative edge rewards when an edge increases semantic entropy.")
     parser.add_argument('--nonpositive_edge_penalty', type=float, default=0.01,
@@ -116,6 +118,7 @@ async def main():
             api_key=args.semantic_judge_api_key,
             base_url=args.semantic_judge_base_url,
             model_path=args.semantic_judge_model_path,
+            max_concurrency=args.semantic_judge_max_concurrency,
         )
     
     num_batches = int(len(dataset)/args.batch_size)

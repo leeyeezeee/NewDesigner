@@ -1,3 +1,4 @@
+import asyncio
 import math
 import os
 from collections import Counter
@@ -18,6 +19,7 @@ T = TypeVar("T")
 _DEFAULT_JUDGE_TIMEOUT = 120.0
 _DEFAULT_JUDGE_CONNECT_TIMEOUT = 10.0
 _DEFAULT_JUDGE_MAX_RETRIES = 3
+_DEFAULT_JUDGE_MAX_CONCURRENCY = 16
 
 
 def _float_env(name: str, default: float) -> float:
@@ -74,6 +76,7 @@ class SemanticEntailmentJudge:
         timeout: Optional[float] = None,
         connect_timeout: Optional[float] = None,
         max_retries: Optional[int] = None,
+        max_concurrency: Optional[int] = None,
     ):
         try:
             from dotenv import load_dotenv
@@ -96,6 +99,16 @@ class SemanticEntailmentJudge:
             if max_retries is not None
             else _int_env("SEMANTIC_JUDGE_MAX_RETRIES", _DEFAULT_JUDGE_MAX_RETRIES)
         )
+        self.max_concurrency = max(
+            1,
+            max_concurrency
+            if max_concurrency is not None
+            else _int_env(
+                "SEMANTIC_JUDGE_MAX_CONCURRENCY",
+                _DEFAULT_JUDGE_MAX_CONCURRENCY,
+            ),
+        )
+        self._request_semaphore = asyncio.Semaphore(self.max_concurrency)
 
         self.llm_name = (
             model_path
@@ -144,7 +157,8 @@ class SemanticEntailmentJudge:
             reraise=True,
         ):
             with attempt:
-                return await self._client.chat.completions.create(**request_kwargs)
+                async with self._request_semaphore:
+                    return await self._client.chat.completions.create(**request_kwargs)
 
     async def entails(self, question: str, premise: str, hypothesis: str) -> bool:
         if self._client is None:
@@ -192,7 +206,18 @@ class SemanticEntailmentJudge:
     async def equivalent(self, question: str, output_a: str, output_b: str) -> bool:
         if output_a.strip() == output_b.strip():
             return True
-        return await self.entails(question, output_a, output_b) and await self.entails(question, output_b, output_a)
+        forward, backward = await asyncio.gather(
+            self.entails(question, output_a, output_b),
+            self.entails(question, output_b, output_a),
+            return_exceptions=True,
+        )
+        if isinstance(forward, Exception):
+            raise forward
+        if not forward:
+            return False
+        if isinstance(backward, Exception):
+            raise backward
+        return bool(backward)
 
     async def cluster_outputs(self, question: str, outputs: Iterable[Any]) -> List[str]:
         valid_outputs = [str(output) for output in outputs if str(output).strip()]
@@ -200,9 +225,21 @@ class SemanticEntailmentJudge:
         labels: List[str] = []
         for output in valid_outputs:
             label = ""
-            for cluster_idx, cluster in enumerate(clusters):
-                if await self.equivalent(question, output, cluster[0]):
-                    cluster.append(output)
+            if clusters:
+                comparisons = await asyncio.gather(
+                    *[
+                        self.equivalent(question, output, cluster[0])
+                        for cluster in clusters
+                    ],
+                    return_exceptions=True,
+                )
+            else:
+                comparisons = []
+            for cluster_idx, comparison in enumerate(comparisons):
+                if isinstance(comparison, Exception):
+                    raise comparison
+                if comparison:
+                    clusters[cluster_idx].append(output)
                     label = f"cluster_{cluster_idx}"
                     break
             if not label:
@@ -331,12 +368,17 @@ async def edge_entropy_rewards(
         if not before_outputs or not after_outputs:
             continue
 
-        before_entropy, before_labels = await semantic_uncertainty(question, before_outputs, judge)
         after_cache_key = (target_id, round_idx)
         if after_cache_key in after_cache:
+            before_entropy, before_labels = await semantic_uncertainty(question, before_outputs, judge)
             after_entropy, after_labels = after_cache[after_cache_key]
         else:
-            after_entropy, after_labels = await semantic_uncertainty(question, after_outputs, judge)
+            before_result, after_result = await asyncio.gather(
+                semantic_uncertainty(question, before_outputs, judge),
+                semantic_uncertainty(question, after_outputs, judge),
+            )
+            before_entropy, before_labels = before_result
+            after_entropy, after_labels = after_result
             after_cache[after_cache_key] = (after_entropy, after_labels)
             history_item["entropy_samples"] = []
 

@@ -42,6 +42,7 @@ def parse_args():
     parser.add_argument("--semantic_judge_api_key", type=str, default="")
     parser.add_argument("--semantic_judge_base_url", type=str, default="")
     parser.add_argument("--semantic_judge_model_path", type=str, default="")
+    parser.add_argument("--semantic_judge_max_concurrency", type=int, default=None)
     parser.add_argument("--negative_edge_reward_scale", type=float, default=1.0)
     parser.add_argument("--nonpositive_edge_penalty", type=float, default=0.01)
     parser.add_argument("--optimized_spatial", action="store_true")

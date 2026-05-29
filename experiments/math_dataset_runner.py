@@ -89,6 +89,7 @@ async def run_math_dataset(
             api_key=args.semantic_judge_api_key,
             base_url=args.semantic_judge_base_url,
             model_path=args.semantic_judge_model_path,
+            max_concurrency=args.semantic_judge_max_concurrency,
         )
 
     num_batches = int(len(dataset) / args.batch_size)

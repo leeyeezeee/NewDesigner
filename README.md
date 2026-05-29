@@ -41,6 +41,12 @@ For example, if you want to verify the results on the `gsm8k` dataset, you can e
 python experiments/run_gsm8k.py --mode FullConnected --batch_size 4 --agent_nums 4 --num_iterations 10 --num_rounds 1 --optimized_spatial
 ```
 
+When semantic edge rewards are enabled, the judge can use any OpenAI-compatible local vLLM server:
+
+```bash
+python experiments/run_gsm8k.py --optimized_spatial --uncertainty_lambda 1.0 --num_entropy_samples 2 --semantic_judge_llm_name Qwen/Qwen2.5-7B-Instruct --semantic_judge_base_url http://localhost:8000/v1 --semantic_judge_max_concurrency 32
+```
+
 ## Acknowledgement
 
 This code refers to [GPTSwarm](https://github.com/metauto-ai/GPTSwarm).

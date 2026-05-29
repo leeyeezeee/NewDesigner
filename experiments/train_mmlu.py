@@ -31,6 +31,7 @@ async def train(graph:Graph,
             semantic_judge_api_key: str = "",
             semantic_judge_base_url: str = "",
             semantic_judge_model_path: str = "",
+            semantic_judge_max_concurrency: int = None,
             negative_edge_reward_scale: float = 1.0,
             nonpositive_edge_penalty: float = 0.01,
           ) -> None:
@@ -52,6 +53,7 @@ async def train(graph:Graph,
             api_key=semantic_judge_api_key,
             base_url=semantic_judge_base_url,
             model_path=semantic_judge_model_path,
+            max_concurrency=semantic_judge_max_concurrency,
         )
     
     optimizer_params = list(graph.gcn.parameters()) + list(graph.mlp.parameters())
