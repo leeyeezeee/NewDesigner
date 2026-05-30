@@ -5,6 +5,7 @@ import csv
 import os
 import random
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -61,6 +62,17 @@ class DatasetBundle:
     record_to_target: RecordToTarget
     parse_prediction: PredictionParser
     is_correct: CorrectnessFn
+
+
+@dataclass
+class InferenceResult:
+    dataset: str
+    index: int
+    input_dict: Dict[str, Any]
+    realized_graph: Graph
+    predicted_answer: str
+    target_answer: str
+    is_correct: bool
 
 
 DATASET_DEFAULTS: Dict[str, DatasetDefaults] = {
@@ -137,7 +149,12 @@ def parse_args():
         help="MMLU split. Ignored by non-MMLU datasets.",
     )
     parser.add_argument("--limit_questions", type=int, default=153)
-    parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=4,
+        help="Number of records inferred concurrently in each batch.",
+    )
     parser.add_argument(
         "--mode",
         type=str,
@@ -166,7 +183,12 @@ def parse_args():
     parser.add_argument("--semantic_judge_api_key", type=str, default="")
     parser.add_argument("--semantic_judge_base_url", type=str, default="")
     parser.add_argument("--semantic_judge_model_path", type=str, default="")
-    parser.add_argument("--semantic_judge_max_concurrency", type=int, default=None)
+    parser.add_argument(
+        "--semantic_judge_max_concurrency",
+        type=int,
+        default=None,
+        help="Maximum concurrent semantic judge requests. Defaults to env or 16.",
+    )
     parser.add_argument("--humaneval_timeout", type=int, default=100)
     parser.add_argument("--bins", type=int, default=25)
     parser.add_argument("--seed", type=int, default=888)
@@ -488,14 +510,19 @@ async def average_agent_semantic_entropy(
     return average_entropy, per_agent_entropy
 
 
-async def evaluate_record(
+async def compute_correctness(bundle: DatasetBundle, predicted: str, target: str) -> bool:
+    if bundle.name == "humaneval":
+        return await asyncio.to_thread(bundle.is_correct, predicted, target)
+    return bundle.is_correct(predicted, target)
+
+
+async def run_record_inference(
     graph: Graph,
     bundle: DatasetBundle,
     record_index: int,
     record,
     args,
-    judge: SemanticEntailmentJudge,
-) -> Dict[str, Any]:
+) -> InferenceResult:
     realized_graph = copy.deepcopy(graph)
     realized_graph.gcn = graph.gcn
     realized_graph.mlp = graph.mlp
@@ -512,19 +539,34 @@ async def evaluate_record(
 
     predicted_answer = bundle.parse_prediction(raw_answer)
     target_answer = bundle.record_to_target(record)
-    is_correct = bundle.is_correct(predicted_answer, target_answer)
+    is_correct = await compute_correctness(bundle, predicted_answer, target_answer)
+    return InferenceResult(
+        dataset=bundle.name,
+        index=record_index,
+        input_dict=input_dict,
+        realized_graph=realized_graph,
+        predicted_answer=predicted_answer,
+        target_answer=target_answer,
+        is_correct=is_correct,
+    )
+
+
+async def attach_semantic_entropy(
+    result: InferenceResult,
+    judge: SemanticEntailmentJudge,
+) -> Dict[str, Any]:
     avg_entropy, per_agent_entropy = await average_agent_semantic_entropy(
-        realized_graph,
-        input_dict["task"],
+        result.realized_graph,
+        result.input_dict["task"],
         judge,
     )
 
     return {
-        "dataset": bundle.name,
-        "index": record_index,
-        "predicted_answer": predicted_answer,
-        "target_answer": target_answer,
-        "is_correct": is_correct,
+        "dataset": result.dataset,
+        "index": result.index,
+        "predicted_answer": result.predicted_answer,
+        "target_answer": result.target_answer,
+        "is_correct": result.is_correct,
         "average_agent_semantic_entropy": avg_entropy,
         "per_agent_semantic_entropy": per_agent_entropy,
     }
@@ -648,6 +690,7 @@ async def main():
             "--semantic_judge_api_key; for local vLLM, pass "
             "--semantic_judge_base_url http://localhost:8000/v1."
         )
+    print(f"Semantic judge max concurrency: {judge.max_concurrency}")
 
     rows: List[Dict[str, Any]] = []
     correct_count = 0
@@ -656,16 +699,30 @@ async def main():
         iter_batches(bundle.records, args.batch_size, args.limit_questions)
     ):
         print(f"Batch {batch_id}")
-        batch_rows = await asyncio.gather(
+        inference_start = time.time()
+        inference_results = await asyncio.gather(
             *[
-                evaluate_record(graph, bundle, record_index, record, args, judge)
+                run_record_inference(graph, bundle, record_index, record, args)
                 for record_index, record in batch
             ]
         )
+        inference_seconds = time.time() - inference_start
+
+        entropy_start = time.time()
+        batch_rows = await asyncio.gather(
+            *[
+                attach_semantic_entropy(inference_result, judge)
+                for inference_result in inference_results
+            ]
+        )
+        entropy_seconds = time.time() - entropy_start
+
         rows.extend(batch_rows)
         correct_count += sum(int(row["is_correct"]) for row in batch_rows)
         total_count += len(batch_rows)
         print(f"Accuracy so far: {correct_count / total_count:.4f}")
+        print(f"Inference time: {inference_seconds:.3f}s")
+        print(f"Semantic entropy time: {entropy_seconds:.3f}s")
 
     correct_values = [
         row["average_agent_semantic_entropy"] for row in rows if row["is_correct"]
