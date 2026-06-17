@@ -22,7 +22,6 @@ from GDesigner.utils.uncertainty import (
     SemanticEntailmentJudge,
     edge_entropy_rewards,
     edge_semantic_loss,
-    total_reward_with_edges,
 )
 
 def dataloader(data_list, batch_size, i_batch):
@@ -48,9 +47,13 @@ def parse_args():
     parser.add_argument('--imp_per_iterations', type=int, default=5,
                         help="Prune temporal edges every few iterations when --optimized_temporal is set.")
     parser.add_argument('--uncertainty_lambda', type=float, default=0.0,
-                        help="Weight for edge-level semantic entropy reward. Default 0 keeps original utility.")
+                        help="Deprecated alias for --semantic_beta. Default 0 keeps semantic entropy disabled.")
+    parser.add_argument('--correctness_alpha', type=float, default=1.0,
+                        help="Weight for graph-level final correctness loss.")
+    parser.add_argument('--semantic_beta', type=float, default=None,
+                        help="Weight for per-edge semantic entropy loss. Defaults to --uncertainty_lambda when omitted.")
     parser.add_argument('--num_entropy_samples', type=int, default=1,
-                        help="Samples per agent before and after communication for semantic entropy. Automatically raised to 2 when uncertainty_lambda > 0.")
+                        help="Samples per agent before and after communication for semantic entropy. Automatically raised to 2 when semantic_beta > 0.")
     parser.add_argument('--semantic_judge_llm_name', type=str, default="gpt-4o-mini",
                         help="OpenAI-compatible semantic judge model name. Independent from --llm_name.")
     parser.add_argument('--semantic_judge_api_key', type=str, default="",
@@ -64,7 +67,7 @@ def parse_args():
     parser.add_argument('--negative_edge_reward_scale', type=float, default=1.0,
                         help="Scale for negative edge rewards when an edge increases semantic entropy.")
     parser.add_argument('--nonpositive_edge_penalty', type=float, default=0.01,
-                        help="Extra penalty when a selected edge does not reduce semantic entropy.")
+                        help="Deprecated compatibility option; normalized edge rewards do not add a zero-gain penalty.")
     parser.add_argument('--num_iterations', type=int, default = 10,help="The num of training iterations.")
     parser.add_argument('--domain', type=str, default="humaneval",help="Domain (the same as dataset name), default 'humaneval'")
     parser.add_argument('--agent_names', nargs='+', type=str, default=['CodeWriting'],
@@ -108,9 +111,10 @@ async def main():
     if graph.optimized_temporal:
         optimizer_params.append(graph.temporal_logits)
     optimizer = torch.optim.Adam(optimizer_params, lr=args.lr)
-    effective_num_entropy_samples = max(2, int(args.num_entropy_samples)) if args.uncertainty_lambda > 0 else max(1, int(args.num_entropy_samples))
+    semantic_beta = args.uncertainty_lambda if args.semantic_beta is None else args.semantic_beta
+    effective_num_entropy_samples = max(2, int(args.num_entropy_samples)) if semantic_beta > 0 else max(1, int(args.num_entropy_samples))
     optimize_enabled = args.optimized_spatial or args.optimized_temporal
-    use_semantic_edges_for_training = optimize_enabled and args.uncertainty_lambda > 0 and effective_num_entropy_samples > 1
+    use_semantic_edges_for_training = optimize_enabled and semantic_beta > 0 and effective_num_entropy_samples > 1
     semantic_judge = None
     if use_semantic_edges_for_training:
         semantic_judge = SemanticEntailmentJudge(
@@ -163,7 +167,7 @@ async def main():
         raw_results = await asyncio.gather(*answer_log_probs)
         raw_answers, log_probs = zip(*raw_results)
         loss_list: List[torch.Tensor] = []
-        utilities: List[float] = []
+        utilities: List[dict] = []
 
         for task, answer, log_prob, test, realized_graph, input_dict in zip(current_batch, raw_answers, log_probs, tests, realized_graphs, input_dicts):
             if not isinstance(answer,list):
@@ -189,12 +193,15 @@ async def main():
             edge_losses = edge_semantic_loss(
                 realized_graph.edge_log_probs,
                 edge_rewards,
-                args.uncertainty_lambda,
+                semantic_beta,
                 is_solved,
             )
-            utility = total_reward_with_edges(is_solved, edge_rewards, args.uncertainty_lambda)
+            utility = {
+                "correctness": is_solved,
+                "edge_entropy_rewards": edge_rewards,
+            }
             utilities.append(utility)
-            single_loss = -log_prob * is_solved
+            single_loss = -log_prob * args.correctness_alpha * is_solved
             if edge_losses:
                 single_loss = single_loss + torch.sum(torch.stack(edge_losses))
             loss_list.append(single_loss)

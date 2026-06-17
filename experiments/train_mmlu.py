@@ -14,7 +14,6 @@ from GDesigner.utils.uncertainty import (
     SemanticEntailmentJudge,
     edge_entropy_rewards,
     edge_semantic_loss,
-    total_reward_with_edges,
 )
 
 async def train(graph:Graph,
@@ -24,6 +23,8 @@ async def train(graph:Graph,
             lr:float=0.1,
             batch_size:int = 4,
             uncertainty_lambda: float = 0.0,
+            correctness_alpha: float = 1.0,
+            semantic_beta: float = None,
             imp_per_iterations: int = 5,
             pruning_rate: float = 0.25,
             num_entropy_samples: int = 1,
@@ -44,8 +45,9 @@ async def train(graph:Graph,
                     yield record
     
     loader = infinite_data_loader()
-    effective_num_entropy_samples = max(2, int(num_entropy_samples)) if uncertainty_lambda > 0 else max(1, int(num_entropy_samples))
-    use_semantic_edges = uncertainty_lambda > 0 and effective_num_entropy_samples > 1
+    semantic_beta = uncertainty_lambda if semantic_beta is None else semantic_beta
+    effective_num_entropy_samples = max(2, int(num_entropy_samples)) if semantic_beta > 0 else max(1, int(num_entropy_samples))
+    use_semantic_edges = semantic_beta > 0 and effective_num_entropy_samples > 1
     semantic_judge = None
     if use_semantic_edges:
         semantic_judge = SemanticEntailmentJudge(
@@ -93,7 +95,7 @@ async def train(graph:Graph,
         raw_results = await asyncio.gather(*answer_log_probs)
         raw_answers, log_probs = zip(*raw_results)
         loss_list: List[torch.Tensor] = []
-        utilities: List[float] = []
+        utilities: List[dict] = []
         answers: List[str] = []
         
         for raw_answer, log_prob, correct_answer, realized_graph, input_dict in zip(raw_answers, log_probs, correct_answers, realized_graphs, input_dicts):
@@ -119,12 +121,15 @@ async def train(graph:Graph,
             edge_losses = edge_semantic_loss(
                 realized_graph.edge_log_probs,
                 edge_rewards,
-                uncertainty_lambda,
+                semantic_beta,
                 correctness_reward,
             )
-            utility = total_reward_with_edges(correctness_reward, edge_rewards, uncertainty_lambda)
+            utility = {
+                "correctness": correctness_reward,
+                "edge_entropy_rewards": edge_rewards,
+            }
             utilities.append(utility)
-            single_loss = - log_prob * correctness_reward
+            single_loss = -log_prob * correctness_alpha * correctness_reward
             if edge_losses:
                 single_loss = single_loss + torch.sum(torch.stack(edge_losses))
             loss_list.append(single_loss)

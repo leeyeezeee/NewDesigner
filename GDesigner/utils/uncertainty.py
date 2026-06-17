@@ -298,7 +298,42 @@ def _edge_reward_from_delta(
 ) -> float:
     if entropy_delta > 0:
         return entropy_delta
-    return negative_reward_scale * entropy_delta - nonpositive_penalty
+    if entropy_delta < 0:
+        return negative_reward_scale * entropy_delta
+    return 0.0
+
+
+def _normalize_edge_rewards(
+    details: Dict[str, Dict[str, Any]],
+    negative_reward_scale: float,
+    nonpositive_penalty: float,
+) -> Dict[str, float]:
+    if not details:
+        return {}
+
+    entropy_deltas = [
+        float(detail["entropy_delta"])
+        for detail in details.values()
+    ]
+    max_abs_delta = max(abs(delta) for delta in entropy_deltas)
+
+    rewards: Dict[str, float] = {}
+    for key, detail in details.items():
+        entropy_delta = float(detail["entropy_delta"])
+        normalized_delta = (
+            entropy_delta / max_abs_delta
+            if max_abs_delta > 0
+            else 0.0
+        )
+        reward = _edge_reward_from_delta(
+            normalized_delta,
+            negative_reward_scale=negative_reward_scale,
+            nonpositive_penalty=nonpositive_penalty,
+        )
+        detail["normalized_entropy_delta"] = normalized_delta
+        detail["reward"] = reward
+        rewards[key] = reward
+    return rewards
 
 
 async def edge_entropy_rewards(
@@ -319,7 +354,6 @@ async def edge_entropy_rewards(
         for history_item in node.execution_history:
             histories[(node_id, history_item["round"])] = history_item
 
-    rewards: Dict[str, float] = {}
     details: Dict[str, Dict[str, Any]] = {}
     after_cache: Dict[Tuple[str, int], Tuple[float, List[str]]] = {}
 
@@ -380,15 +414,8 @@ async def edge_entropy_rewards(
             before_entropy, before_labels = before_result
             after_entropy, after_labels = after_result
             after_cache[after_cache_key] = (after_entropy, after_labels)
-            history_item["entropy_samples"] = []
 
         entropy_delta = before_entropy - after_entropy
-        reward = _edge_reward_from_delta(
-            entropy_delta,
-            negative_reward_scale=negative_reward_scale,
-            nonpositive_penalty=nonpositive_penalty,
-        )
-        rewards[key] = reward
         details[key] = {
             "type": edge_type,
             "round": round_idx,
@@ -397,33 +424,38 @@ async def edge_entropy_rewards(
             "before_entropy": before_entropy,
             "after_entropy": after_entropy,
             "entropy_delta": entropy_delta,
-            "reward": reward,
+            "normalized_entropy_delta": entropy_delta,
+            "reward": 0.0,
             "before_labels": before_labels,
             "after_labels": after_labels,
         }
 
+    rewards = _normalize_edge_rewards(
+        details,
+        negative_reward_scale=negative_reward_scale,
+        nonpositive_penalty=nonpositive_penalty,
+    )
     return rewards, details
 
 
 def edge_semantic_loss(
     edge_log_probs,
     edge_rewards: dict,
-    semantic_lambda: float,
+    semantic_beta: float,
     correctness_reward: float = 1.0,
 ):
-    if semantic_lambda <= 0 or not edge_log_probs or correctness_reward <= 0:
+    if semantic_beta <= 0 or not edge_log_probs or correctness_reward <= 0:
         return None
 
     losses = []
     for edge_info in edge_log_probs:
-        reward = semantic_lambda * edge_rewards.get(edge_key(edge_info), 0.0)
+        reward = (
+            semantic_beta
+            * correctness_reward
+            * edge_rewards.get(edge_key(edge_info), 0.0)
+        )
         if reward != 0:
             # Negative rewards make gradient descent lower the probability of this selected edge.
             losses.append(-edge_info["log_prob"] * reward)
     return losses
 
-
-def total_reward_with_edges(correctness_reward: float, edge_rewards: Dict[str, float], semantic_lambda: float) -> float:
-    if semantic_lambda <= 0 or correctness_reward <= 0:
-        return correctness_reward
-    return correctness_reward + semantic_lambda * sum(edge_rewards.values())
