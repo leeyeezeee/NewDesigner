@@ -71,18 +71,16 @@ async def run_math_dataset(
     optimizer = torch.optim.Adam(optimizer_params, lr=args.lr)
 
     correctness_alpha = getattr(args, "correctness_alpha", 1.0)
-    semantic_beta_arg = getattr(args, "semantic_beta", None)
-    semantic_beta = args.uncertainty_lambda if semantic_beta_arg is None else semantic_beta_arg
 
     effective_num_entropy_samples = (
         max(2, int(args.num_entropy_samples))
-        if semantic_beta > 0
+        if args.uncertainty_lambda > 0
         else max(1, int(args.num_entropy_samples))
     )
     optimize_enabled = args.optimized_spatial or args.optimized_temporal
     use_semantic_edges_for_training = (
         optimize_enabled
-        and semantic_beta > 0
+        and args.uncertainty_lambda > 0
         and effective_num_entropy_samples > 1
     )
     semantic_judge = None
@@ -175,7 +173,7 @@ async def run_math_dataset(
             edge_losses = edge_semantic_loss(
                 realized_graph.edge_log_probs,
                 edge_rewards,
-                semantic_beta,
+                args.uncertainty_lambda,
                 correctness_reward,
             )
             utility = {

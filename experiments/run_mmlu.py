@@ -41,13 +41,11 @@ def parse_args():
     parser.add_argument('--pruning_rate', type=float, default=0.25,
                         help="Rate for temporal edge pruning when --optimized_temporal is set.")
     parser.add_argument('--uncertainty_lambda', type=float, default=0.0,
-                        help="Deprecated alias for --semantic_beta. Default 0 keeps semantic entropy disabled.")
+                        help="Weight for per-edge semantic entropy loss. Default 0 keeps semantic entropy disabled.")
     parser.add_argument('--correctness_alpha', type=float, default=1.0,
                         help="Weight for graph-level final correctness loss.")
-    parser.add_argument('--semantic_beta', type=float, default=None,
-                        help="Weight for per-edge semantic entropy loss. Defaults to --uncertainty_lambda when omitted.")
     parser.add_argument('--num_entropy_samples', type=int, default=1,
-                        help="Samples per agent before and after communication for semantic entropy. Automatically raised to 2 when semantic_beta > 0.")
+                        help="Samples per agent before and after communication for semantic entropy. Automatically raised to 2 when uncertainty_lambda > 0.")
     parser.add_argument('--semantic_judge_llm_name', type=str, default="gpt-4o-mini",
                         help="OpenAI-compatible semantic judge model name. Independent from --llm_name.")
     parser.add_argument('--semantic_judge_api_key', type=str, default="",
@@ -104,7 +102,6 @@ async def main():
         await train(graph=graph,dataset=dataset_train,num_iters=args.num_iterations,num_rounds=args.num_rounds,
                     lr=args.lr,batch_size=args.batch_size, uncertainty_lambda=args.uncertainty_lambda,
                     correctness_alpha=args.correctness_alpha,
-                    semantic_beta=args.semantic_beta,
                     imp_per_iterations=args.imp_per_iterations, pruning_rate=args.pruning_rate,
                     num_entropy_samples=args.num_entropy_samples,
                     semantic_judge_llm_name=args.semantic_judge_llm_name,

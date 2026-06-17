@@ -47,13 +47,11 @@ def parse_args():
     parser.add_argument('--imp_per_iterations', type=int, default=5,
                         help="Prune temporal edges every few iterations when --optimized_temporal is set.")
     parser.add_argument('--uncertainty_lambda', type=float, default=0.0,
-                        help="Deprecated alias for --semantic_beta. Default 0 keeps semantic entropy disabled.")
+                        help="Weight for per-edge semantic entropy loss. Default 0 keeps semantic entropy disabled.")
     parser.add_argument('--correctness_alpha', type=float, default=1.0,
                         help="Weight for graph-level final correctness loss.")
-    parser.add_argument('--semantic_beta', type=float, default=None,
-                        help="Weight for per-edge semantic entropy loss. Defaults to --uncertainty_lambda when omitted.")
     parser.add_argument('--num_entropy_samples', type=int, default=1,
-                        help="Samples per agent before and after communication for semantic entropy. Automatically raised to 2 when semantic_beta > 0.")
+                        help="Samples per agent before and after communication for semantic entropy. Automatically raised to 2 when uncertainty_lambda > 0.")
     parser.add_argument('--semantic_judge_llm_name', type=str, default="gpt-4o-mini",
                         help="OpenAI-compatible semantic judge model name. Independent from --llm_name.")
     parser.add_argument('--semantic_judge_api_key', type=str, default="",
@@ -111,10 +109,9 @@ async def main():
     if graph.optimized_temporal:
         optimizer_params.append(graph.temporal_logits)
     optimizer = torch.optim.Adam(optimizer_params, lr=args.lr)
-    semantic_beta = args.uncertainty_lambda if args.semantic_beta is None else args.semantic_beta
-    effective_num_entropy_samples = max(2, int(args.num_entropy_samples)) if semantic_beta > 0 else max(1, int(args.num_entropy_samples))
+    effective_num_entropy_samples = max(2, int(args.num_entropy_samples)) if args.uncertainty_lambda > 0 else max(1, int(args.num_entropy_samples))
     optimize_enabled = args.optimized_spatial or args.optimized_temporal
-    use_semantic_edges_for_training = optimize_enabled and semantic_beta > 0 and effective_num_entropy_samples > 1
+    use_semantic_edges_for_training = optimize_enabled and args.uncertainty_lambda > 0 and effective_num_entropy_samples > 1
     semantic_judge = None
     if use_semantic_edges_for_training:
         semantic_judge = SemanticEntailmentJudge(
@@ -192,7 +189,7 @@ async def main():
             edge_losses = edge_semantic_loss(
                 realized_graph.edge_log_probs,
                 edge_rewards,
-                semantic_beta,
+                args.uncertainty_lambda,
                 is_solved,
             )
             utility = {

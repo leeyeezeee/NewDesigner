@@ -441,16 +441,16 @@ async def edge_entropy_rewards(
 def edge_semantic_loss(
     edge_log_probs,
     edge_rewards: dict,
-    semantic_beta: float,
+    uncertainty_lambda: float,
     correctness_reward: float = 1.0,
 ):
-    if semantic_beta <= 0 or not edge_log_probs or correctness_reward <= 0:
+    if uncertainty_lambda <= 0 or not edge_log_probs or correctness_reward <= 0:
         return None
 
     losses = []
     for edge_info in edge_log_probs:
         reward = (
-            semantic_beta
+            uncertainty_lambda
             * correctness_reward
             * edge_rewards.get(edge_key(edge_info), 0.0)
         )

@@ -37,11 +37,9 @@ def parse_args():
     parser.add_argument("--decision_method", type=str, default="FinalRefer")
     parser.add_argument("--metrics_file", type=str, default="result/svamp.jsonl")
     parser.add_argument("--uncertainty_lambda", type=float, default=0.0,
-                        help="Deprecated alias for --semantic_beta.")
+                        help="Weight for per-edge semantic entropy loss.")
     parser.add_argument("--correctness_alpha", type=float, default=1.0,
                         help="Weight for graph-level final correctness loss.")
-    parser.add_argument("--semantic_beta", type=float, default=None,
-                        help="Weight for per-edge semantic entropy loss. Defaults to --uncertainty_lambda when omitted.")
     parser.add_argument("--num_entropy_samples", type=int, default=1)
     parser.add_argument("--semantic_judge_llm_name", type=str, default="gpt-4o-mini")
     parser.add_argument("--semantic_judge_api_key", type=str, default="")
