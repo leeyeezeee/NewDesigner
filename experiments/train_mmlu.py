@@ -27,7 +27,7 @@ async def train(graph:Graph,
             num_rounds:int=1,
             lr:float=0.1,
             batch_size:int = 4,
-            uncertainty_lambda: float = 0.0,
+            use_edge_selector: bool = False,
             imp_per_iterations: int = 5,
             pruning_rate: float = 0.25,
             num_entropy_samples: int = 5,
@@ -50,8 +50,8 @@ async def train(graph:Graph,
                     yield record
     
     loader = infinite_data_loader()
-    effective_num_entropy_samples = max(2, int(num_entropy_samples)) if uncertainty_lambda > 0 else max(1, int(num_entropy_samples))
-    use_semantic_edges = uncertainty_lambda > 0 and effective_num_entropy_samples > 1
+    effective_num_entropy_samples = max(2, int(num_entropy_samples)) if use_edge_selector else max(1, int(num_entropy_samples))
+    use_semantic_edges = use_edge_selector and effective_num_entropy_samples > 1
     semantic_judge = None
     if use_semantic_edges:
         semantic_judge = SemanticEntailmentJudge(

@@ -51,10 +51,10 @@ def parse_args():
                         help="Rate for temporal edge pruning when --optimized_temporal is set.")
     parser.add_argument('--imp_per_iterations', type=int, default=5,
                         help="Prune temporal edges every few iterations when --optimized_temporal is set.")
-    parser.add_argument('--uncertainty_lambda', type=float, default=0.0,
-                        help="Enable per-edge semantic entropy analysis when > 0. It is not added to the training loss.")
+    parser.add_argument('--use_edge_selector', action='store_true',
+                        help="Enable semantic-entropy selector training and selector pruning during evaluation.")
     parser.add_argument('--num_entropy_samples', type=int, default=5,
-                        help="Samples per agent before and after communication for semantic entropy. Automatically raised to 2 when uncertainty_lambda > 0.")
+                        help="Samples per agent before and after communication for semantic entropy. Automatically raised to 2 when --use_edge_selector is set.")
     parser.add_argument('--semantic_judge_llm_name', type=str, default="gpt-4o-mini",
                         help="OpenAI-compatible semantic judge model name. Independent from --llm_name.")
     parser.add_argument('--semantic_judge_api_key', type=str, default="",
@@ -116,9 +116,9 @@ async def main():
     if graph.optimized_temporal:
         optimizer_params.append(graph.temporal_logits)
     optimizer = torch.optim.Adam(optimizer_params, lr=args.lr)
-    effective_num_entropy_samples = max(2, int(args.num_entropy_samples)) if args.uncertainty_lambda > 0 else max(1, int(args.num_entropy_samples))
+    effective_num_entropy_samples = max(2, int(args.num_entropy_samples)) if args.use_edge_selector else max(1, int(args.num_entropy_samples))
     optimize_enabled = args.optimized_spatial or args.optimized_temporal
-    use_semantic_edges_for_analysis = optimize_enabled and args.uncertainty_lambda > 0 and effective_num_entropy_samples > 1
+    use_semantic_edges_for_analysis = optimize_enabled and args.use_edge_selector and effective_num_entropy_samples > 1
     semantic_judge = None
     if use_semantic_edges_for_analysis:
         semantic_judge = SemanticEntailmentJudge(

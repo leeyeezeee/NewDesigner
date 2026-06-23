@@ -36,8 +36,8 @@ def parse_args():
     parser.add_argument("--agent_nums", nargs="+", type=int, default=[4])
     parser.add_argument("--decision_method", type=str, default="FinalRefer")
     parser.add_argument("--metrics_file", type=str, default="result/aqua.jsonl")
-    parser.add_argument("--uncertainty_lambda", type=float, default=0.0,
-                        help="Enable per-edge semantic entropy analysis when > 0. It is not added to the training loss.")
+    parser.add_argument("--use_edge_selector", action="store_true",
+                        help="Enable semantic-entropy selector training and selector pruning during evaluation.")
     parser.add_argument("--num_entropy_samples", type=int, default=5)
     parser.add_argument("--semantic_judge_llm_name", type=str, default="gpt-4o-mini")
     parser.add_argument("--semantic_judge_api_key", type=str, default="")

@@ -77,13 +77,13 @@ async def run_math_dataset(
 
     effective_num_entropy_samples = (
         max(2, int(args.num_entropy_samples))
-        if args.uncertainty_lambda > 0
+        if args.use_edge_selector
         else max(1, int(args.num_entropy_samples))
     )
     optimize_enabled = args.optimized_spatial or args.optimized_temporal
     use_semantic_edges_for_analysis = (
         optimize_enabled
-        and args.uncertainty_lambda > 0
+        and args.use_edge_selector
         and effective_num_entropy_samples > 1
     )
     semantic_judge = None
