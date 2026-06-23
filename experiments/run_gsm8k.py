@@ -16,7 +16,7 @@ from GDesigner.graph.graph import Graph
 from GDesigner.tools.reader.readers import JSONLReader
 from GDesigner.utils.globals import Time
 from GDesigner.utils.globals import Cost, PromptTokens, CompletionTokens
-from GDesigner.utils.metrics import write_metrics_record
+from GDesigner.utils.metrics import reset_usage_counters, write_metrics_record
 from GDesigner.utils.edge_selector import (
     EdgeSelector,
     SelectorReplayBuffer,
@@ -253,6 +253,7 @@ async def main():
             accuracy = 0.0
             graph.gcn.eval()
             graph.mlp.eval()
+            reset_usage_counters()
             print("Start Eval")
             
         print(f"Cost {Cost.instance().value}")

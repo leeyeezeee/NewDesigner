@@ -13,7 +13,7 @@ from datasets.MMLU.download import download
 from experiments.train_mmlu import train
 from experiments.evaluate_mmlu import evaluate
 from GDesigner.utils.const import GDesigner_ROOT
-from GDesigner.utils.metrics import write_metrics_record
+from GDesigner.utils.metrics import reset_usage_counters, write_metrics_record
 
 
 
@@ -117,6 +117,7 @@ async def main():
     else:
         edge_selector = None
 
+    reset_usage_counters()
     eval_metrics = await evaluate(graph=graph,dataset=dataset_val,num_rounds=args.num_rounds,limit_questions=limit_questions,eval_batch_size=args.batch_size,edge_selector=edge_selector)
     score = eval_metrics["accuracy"]
     print(f"Final Eval Accuracy: {score}")

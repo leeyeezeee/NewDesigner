@@ -9,7 +9,7 @@ import torch
 
 from GDesigner.graph.graph import Graph
 from GDesigner.utils.globals import CompletionTokens, Cost, PromptTokens, Time
-from GDesigner.utils.metrics import write_metrics_record
+from GDesigner.utils.metrics import reset_usage_counters, write_metrics_record
 from GDesigner.utils.edge_selector import (
     EdgeSelector,
     SelectorReplayBuffer,
@@ -233,6 +233,7 @@ async def run_math_dataset(
             accuracy = 0.0
             graph.gcn.eval()
             graph.mlp.eval()
+            reset_usage_counters()
             print("Start Eval")
 
         print(f"Cost {Cost.instance().value}")

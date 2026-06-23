@@ -5,6 +5,12 @@ from typing import Any, Dict, Optional
 from GDesigner.utils.globals import CompletionTokens, Cost, PromptTokens
 
 
+def reset_usage_counters() -> None:
+    Cost.instance().reset()
+    PromptTokens.instance().reset()
+    CompletionTokens.instance().reset()
+
+
 def write_metrics_record(metrics_file: Optional[str], record: Dict[str, Any]) -> None:
     if not metrics_file:
         return
