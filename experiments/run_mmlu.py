@@ -41,10 +41,8 @@ def parse_args():
     parser.add_argument('--pruning_rate', type=float, default=0.25,
                         help="Rate for temporal edge pruning when --optimized_temporal is set.")
     parser.add_argument('--uncertainty_lambda', type=float, default=0.0,
-                        help="Weight for per-edge semantic entropy loss. Default 0 keeps semantic entropy disabled.")
-    parser.add_argument('--correctness_alpha', type=float, default=1.0,
-                        help="Weight for graph-level final correctness loss.")
-    parser.add_argument('--num_entropy_samples', type=int, default=1,
+                        help="Enable per-edge semantic entropy analysis when > 0. It is not added to the training loss.")
+    parser.add_argument('--num_entropy_samples', type=int, default=5,
                         help="Samples per agent before and after communication for semantic entropy. Automatically raised to 2 when uncertainty_lambda > 0.")
     parser.add_argument('--semantic_judge_llm_name', type=str, default="gpt-4o-mini",
                         help="OpenAI-compatible semantic judge model name. Independent from --llm_name.")
@@ -60,6 +58,10 @@ def parse_args():
                         help="Scale for negative edge rewards when an edge increases semantic entropy.")
     parser.add_argument('--nonpositive_edge_penalty', type=float, default=0.01,
                         help="Deprecated compatibility option; normalized edge rewards do not add a zero-gain penalty.")
+    parser.add_argument('--selector_buffer_size', type=int, default=512,
+                        help="Replay buffer capacity for selector edge samples.")
+    parser.add_argument('--selector_entropy_tau', type=float, default=0.2,
+                        help="Entropy delta threshold for positive selector labels.")
     parser.add_argument('--llm_name', type=str, default="gpt-4o",
                         help="Model name, None runs the default ChatGPT4")
     parser.add_argument('--domain', type=str, default="mmlu",
@@ -67,7 +69,7 @@ def parse_args():
     parser.add_argument('--decision_method', type=str, default="FinalRefer",
                         help="the decision method of the final node")
     parser.add_argument('--metrics_file', type=str, default="result/mmlu.jsonl",
-                        help="JSONL file to overwrite with final accuracy and cost metrics.")
+                        help="JSONL file to append final accuracy and cost metrics.")
     parser.add_argument('--optimized_spatial',action='store_true')
     parser.add_argument('--optimized_temporal',action='store_true')
     args = parser.parse_args()
@@ -99,9 +101,8 @@ async def main():
     dataset_val = MMLUDataset('val')
     
     if args.optimized_spatial or args.optimized_temporal:
-        await train(graph=graph,dataset=dataset_train,num_iters=args.num_iterations,num_rounds=args.num_rounds,
+        edge_selector = await train(graph=graph,dataset=dataset_train,num_iters=args.num_iterations,num_rounds=args.num_rounds,
                     lr=args.lr,batch_size=args.batch_size, uncertainty_lambda=args.uncertainty_lambda,
-                    correctness_alpha=args.correctness_alpha,
                     imp_per_iterations=args.imp_per_iterations, pruning_rate=args.pruning_rate,
                     num_entropy_samples=args.num_entropy_samples,
                     semantic_judge_llm_name=args.semantic_judge_llm_name,
@@ -110,14 +111,22 @@ async def main():
                     semantic_judge_model_path=args.semantic_judge_model_path,
                     semantic_judge_max_concurrency=args.semantic_judge_max_concurrency,
                     negative_edge_reward_scale=args.negative_edge_reward_scale,
-                    nonpositive_edge_penalty=args.nonpositive_edge_penalty)
-        
-    
-    score = await evaluate(graph=graph,dataset=dataset_val,num_rounds=args.num_rounds,limit_questions=limit_questions,eval_batch_size=args.batch_size)
+                    nonpositive_edge_penalty=args.nonpositive_edge_penalty,
+                    selector_buffer_size=args.selector_buffer_size,
+                    selector_entropy_tau=args.selector_entropy_tau)
+    else:
+        edge_selector = None
+
+    eval_metrics = await evaluate(graph=graph,dataset=dataset_val,num_rounds=args.num_rounds,limit_questions=limit_questions,eval_batch_size=args.batch_size,edge_selector=edge_selector)
+    score = eval_metrics["accuracy"]
     print(f"Final Eval Accuracy: {score}")
+    print(f"Final Avg Edges: {eval_metrics['avg_edges']}")
     write_metrics_record(args.metrics_file, {
         "dataset": "mmlu",
         "accuracy": score,
+        "total_solved": eval_metrics["total_solved"],
+        "total_executed": eval_metrics["total_executed"],
+        "avg_edges": eval_metrics["avg_edges"],
         "llm_name": args.llm_name,
     })
 

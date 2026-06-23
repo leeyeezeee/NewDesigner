@@ -398,8 +398,7 @@ async def edge_entropy_rewards(
             before_temporal_info,
             num_entropy_samples,
         )
-        after_outputs = history_item.get("entropy_samples", [])
-        if not before_outputs or not after_outputs:
+        if not before_outputs:
             continue
 
         after_cache_key = (target_id, round_idx)
@@ -407,6 +406,9 @@ async def edge_entropy_rewards(
             before_entropy, before_labels = await semantic_uncertainty(question, before_outputs, judge)
             after_entropy, after_labels = after_cache[after_cache_key]
         else:
+            after_outputs = history_item.get("entropy_samples", [])
+            if not after_outputs:
+                continue
             before_result, after_result = await asyncio.gather(
                 semantic_uncertainty(question, before_outputs, judge),
                 semantic_uncertainty(question, after_outputs, judge),
@@ -414,6 +416,7 @@ async def edge_entropy_rewards(
             before_entropy, before_labels = before_result
             after_entropy, after_labels = after_result
             after_cache[after_cache_key] = (after_entropy, after_labels)
+            history_item["entropy_samples"] = []
 
         entropy_delta = before_entropy - after_entropy
         details[key] = {
@@ -436,26 +439,4 @@ async def edge_entropy_rewards(
         nonpositive_penalty=nonpositive_penalty,
     )
     return rewards, details
-
-
-def edge_semantic_loss(
-    edge_log_probs,
-    edge_rewards: dict,
-    uncertainty_lambda: float,
-    correctness_reward: float = 1.0,
-):
-    if uncertainty_lambda <= 0 or not edge_log_probs or correctness_reward <= 0:
-        return None
-
-    losses = []
-    for edge_info in edge_log_probs:
-        reward = (
-            uncertainty_lambda
-            * correctness_reward
-            * edge_rewards.get(edge_key(edge_info), 0.0)
-        )
-        if reward != 0:
-            # Negative rewards make gradient descent lower the probability of this selected edge.
-            losses.append(-edge_info["log_prob"] * reward)
-    return losses
 

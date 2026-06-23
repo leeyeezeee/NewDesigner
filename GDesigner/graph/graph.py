@@ -70,9 +70,11 @@ class Graph(ABC):
         self.potential_spatial_edges:List[List[str, str]] = []
         self.potential_temporal_edges:List[List[str,str]] = []
         self.edge_log_probs:List[Dict[str, Any]] = []
+        self.realized_edge_counts:List[int] = []
         self.node_kwargs = node_kwargs if node_kwargs is not None else [{} for _ in agent_names]
         
         self.init_nodes() # add nodes to the self.nodes
+        self.node_id_to_index = {node_id: idx for idx, node_id in enumerate(self.nodes)}
         self.init_potential_edges() # add potential edges to the self.potential_spatial/temporal_edges
         
         self.prompt_set = PromptSetRegistry.get(domain)
@@ -131,6 +133,82 @@ class Graph(ABC):
         query_embedding = query_embedding.unsqueeze(0).repeat((self.num_nodes,1))
         new_features = torch.cat((self.features,query_embedding),dim=1)
         return new_features
+
+    def edge_selector_task_embedding(self, task: str) -> torch.Tensor:
+        return torch.tensor(np.array(get_sentence_embedding(task)), dtype=torch.float32)
+
+    def edge_selector_feature(
+            self,
+            task: str,
+            source_id: str,
+            target_id: str,
+            task_embedding: Optional[torch.Tensor] = None,
+            ) -> torch.Tensor:
+        task_embedding = task_embedding if task_embedding is not None else self.edge_selector_task_embedding(task)
+        source_role_embedding = self.features[self.node_id_to_index[source_id]]
+        target_role_embedding = self.features[self.node_id_to_index[target_id]]
+        return torch.cat([
+            task_embedding.float(),
+            source_role_embedding.detach().float(),
+            target_role_embedding.detach().float(),
+        ])
+
+    def apply_edge_selector(self, task: str, edge_selector, round_idx: int) -> None:
+        if edge_selector is None:
+            return
+
+        selected_edges = [
+            edge_info
+            for edge_info in self.edge_log_probs
+            if edge_info.get("round") == round_idx
+        ]
+        if not selected_edges:
+            return
+
+        was_training = edge_selector.training
+        edge_selector.eval()
+        device = next(edge_selector.parameters()).device
+        task_embedding = self.edge_selector_task_embedding(task)
+        with torch.no_grad():
+            valid_edges = []
+            feature_rows = []
+            for edge_info in selected_edges:
+                source_id = edge_info["source"]
+                target_id = edge_info["target"]
+                if source_id not in self.nodes or target_id not in self.nodes:
+                    continue
+                valid_edges.append(edge_info)
+                feature_rows.append(self.edge_selector_feature(
+                    task,
+                    source_id,
+                    target_id,
+                    task_embedding=task_embedding,
+                ))
+            if not valid_edges:
+                if was_training:
+                    edge_selector.train()
+                return
+
+            features = torch.stack(feature_rows).to(device)
+            keep_probabilities = torch.sigmoid(edge_selector(features)).view(-1)
+            keep_samples = torch.bernoulli(keep_probabilities).bool()
+            for edge_info, keep_probability, keep_sample in zip(
+                    valid_edges,
+                    keep_probabilities.cpu(),
+                    keep_samples.cpu(),
+                    ):
+                keep = bool(keep_sample.item())
+                edge_info["selector_probability"] = float(keep_probability.item())
+                edge_info["selector_keep"] = keep
+                if not keep:
+                    source_id = edge_info["source"]
+                    target_id = edge_info["target"]
+                    self.find_node(source_id).remove_successor(
+                        self.find_node(target_id),
+                        edge_info["type"],
+                    )
+        if was_training:
+            edge_selector.train()
         
     @property
     def spatial_adj_matrix(self):
@@ -156,6 +234,21 @@ class Graph(ABC):
         for node in self.nodes.values():
             num_edges += len(node.spatial_successors)
         return num_edges
+
+    @property
+    def communication_edge_count(self):
+        node_ids = set(self.nodes.keys())
+        num_edges = 0
+        for node in self.nodes.values():
+            num_edges += sum(
+                1 for successor in node.spatial_successors
+                if successor.id in node_ids
+            )
+            num_edges += sum(
+                1 for successor in node.temporal_successors
+                if successor.id in node_ids
+            )
+        return num_edges
     
     @property
     def num_nodes(self):
@@ -173,6 +266,8 @@ class Graph(ABC):
             node_id = shortuuid.ShortUUID().random(length=4)
         node.id = node_id
         self.nodes[node_id] = node
+        if hasattr(self, "node_id_to_index"):
+            self.node_id_to_index[node_id] = len(self.node_id_to_index)
         return node
     
     def init_nodes(self):
@@ -242,17 +337,18 @@ class Graph(ABC):
                     edge_prob = torch.tensor(1 if edge_prob > threshold else 0)
                 if torch.rand(1) < edge_prob:
                     out_node.add_successor(in_node,'spatial')
+                    edge_info = {
+                        "type": "spatial",
+                        "round": round,
+                        "source": out_node.id,
+                        "target": in_node.id,
+                        "edge_key": f"spatial:{round}:{out_node.id}->{in_node.id}",
+                    }
                     if track_grad:
                         edge_log_prob = torch.log(edge_prob)
                         log_probs.append(edge_log_prob)
-                        self.edge_log_probs.append({
-                            "type": "spatial",
-                            "round": round,
-                            "source": out_node.id,
-                            "target": in_node.id,
-                            "edge_key": f"spatial:{round}:{out_node.id}->{in_node.id}",
-                            "log_prob": edge_log_prob,
-                        })
+                        edge_info["log_prob"] = edge_log_prob
+                    self.edge_log_probs.append(edge_info)
                 else:
                     if track_grad:
                         log_probs.append(torch.log(1 - edge_prob))
@@ -285,17 +381,18 @@ class Graph(ABC):
                 edge_prob = torch.tensor(1 if edge_prob > threshold else 0)
             if torch.rand(1) < edge_prob:
                 out_node.add_successor(in_node,'temporal')
+                edge_info = {
+                    "type": "temporal",
+                    "round": round,
+                    "source": out_node.id,
+                    "target": in_node.id,
+                    "edge_key": f"temporal:{round}:{out_node.id}->{in_node.id}",
+                }
                 if track_grad:
                     edge_log_prob = torch.log(edge_prob)
                     log_probs.append(edge_log_prob)
-                    self.edge_log_probs.append({
-                        "type": "temporal",
-                        "round": round,
-                        "source": out_node.id,
-                        "target": in_node.id,
-                        "edge_key": f"temporal:{round}:{out_node.id}->{in_node.id}",
-                        "log_prob": edge_log_prob,
-                    })
+                    edge_info["log_prob"] = edge_log_prob
+                self.edge_log_probs.append(edge_info)
             else:
                 if track_grad:
                     log_probs.append(torch.log(1 - edge_prob))
@@ -309,13 +406,18 @@ class Graph(ABC):
                   max_time: int = 600,
                   num_entropy_samples: int = 1,
                   record_execution_history: bool = True,
-                  track_grad: bool = True,) -> List[Any]:
+                  track_grad: bool = True,
+                  edge_selector = None,) -> List[Any]:
         # inputs:{'task':"xxx"}
         log_probs = 0
         self.edge_log_probs = []
+        self.realized_edge_counts = []
         for round in range(num_rounds):
             log_probs += self.construct_spatial_connection(round, track_grad=track_grad)
             log_probs += self.construct_temporal_connection(round, track_grad=track_grad)
+            task = inputs.get("task", str(inputs)) if isinstance(inputs, dict) else str(inputs)
+            self.apply_edge_selector(task, edge_selector, round)
+            self.realized_edge_counts.append(self.communication_edge_count)
             
             in_degree = {node_id: len(node.spatial_predecessors) for node_id, node in self.nodes.items()}
             zero_in_degree_queue = [node_id for node_id, deg in in_degree.items() if deg == 0]
@@ -358,10 +460,12 @@ class Graph(ABC):
                   max_time: int = 600,
                   num_entropy_samples: int = 1,
                   record_execution_history: bool = True,
-                  track_grad: bool = True,) -> List[Any]:
+                  track_grad: bool = True,
+                  edge_selector = None,) -> List[Any]:
         # inputs:{'task':"xxx"}
         log_probs = 0
         self.edge_log_probs = []
+        self.realized_edge_counts = []
         if track_grad:
             new_features = self.construct_new_features(input['task'])
             logits = self.gcn(new_features,self.role_adj_matrix)
@@ -379,6 +483,8 @@ class Graph(ABC):
         for round in range(num_rounds):
             log_probs += self.construct_spatial_connection(round, track_grad=track_grad)
             log_probs += self.construct_temporal_connection(round, track_grad=track_grad)
+            self.apply_edge_selector(input.get("task", str(input)), edge_selector, round)
+            self.realized_edge_counts.append(self.communication_edge_count)
             
             in_degree = {node_id: len(node.spatial_predecessors) for node_id, node in self.nodes.items()}
             zero_in_degree_queue = [node_id for node_id, deg in in_degree.items() if deg == 0]

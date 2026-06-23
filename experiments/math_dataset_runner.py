@@ -10,10 +10,15 @@ import torch
 from GDesigner.graph.graph import Graph
 from GDesigner.utils.globals import CompletionTokens, Cost, PromptTokens, Time
 from GDesigner.utils.metrics import write_metrics_record
+from GDesigner.utils.edge_selector import (
+    EdgeSelector,
+    SelectorReplayBuffer,
+    build_edge_selector_examples,
+    train_edge_selector,
+)
 from GDesigner.utils.uncertainty import (
     SemanticEntailmentJudge,
     edge_entropy_rewards,
-    edge_semantic_loss,
 )
 
 
@@ -70,21 +75,19 @@ async def run_math_dataset(
         optimizer_params.append(graph.temporal_logits)
     optimizer = torch.optim.Adam(optimizer_params, lr=args.lr)
 
-    correctness_alpha = getattr(args, "correctness_alpha", 1.0)
-
     effective_num_entropy_samples = (
         max(2, int(args.num_entropy_samples))
         if args.uncertainty_lambda > 0
         else max(1, int(args.num_entropy_samples))
     )
     optimize_enabled = args.optimized_spatial or args.optimized_temporal
-    use_semantic_edges_for_training = (
+    use_semantic_edges_for_analysis = (
         optimize_enabled
         and args.uncertainty_lambda > 0
         and effective_num_entropy_samples > 1
     )
     semantic_judge = None
-    if use_semantic_edges_for_training:
+    if use_semantic_edges_for_analysis:
         semantic_judge = SemanticEntailmentJudge(
             llm_name=args.semantic_judge_llm_name,
             api_key=args.semantic_judge_api_key,
@@ -92,15 +95,25 @@ async def run_math_dataset(
             model_path=args.semantic_judge_model_path,
             max_concurrency=args.semantic_judge_max_concurrency,
         )
+    edge_selector = None
+    selector_buffer = None
+    selector_optimizer = None
+    selector_trained = False
+    if use_semantic_edges_for_analysis:
+        edge_selector = EdgeSelector(graph.features.size(1))
+        selector_buffer = SelectorReplayBuffer(getattr(args, "selector_buffer_size", 512))
+        selector_optimizer = torch.optim.Adam(edge_selector.parameters(), lr=1e-3)
 
     num_batches = int(len(dataset) / args.batch_size)
     total_solved, total_executed = (0, 0)
+    total_edges, edge_samples = (0, 0)
     accuracy = 0.0
 
     for i_batch in range(num_batches):
         train_updates_enabled = optimize_enabled and i_batch < args.num_iterations
-        use_semantic_edges = use_semantic_edges_for_training and train_updates_enabled
+        use_semantic_edges = use_semantic_edges_for_analysis and train_updates_enabled
         batch_entropy_samples = effective_num_entropy_samples if use_semantic_edges else 1
+        batch_edge_selector = edge_selector if (selector_trained and not train_updates_enabled) else None
         print(f"Batch {i_batch}", 80 * "-")
         start_ts = time.time()
         answer_log_probs = []
@@ -131,6 +144,7 @@ async def run_math_dataset(
                         num_entropy_samples=batch_entropy_samples,
                         record_execution_history=use_semantic_edges,
                         track_grad=train_updates_enabled,
+                        edge_selector=batch_edge_selector,
                     )
                 )
             )
@@ -154,13 +168,17 @@ async def run_math_dataset(
             total_solved += int(is_solved)
             total_executed += 1
             accuracy = total_solved / total_executed
+            if not train_updates_enabled:
+                total_edges += sum(realized_graph.realized_edge_counts)
+                edge_samples += 1
 
             edge_rewards = {}
+            edge_details = {}
             if (
                 is_solved
                 and use_semantic_edges
             ):
-                edge_rewards, _ = await edge_entropy_rewards(
+                edge_rewards, edge_details = await edge_entropy_rewards(
                     realized_graph,
                     record["task"],
                     input_dict,
@@ -169,21 +187,19 @@ async def run_math_dataset(
                     negative_reward_scale=args.negative_edge_reward_scale,
                     nonpositive_penalty=args.nonpositive_edge_penalty,
                 )
+                selector_buffer.add_many(build_edge_selector_examples(
+                    realized_graph,
+                    record["task"],
+                    edge_details,
+                    getattr(args, "selector_entropy_tau", 0.0),
+                ))
             realized_graph.clear_execution_history()
-            edge_losses = edge_semantic_loss(
-                realized_graph.edge_log_probs,
-                edge_rewards,
-                args.uncertainty_lambda,
-                correctness_reward,
-            )
             utility = {
                 "correctness": correctness_reward,
                 "edge_entropy_rewards": edge_rewards,
             }
             utilities.append(utility)
-            single_loss = -log_prob * correctness_alpha * correctness_reward
-            if edge_losses:
-                single_loss = single_loss + torch.sum(torch.stack(edge_losses))
+            single_loss = -log_prob * correctness_reward
             loss_list.append(single_loss)
 
         total_loss = torch.mean(torch.stack(loss_list))
@@ -191,6 +207,11 @@ async def run_math_dataset(
             optimizer.zero_grad()
             total_loss.backward()
             optimizer.step()
+            if edge_selector is not None:
+                selector_trained = (
+                    train_edge_selector(edge_selector, selector_optimizer, selector_buffer)
+                    or selector_trained
+                )
             if (
                 graph.optimized_temporal
                 and (i_batch + 1) % args.imp_per_iterations == 0
@@ -207,6 +228,8 @@ async def run_math_dataset(
         if i_batch + 1 == args.num_iterations:
             total_solved = 0
             total_executed = 0
+            total_edges = 0
+            edge_samples = 0
             accuracy = 0.0
             graph.gcn.eval()
             graph.mlp.eval()
@@ -220,11 +243,14 @@ async def run_math_dataset(
     print(f"Final Cost {Cost.instance().value}")
     print(f"Final PromptTokens {PromptTokens.instance().value}")
     print(f"Final CompletionTokens {CompletionTokens.instance().value}")
+    avg_edges = total_edges / edge_samples if edge_samples else 0.0
+    print(f"Final Avg Edges {avg_edges}")
     write_metrics_record(args.metrics_file, {
         "dataset": dataset_name,
         "accuracy": accuracy,
         "total_solved": total_solved,
         "total_executed": total_executed,
+        "avg_edges": avg_edges,
         "llm_name": args.llm_name,
     })
 

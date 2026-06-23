@@ -17,5 +17,5 @@ def write_metrics_record(metrics_file: Optional[str], record: Dict[str, Any]) ->
         "prompt_tokens": PromptTokens.instance().value,
         "completion_tokens": CompletionTokens.instance().value,
     }
-    with output_path.open("w", encoding="utf-8") as file:
+    with output_path.open("a", encoding="utf-8") as file:
         file.write(json.dumps(record, ensure_ascii=False) + "\n")

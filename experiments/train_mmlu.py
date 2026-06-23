@@ -10,10 +10,15 @@ import copy
 from GDesigner.graph.graph import Graph
 from experiments.accuracy import Accuracy
 from GDesigner.utils.globals import Cost, PromptTokens, CompletionTokens
+from GDesigner.utils.edge_selector import (
+    EdgeSelector,
+    SelectorReplayBuffer,
+    build_edge_selector_examples,
+    train_edge_selector,
+)
 from GDesigner.utils.uncertainty import (
     SemanticEntailmentJudge,
     edge_entropy_rewards,
-    edge_semantic_loss,
 )
 
 async def train(graph:Graph,
@@ -23,10 +28,9 @@ async def train(graph:Graph,
             lr:float=0.1,
             batch_size:int = 4,
             uncertainty_lambda: float = 0.0,
-            correctness_alpha: float = 1.0,
             imp_per_iterations: int = 5,
             pruning_rate: float = 0.25,
-            num_entropy_samples: int = 1,
+            num_entropy_samples: int = 5,
             semantic_judge_llm_name: str = "gpt-4o-mini",
             semantic_judge_api_key: str = "",
             semantic_judge_base_url: str = "",
@@ -34,7 +38,9 @@ async def train(graph:Graph,
             semantic_judge_max_concurrency: int = None,
             negative_edge_reward_scale: float = 1.0,
             nonpositive_edge_penalty: float = 0.01,
-          ) -> None:
+            selector_buffer_size: int = 512,
+            selector_entropy_tau: float = 0.2,
+          ):
     
     def infinite_data_loader() -> Iterator[pd.DataFrame]:
             perm = np.random.permutation(len(dataset))
@@ -55,6 +61,14 @@ async def train(graph:Graph,
             model_path=semantic_judge_model_path,
             max_concurrency=semantic_judge_max_concurrency,
         )
+    edge_selector = None
+    selector_buffer = None
+    selector_optimizer = None
+    selector_trained = False
+    if use_semantic_edges:
+        edge_selector = EdgeSelector(graph.features.size(1))
+        selector_buffer = SelectorReplayBuffer(selector_buffer_size)
+        selector_optimizer = torch.optim.Adam(edge_selector.parameters(), lr=1e-3)
     
     optimizer_params = list(graph.gcn.parameters()) + list(graph.mlp.parameters())
     if graph.optimized_temporal:
@@ -105,8 +119,9 @@ async def train(graph:Graph,
             accuracy.update(answer, correct_answer)
             correctness_reward = accuracy.get()
             edge_rewards = {}
+            edge_details = {}
             if correctness_reward > 0 and use_semantic_edges:
-                edge_rewards, _ = await edge_entropy_rewards(
+                edge_rewards, edge_details = await edge_entropy_rewards(
                     realized_graph,
                     input_dict["task"],
                     input_dict,
@@ -115,21 +130,19 @@ async def train(graph:Graph,
                     negative_reward_scale=negative_edge_reward_scale,
                     nonpositive_penalty=nonpositive_edge_penalty,
                 )
+                selector_buffer.add_many(build_edge_selector_examples(
+                    realized_graph,
+                    input_dict["task"],
+                    edge_details,
+                    selector_entropy_tau,
+                ))
             realized_graph.clear_execution_history()
-            edge_losses = edge_semantic_loss(
-                realized_graph.edge_log_probs,
-                edge_rewards,
-                uncertainty_lambda,
-                correctness_reward,
-            )
             utility = {
                 "correctness": correctness_reward,
                 "edge_entropy_rewards": edge_rewards,
             }
             utilities.append(utility)
-            single_loss = -log_prob * correctness_alpha * correctness_reward
-            if edge_losses:
-                single_loss = single_loss + torch.sum(torch.stack(edge_losses))
+            single_loss = -log_prob * correctness_reward
             loss_list.append(single_loss)
             print(f"correct answer:{correct_answer}")
             print(f"edge entropy rewards:{edge_rewards}")
@@ -138,6 +151,11 @@ async def train(graph:Graph,
         optimizer.zero_grad()
         total_loss.backward()
         optimizer.step()
+        if edge_selector is not None:
+            selector_trained = (
+                train_edge_selector(edge_selector, selector_optimizer, selector_buffer)
+                or selector_trained
+            )
         if (
             graph.optimized_temporal
             and (i_iter + 1) % imp_per_iterations == 0
@@ -153,4 +171,6 @@ async def train(graph:Graph,
         print(f"Cost {Cost.instance().value}")
         print(f"PromptTokens {PromptTokens.instance().value}")
         print(f"CompletionTokens {CompletionTokens.instance().value}")
+
+    return edge_selector if selector_trained else None
         

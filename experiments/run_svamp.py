@@ -37,10 +37,8 @@ def parse_args():
     parser.add_argument("--decision_method", type=str, default="FinalRefer")
     parser.add_argument("--metrics_file", type=str, default="result/svamp.jsonl")
     parser.add_argument("--uncertainty_lambda", type=float, default=0.0,
-                        help="Weight for per-edge semantic entropy loss.")
-    parser.add_argument("--correctness_alpha", type=float, default=1.0,
-                        help="Weight for graph-level final correctness loss.")
-    parser.add_argument("--num_entropy_samples", type=int, default=1)
+                        help="Enable per-edge semantic entropy analysis when > 0. It is not added to the training loss.")
+    parser.add_argument("--num_entropy_samples", type=int, default=5)
     parser.add_argument("--semantic_judge_llm_name", type=str, default="gpt-4o-mini")
     parser.add_argument("--semantic_judge_api_key", type=str, default="")
     parser.add_argument("--semantic_judge_base_url", type=str, default="")
@@ -48,6 +46,8 @@ def parse_args():
     parser.add_argument("--semantic_judge_max_concurrency", type=int, default=None)
     parser.add_argument("--negative_edge_reward_scale", type=float, default=1.0)
     parser.add_argument("--nonpositive_edge_penalty", type=float, default=0.01)
+    parser.add_argument("--selector_buffer_size", type=int, default=512)
+    parser.add_argument("--selector_entropy_tau", type=float, default=0.2)
     parser.add_argument("--optimized_spatial", action="store_true")
     parser.add_argument("--optimized_temporal", action="store_true")
     args = parser.parse_args()

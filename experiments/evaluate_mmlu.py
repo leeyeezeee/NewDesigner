@@ -17,13 +17,16 @@ async def evaluate(
         num_rounds:int = 1,
         limit_questions: Optional[int] = None,
         eval_batch_size: int = 4,
-        ) -> float:
+        edge_selector = None,
+        ) -> Dict[str, Any]:
 
     print(f"Evaluating gdesigner on {dataset.__class__.__name__} split {dataset.split}")
     
     graph.gcn.eval()
     graph.mlp.eval()
     accuracy = Accuracy()
+    total_edges = 0
+    edge_samples = 0
     def eval_loader(batch_size: int) -> Iterator[List[Any]]:
         records = []
         for i_record, record in enumerate(dataset):
@@ -45,11 +48,13 @@ async def evaluate(
 
         start_ts = time.time()
         answer_log_probs = []
+        realized_graphs = []
         
         for record in record_batch:
             realized_graph = copy.deepcopy(graph)
             realized_graph.gcn = graph.gcn
             realized_graph.mlp = graph.mlp
+            realized_graphs.append(realized_graph)
             input_dict = dataset.record_to_input(record)
             # print(input_dict)
             answer_log_probs.append(asyncio.create_task(
@@ -59,10 +64,14 @@ async def evaluate(
                     num_entropy_samples=1,
                     record_execution_history=False,
                     track_grad=False,
+                    edge_selector=edge_selector,
                 )
             ))
         raw_results = await asyncio.gather(*answer_log_probs)
         raw_answers, log_probs = zip(*raw_results)
+        for realized_graph in realized_graphs:
+            total_edges += sum(realized_graph.realized_edge_counts)
+            edge_samples += 1
         print(f"Batch time {time.time() - start_ts:.3f}")
         for raw_answer, record in zip(raw_answers, record_batch):
             answer = dataset.postprocess_answer(raw_answer)
@@ -75,7 +84,12 @@ async def evaluate(
     accuracy.print()
     print("Done!")
 
-    return accuracy.get()
+    return {
+        "accuracy": accuracy.get(),
+        "total_solved": accuracy._num_correct,
+        "total_executed": accuracy._num_total,
+        "avg_edges": total_edges / edge_samples if edge_samples else 0.0,
+    }
 
 
 def dump_eval_results(self, dct: Dict[str, Any]) -> None:

@@ -17,10 +17,15 @@ from GDesigner.tools.reader.readers import JSONLReader
 from GDesigner.utils.globals import Time
 from GDesigner.utils.globals import Cost, PromptTokens, CompletionTokens
 from GDesigner.utils.metrics import write_metrics_record
+from GDesigner.utils.edge_selector import (
+    EdgeSelector,
+    SelectorReplayBuffer,
+    build_edge_selector_examples,
+    train_edge_selector,
+)
 from GDesigner.utils.uncertainty import (
     SemanticEntailmentJudge,
     edge_entropy_rewards,
-    edge_semantic_loss,
 )
 from datasets.gsm8k_dataset import gsm_data_process,gsm_get_predict
 
@@ -47,10 +52,8 @@ def parse_args():
     parser.add_argument('--imp_per_iterations', type=int, default=5,
                         help="Prune temporal edges every few iterations when --optimized_temporal is set.")
     parser.add_argument('--uncertainty_lambda', type=float, default=0.0,
-                        help="Weight for per-edge semantic entropy loss. Default 0 keeps semantic entropy disabled.")
-    parser.add_argument('--correctness_alpha', type=float, default=1.0,
-                        help="Weight for graph-level final correctness loss.")
-    parser.add_argument('--num_entropy_samples', type=int, default=1,
+                        help="Enable per-edge semantic entropy analysis when > 0. It is not added to the training loss.")
+    parser.add_argument('--num_entropy_samples', type=int, default=5,
                         help="Samples per agent before and after communication for semantic entropy. Automatically raised to 2 when uncertainty_lambda > 0.")
     parser.add_argument('--semantic_judge_llm_name', type=str, default="gpt-4o-mini",
                         help="OpenAI-compatible semantic judge model name. Independent from --llm_name.")
@@ -66,6 +69,10 @@ def parse_args():
                         help="Scale for negative edge rewards when an edge increases semantic entropy.")
     parser.add_argument('--nonpositive_edge_penalty', type=float, default=0.01,
                         help="Deprecated compatibility option; normalized edge rewards do not add a zero-gain penalty.")
+    parser.add_argument('--selector_buffer_size', type=int, default=512,
+                        help="Replay buffer capacity for selector edge samples.")
+    parser.add_argument('--selector_entropy_tau', type=float, default=0.2,
+                        help="Entropy delta threshold for positive selector labels.")
     parser.add_argument('--num_iterations', type=int, default=10,help="The num of training iterations.")
     parser.add_argument('--domain', type=str, default="gsm8k",help="Domain (the same as dataset name), default 'gsm8k'")
     parser.add_argument('--agent_names', nargs='+', type=str, default=['MathSolver'],
@@ -75,7 +82,7 @@ def parse_args():
     parser.add_argument('--decision_method', type=str, default='FinalRefer',
                         help='The decison method of the GDesigner')
     parser.add_argument('--metrics_file', type=str, default="result/gsm8k.jsonl",
-                        help="JSONL file to overwrite with final accuracy and cost metrics.")
+                        help="JSONL file to append final accuracy and cost metrics.")
     parser.add_argument('--optimized_spatial',action='store_true')
     parser.add_argument('--optimized_temporal',action='store_true')
     args = parser.parse_args()
@@ -111,9 +118,9 @@ async def main():
     optimizer = torch.optim.Adam(optimizer_params, lr=args.lr)
     effective_num_entropy_samples = max(2, int(args.num_entropy_samples)) if args.uncertainty_lambda > 0 else max(1, int(args.num_entropy_samples))
     optimize_enabled = args.optimized_spatial or args.optimized_temporal
-    use_semantic_edges_for_training = optimize_enabled and args.uncertainty_lambda > 0 and effective_num_entropy_samples > 1
+    use_semantic_edges_for_analysis = optimize_enabled and args.uncertainty_lambda > 0 and effective_num_entropy_samples > 1
     semantic_judge = None
-    if use_semantic_edges_for_training:
+    if use_semantic_edges_for_analysis:
         semantic_judge = SemanticEntailmentJudge(
             llm_name=args.semantic_judge_llm_name,
             api_key=args.semantic_judge_api_key,
@@ -121,15 +128,25 @@ async def main():
             model_path=args.semantic_judge_model_path,
             max_concurrency=args.semantic_judge_max_concurrency,
         )
+    edge_selector = None
+    selector_buffer = None
+    selector_optimizer = None
+    selector_trained = False
+    if use_semantic_edges_for_analysis:
+        edge_selector = EdgeSelector(graph.features.size(1))
+        selector_buffer = SelectorReplayBuffer(args.selector_buffer_size)
+        selector_optimizer = torch.optim.Adam(edge_selector.parameters(), lr=1e-3)
 
     num_batches = int(len(dataset)/args.batch_size)
     total_solved, total_executed = (0, 0)
+    total_edges, edge_samples = (0, 0)
     accuracy = 0.0
 
     for i_batch in range(num_batches):
         train_updates_enabled = optimize_enabled and i_batch < args.num_iterations
-        use_semantic_edges = use_semantic_edges_for_training and train_updates_enabled
+        use_semantic_edges = use_semantic_edges_for_analysis and train_updates_enabled
         batch_entropy_samples = effective_num_entropy_samples if use_semantic_edges else 1
+        batch_edge_selector = edge_selector if (selector_trained and not train_updates_enabled) else None
         print(f"Batch {i_batch}",80*'-')
         start_ts = time.time()
         answer_log_probs = []
@@ -161,6 +178,7 @@ async def main():
                     num_entropy_samples=batch_entropy_samples,
                     record_execution_history=use_semantic_edges,
                     track_grad=train_updates_enabled,
+                    edge_selector=batch_edge_selector,
                 )
             ))
         raw_results = await asyncio.gather(*answer_log_probs)
@@ -174,9 +192,13 @@ async def main():
             total_solved = total_solved + is_solved
             total_executed = total_executed + 1
             accuracy = total_solved/ total_executed
+            if not train_updates_enabled:
+                total_edges += sum(realized_graph.realized_edge_counts)
+                edge_samples += 1
             edge_rewards = {}
+            edge_details = {}
             if is_solved and use_semantic_edges:
-                edge_rewards, _ = await edge_entropy_rewards(
+                edge_rewards, edge_details = await edge_entropy_rewards(
                     realized_graph,
                     task["task"],
                     input_dict,
@@ -185,21 +207,19 @@ async def main():
                     negative_reward_scale=args.negative_edge_reward_scale,
                     nonpositive_penalty=args.nonpositive_edge_penalty,
                 )
+                selector_buffer.add_many(build_edge_selector_examples(
+                    realized_graph,
+                    task["task"],
+                    edge_details,
+                    args.selector_entropy_tau,
+                ))
             realized_graph.clear_execution_history()
-            edge_losses = edge_semantic_loss(
-                realized_graph.edge_log_probs,
-                edge_rewards,
-                args.uncertainty_lambda,
-                is_solved,
-            )
             utility = {
                 "correctness": is_solved,
                 "edge_entropy_rewards": edge_rewards,
             }
             utilities.append(utility)
-            single_loss = -log_prob * args.correctness_alpha * is_solved
-            if edge_losses:
-                single_loss = single_loss + torch.sum(torch.stack(edge_losses))
+            single_loss = -log_prob * is_solved
             loss_list.append(single_loss)
 
         total_loss = torch.mean(torch.stack(loss_list))
@@ -207,6 +227,11 @@ async def main():
             optimizer.zero_grad()
             total_loss.backward()
             optimizer.step()
+            if edge_selector is not None:
+                selector_trained = (
+                    train_edge_selector(edge_selector, selector_optimizer, selector_buffer)
+                    or selector_trained
+                )
             if (
                 graph.optimized_temporal
                 and (i_batch + 1) % args.imp_per_iterations == 0
@@ -223,6 +248,8 @@ async def main():
         if i_batch+1 == args.num_iterations:
             total_solved = 0
             total_executed = 0
+            total_edges = 0
+            edge_samples = 0
             accuracy = 0.0
             graph.gcn.eval()
             graph.mlp.eval()
@@ -236,11 +263,14 @@ async def main():
     print(f"Final Cost {Cost.instance().value}")
     print(f"Final PromptTokens {PromptTokens.instance().value}")
     print(f"Final CompletionTokens {CompletionTokens.instance().value}")
+    avg_edges = total_edges / edge_samples if edge_samples else 0.0
+    print(f"Final Avg Edges {avg_edges}")
     write_metrics_record(args.metrics_file, {
         "dataset": "gsm8k",
         "accuracy": accuracy,
         "total_solved": total_solved,
         "total_executed": total_executed,
+        "avg_edges": avg_edges,
         "llm_name": args.llm_name,
     })
 
