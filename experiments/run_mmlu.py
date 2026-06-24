@@ -42,7 +42,7 @@ def parse_args():
                         help="Rate for temporal edge pruning when --optimized_temporal is set.")
     parser.add_argument('--use_edge_selector', action='store_true',
                         help="Enable semantic-entropy selector training and selector pruning during evaluation.")
-    parser.add_argument('--num_entropy_samples', type=int, default=5,
+    parser.add_argument('--num_entropy_samples', type=int, default=1,
                         help="Samples per agent before and after communication for semantic entropy. Automatically raised to 2 when --use_edge_selector is set.")
     parser.add_argument('--semantic_judge_llm_name', type=str, default="gpt-4o-mini",
                         help="OpenAI-compatible semantic judge model name. Independent from --llm_name.")
@@ -62,6 +62,12 @@ def parse_args():
                         help="Replay buffer capacity for selector edge samples.")
     parser.add_argument('--selector_entropy_tau', type=float, default=0.2,
                         help="Entropy delta threshold for positive selector labels.")
+    parser.add_argument('--refine_rank', type=int, default=4,
+                        help="Rank used by the refined adjacency decoder.")
+    parser.add_argument('--anchor_reg_weight', type=float, default=1.0,
+                        help="Weight for G-Designer refined adjacency anchor regularization.")
+    parser.add_argument('--sparsity_reg_weight', type=float, default=1.0,
+                        help="Weight for G-Designer refined adjacency nuclear-norm sparsity regularization.")
     parser.add_argument('--llm_name', type=str, default="gpt-4o",
                         help="Model name, None runs the default ChatGPT4")
     parser.add_argument('--domain', type=str, default="mmlu",
@@ -95,6 +101,7 @@ async def main():
                   decision_method=decision_method,
                   optimized_spatial=args.optimized_spatial,
                   optimized_temporal=args.optimized_temporal,
+                  refine_rank=args.refine_rank,
                   **kwargs)
     download()
     dataset_train = MMLUDataset('dev')
@@ -113,7 +120,9 @@ async def main():
                     negative_edge_reward_scale=args.negative_edge_reward_scale,
                     nonpositive_edge_penalty=args.nonpositive_edge_penalty,
                     selector_buffer_size=args.selector_buffer_size,
-                    selector_entropy_tau=args.selector_entropy_tau)
+                    selector_entropy_tau=args.selector_entropy_tau,
+                    anchor_reg_weight=args.anchor_reg_weight,
+                    sparsity_reg_weight=args.sparsity_reg_weight)
     else:
         edge_selector = None
 

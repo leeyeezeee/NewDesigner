@@ -38,7 +38,7 @@ def parse_args():
     parser.add_argument("--metrics_file", type=str, default="result/multiarith.jsonl")
     parser.add_argument("--use_edge_selector", action="store_true",
                         help="Enable semantic-entropy selector training and selector pruning during evaluation.")
-    parser.add_argument("--num_entropy_samples", type=int, default=5)
+    parser.add_argument("--num_entropy_samples", type=int, default=1)
     parser.add_argument("--semantic_judge_llm_name", type=str, default="gpt-4o-mini")
     parser.add_argument("--semantic_judge_api_key", type=str, default="")
     parser.add_argument("--semantic_judge_base_url", type=str, default="")
@@ -48,6 +48,12 @@ def parse_args():
     parser.add_argument("--nonpositive_edge_penalty", type=float, default=0.01)
     parser.add_argument("--selector_buffer_size", type=int, default=512)
     parser.add_argument("--selector_entropy_tau", type=float, default=0.2)
+    parser.add_argument("--refine_rank", type=int, default=4,
+                        help="Rank used by the refined adjacency decoder.")
+    parser.add_argument("--anchor_reg_weight", type=float, default=1.0,
+                        help="Weight for G-Designer refined adjacency anchor regularization.")
+    parser.add_argument("--sparsity_reg_weight", type=float, default=1.0,
+                        help="Weight for G-Designer refined adjacency nuclear-norm sparsity regularization.")
     parser.add_argument("--optimized_spatial", action="store_true")
     parser.add_argument("--optimized_temporal", action="store_true")
     args = parser.parse_args()

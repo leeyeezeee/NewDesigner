@@ -20,6 +20,7 @@ from GDesigner.utils.uncertainty import (
     SemanticEntailmentJudge,
     edge_entropy_rewards,
 )
+from experiments.refinement_loss import refinement_regularization_loss
 
 
 AnswerParser = Callable[[str], str]
@@ -66,11 +67,12 @@ async def run_math_dataset(
         decision_method=args.decision_method,
         optimized_spatial=args.optimized_spatial,
         optimized_temporal=args.optimized_temporal,
+        refine_rank=getattr(args, "refine_rank", 4),
         **kwargs,
     )
     graph.gcn.train()
     graph.mlp.train()
-    optimizer_params = list(graph.gcn.parameters()) + list(graph.mlp.parameters())
+    optimizer_params = list(graph.gcn.parameters()) + list(graph.mlp.parameters()) + graph.refinement_parameters()
     if graph.optimized_temporal:
         optimizer_params.append(graph.temporal_logits)
     optimizer = torch.optim.Adam(optimizer_params, lr=args.lr)
@@ -130,6 +132,7 @@ async def run_math_dataset(
             realized_graph = copy.deepcopy(graph)
             realized_graph.gcn = graph.gcn
             realized_graph.mlp = graph.mlp
+            realized_graph.refinement_weight = graph.refinement_weight
             realized_graph.temporal_logits = graph.temporal_logits
             realized_graphs.append(realized_graph)
             task = record["task"]
@@ -202,7 +205,14 @@ async def run_math_dataset(
             single_loss = -log_prob * correctness_reward
             loss_list.append(single_loss)
 
-        total_loss = torch.mean(torch.stack(loss_list))
+        utility_loss = torch.mean(torch.stack(loss_list))
+        reg_loss, anchor_loss, sparse_loss = refinement_regularization_loss(
+            realized_graphs,
+            utility_loss,
+            anchor_reg_weight=getattr(args, "anchor_reg_weight", 1.0),
+            sparsity_reg_weight=getattr(args, "sparsity_reg_weight", 1.0),
+        )
+        total_loss = utility_loss + reg_loss
         if train_updates_enabled:
             optimizer.zero_grad()
             total_loss.backward()
@@ -223,6 +233,9 @@ async def run_math_dataset(
         print(f"Batch time {time.time() - start_ts:.3f}")
         print(f"Accuracy: {accuracy}")
         print("utilities:", utilities)
+        print("utility loss:", utility_loss.item())
+        print("anchor loss:", anchor_loss.item())
+        print("sparse loss:", sparse_loss.item())
         print("loss:", total_loss.item())
 
         if i_batch + 1 == args.num_iterations:

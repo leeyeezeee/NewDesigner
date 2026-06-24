@@ -28,6 +28,7 @@ from GDesigner.utils.uncertainty import (
     edge_entropy_rewards,
 )
 from datasets.gsm8k_dataset import gsm_data_process,gsm_get_predict
+from experiments.refinement_loss import refinement_regularization_loss
 
 def dataloader(data_list, batch_size, i_batch):
     return data_list[i_batch*batch_size:i_batch*batch_size + batch_size]
@@ -53,7 +54,7 @@ def parse_args():
                         help="Prune temporal edges every few iterations when --optimized_temporal is set.")
     parser.add_argument('--use_edge_selector', action='store_true',
                         help="Enable semantic-entropy selector training and selector pruning during evaluation.")
-    parser.add_argument('--num_entropy_samples', type=int, default=5,
+    parser.add_argument('--num_entropy_samples', type=int, default=1,
                         help="Samples per agent before and after communication for semantic entropy. Automatically raised to 2 when --use_edge_selector is set.")
     parser.add_argument('--semantic_judge_llm_name', type=str, default="gpt-4o-mini",
                         help="OpenAI-compatible semantic judge model name. Independent from --llm_name.")
@@ -73,6 +74,12 @@ def parse_args():
                         help="Replay buffer capacity for selector edge samples.")
     parser.add_argument('--selector_entropy_tau', type=float, default=0.2,
                         help="Entropy delta threshold for positive selector labels.")
+    parser.add_argument('--refine_rank', type=int, default=4,
+                        help="Rank used by the refined adjacency decoder.")
+    parser.add_argument('--anchor_reg_weight', type=float, default=1.0,
+                        help="Weight for G-Designer refined adjacency anchor regularization.")
+    parser.add_argument('--sparsity_reg_weight', type=float, default=1.0,
+                        help="Weight for G-Designer refined adjacency nuclear-norm sparsity regularization.")
     parser.add_argument('--num_iterations', type=int, default=10,help="The num of training iterations.")
     parser.add_argument('--domain', type=str, default="gsm8k",help="Domain (the same as dataset name), default 'gsm8k'")
     parser.add_argument('--agent_names', nargs='+', type=str, default=['MathSolver'],
@@ -109,10 +116,11 @@ async def main():
                   decision_method=decision_method,
                   optimized_spatial=args.optimized_spatial,
                   optimized_temporal=args.optimized_temporal,
+                  refine_rank=args.refine_rank,
                   **kwargs)
     graph.gcn.train()
     graph.mlp.train()
-    optimizer_params = list(graph.gcn.parameters()) + list(graph.mlp.parameters())
+    optimizer_params = list(graph.gcn.parameters()) + list(graph.mlp.parameters()) + graph.refinement_parameters()
     if graph.optimized_temporal:
         optimizer_params.append(graph.temporal_logits)
     optimizer = torch.optim.Adam(optimizer_params, lr=args.lr)
@@ -163,6 +171,7 @@ async def main():
             realized_graph = copy.deepcopy(graph)
             realized_graph.gcn = graph.gcn
             realized_graph.mlp = graph.mlp
+            realized_graph.refinement_weight = graph.refinement_weight
             realized_graph.temporal_logits = graph.temporal_logits
             realized_graphs.append(realized_graph)
             task = record["task"]
@@ -222,7 +231,14 @@ async def main():
             single_loss = -log_prob * is_solved
             loss_list.append(single_loss)
 
-        total_loss = torch.mean(torch.stack(loss_list))
+        utility_loss = torch.mean(torch.stack(loss_list))
+        reg_loss, anchor_loss, sparse_loss = refinement_regularization_loss(
+            realized_graphs,
+            utility_loss,
+            anchor_reg_weight=args.anchor_reg_weight,
+            sparsity_reg_weight=args.sparsity_reg_weight,
+        )
+        total_loss = utility_loss + reg_loss
         if train_updates_enabled:
             optimizer.zero_grad()
             total_loss.backward()
@@ -243,6 +259,9 @@ async def main():
         print(f"Batch time {time.time() - start_ts:.3f}")
         print(f"Accuracy: {accuracy}")
         print("utilities:", utilities)
+        print("utility loss:", utility_loss.item())
+        print("anchor loss:", anchor_loss.item())
+        print("sparse loss:", sparse_loss.item())
         print("loss:", total_loss.item())
 
         if i_batch+1 == args.num_iterations:

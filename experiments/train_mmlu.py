@@ -20,6 +20,7 @@ from GDesigner.utils.uncertainty import (
     SemanticEntailmentJudge,
     edge_entropy_rewards,
 )
+from experiments.refinement_loss import refinement_regularization_loss
 
 async def train(graph:Graph,
             dataset,
@@ -30,7 +31,7 @@ async def train(graph:Graph,
             use_edge_selector: bool = False,
             imp_per_iterations: int = 5,
             pruning_rate: float = 0.25,
-            num_entropy_samples: int = 5,
+            num_entropy_samples: int = 1,
             semantic_judge_llm_name: str = "gpt-4o-mini",
             semantic_judge_api_key: str = "",
             semantic_judge_base_url: str = "",
@@ -40,6 +41,8 @@ async def train(graph:Graph,
             nonpositive_edge_penalty: float = 0.01,
             selector_buffer_size: int = 512,
             selector_entropy_tau: float = 0.2,
+            anchor_reg_weight: float = 1.0,
+            sparsity_reg_weight: float = 1.0,
           ):
     
     def infinite_data_loader() -> Iterator[pd.DataFrame]:
@@ -52,6 +55,7 @@ async def train(graph:Graph,
     loader = infinite_data_loader()
     effective_num_entropy_samples = max(2, int(num_entropy_samples)) if use_edge_selector else max(1, int(num_entropy_samples))
     use_semantic_edges = use_edge_selector and effective_num_entropy_samples > 1
+    batch_entropy_samples = effective_num_entropy_samples if use_semantic_edges else 1
     semantic_judge = None
     if use_semantic_edges:
         semantic_judge = SemanticEntailmentJudge(
@@ -70,7 +74,7 @@ async def train(graph:Graph,
         selector_buffer = SelectorReplayBuffer(selector_buffer_size)
         selector_optimizer = torch.optim.Adam(edge_selector.parameters(), lr=1e-3)
     
-    optimizer_params = list(graph.gcn.parameters()) + list(graph.mlp.parameters())
+    optimizer_params = list(graph.gcn.parameters()) + list(graph.mlp.parameters()) + graph.refinement_parameters()
     if graph.optimized_temporal:
         optimizer_params.append(graph.temporal_logits)
     optimizer = torch.optim.Adam(optimizer_params, lr=lr)
@@ -88,6 +92,7 @@ async def train(graph:Graph,
             realized_graph = copy.deepcopy(graph)
             realized_graph.gcn = graph.gcn
             realized_graph.mlp = graph.mlp
+            realized_graph.refinement_weight = graph.refinement_weight
             realized_graph.temporal_logits = graph.temporal_logits
             realized_graphs.append(realized_graph)
             input_dict = dataset.record_to_input(record)
@@ -96,7 +101,7 @@ async def train(graph:Graph,
                 realized_graph.arun(
                     input_dict,
                     num_rounds,
-                    num_entropy_samples=effective_num_entropy_samples,
+                    num_entropy_samples=batch_entropy_samples,
                     record_execution_history=use_semantic_edges,
                     track_grad=True,
                 )
@@ -147,7 +152,14 @@ async def train(graph:Graph,
             print(f"correct answer:{correct_answer}")
             print(f"edge entropy rewards:{edge_rewards}")
     
-        total_loss = torch.mean(torch.stack(loss_list))
+        utility_loss = torch.mean(torch.stack(loss_list))
+        reg_loss, anchor_loss, sparse_loss = refinement_regularization_loss(
+            realized_graphs,
+            utility_loss,
+            anchor_reg_weight=anchor_reg_weight,
+            sparsity_reg_weight=sparsity_reg_weight,
+        )
+        total_loss = utility_loss + reg_loss
         optimizer.zero_grad()
         total_loss.backward()
         optimizer.step()
@@ -167,6 +179,9 @@ async def train(graph:Graph,
         print("answers:",answers)
         print(f"Batch time {time.time() - start_ts:.3f}")
         print("utilities:", utilities) # [0.0, 0.0, 0.0, 1.0]
+        print("utility loss:", utility_loss.item())
+        print("anchor loss:", anchor_loss.item())
+        print("sparse loss:", sparse_loss.item())
         print("loss:", total_loss.item()) # 4.6237263679504395
         print(f"Cost {Cost.instance().value}")
         print(f"PromptTokens {PromptTokens.instance().value}")

@@ -48,6 +48,7 @@ class Graph(ABC):
                 initial_temporal_probability: float = 0.5,
                 fixed_temporal_masks:List[List[int]] = None,
                 node_kwargs:List[Dict] = None,
+                refine_rank:int = 4,
                 ):
         
         if fixed_spatial_masks is None:
@@ -72,6 +73,15 @@ class Graph(ABC):
         self.edge_log_probs:List[Dict[str, Any]] = []
         self.realized_edge_counts:List[int] = []
         self.node_kwargs = node_kwargs if node_kwargs is not None else [{} for _ in agent_names]
+        self.anchor_spatial_matrix = fixed_spatial_masks.view(len(agent_names), len(agent_names)).float()
+        self.refine_rank = min(max(1, int(refine_rank)), len(agent_names))
+        self.refinement_weight = torch.nn.Parameter(
+            torch.eye(self.refine_rank),
+            requires_grad=optimized_spatial,
+        )
+        self.refinement_anchor_loss = torch.tensor(0.0)
+        self.refinement_sparse_loss = torch.tensor(0.0)
+        self.spatial_edge_probabilities = None
         
         self.init_nodes() # add nodes to the self.nodes
         self.node_id_to_index = {node_id: idx for idx, node_id in enumerate(self.nodes)}
@@ -92,6 +102,11 @@ class Graph(ABC):
         self.temporal_logits = torch.nn.Parameter(torch.ones(len(self.potential_temporal_edges), requires_grad=optimized_temporal) * init_temporal_logit,
                                                  requires_grad=optimized_temporal) # trainable edge logits
         self.temporal_masks = torch.nn.Parameter(fixed_temporal_masks,requires_grad=False)  # fixed edge masks
+
+    def refinement_parameters(self) -> List[torch.nn.Parameter]:
+        if self.refinement_weight.requires_grad:
+            return [self.refinement_weight]
+        return []
     
     def construct_adj_matrix(self):
         role_connect:List[Tuple[str,str]] = self.prompt_set.get_role_connection()
@@ -133,6 +148,66 @@ class Graph(ABC):
         query_embedding = query_embedding.unsqueeze(0).repeat((self.num_nodes,1))
         new_features = torch.cat((self.features,query_embedding),dim=1)
         return new_features
+
+    def _reset_refinement_losses(self, reference: Optional[torch.Tensor] = None) -> None:
+        if reference is None:
+            reference = self.refinement_weight
+        self.refinement_anchor_loss = reference.new_tensor(0.0)
+        self.refinement_sparse_loss = reference.new_tensor(0.0)
+
+    def _refine_spatial_logits(self, raw_spatial_logits: torch.Tensor) -> torch.Tensor:
+        if not self.optimized_spatial:
+            self.spatial_edge_probabilities = None
+            self._reset_refinement_losses(raw_spatial_logits)
+            return raw_spatial_logits.view(-1)
+
+        raw_spatial_logits = raw_spatial_logits.view(self.num_nodes, self.num_nodes)
+        mask = self.spatial_masks.view(self.num_nodes, self.num_nodes).to(
+            device=raw_spatial_logits.device,
+            dtype=raw_spatial_logits.dtype,
+        )
+        sketched_adj = torch.sigmoid(raw_spatial_logits) * mask
+        anchor_adj = self.anchor_spatial_matrix.to(
+            device=raw_spatial_logits.device,
+            dtype=raw_spatial_logits.dtype,
+        )
+        rank = min(self.refine_rank, self.num_nodes)
+        left_singular_vectors, _, _ = torch.linalg.svd(
+            sketched_adj,
+            full_matrices=False,
+        )
+        left_singular_vectors = left_singular_vectors[:, :rank]
+        refinement_weight = self.refinement_weight[:rank, :rank].to(
+            device=raw_spatial_logits.device,
+            dtype=raw_spatial_logits.dtype,
+        )
+        refined_adj = left_singular_vectors @ refinement_weight @ left_singular_vectors.t()
+
+        self.refinement_anchor_loss = (
+            0.5 * torch.linalg.matrix_norm(sketched_adj - refined_adj, ord="fro").pow(2)
+            + 0.5 * torch.linalg.matrix_norm(anchor_adj - refined_adj, ord="fro").pow(2)
+        )
+        self.refinement_sparse_loss = torch.linalg.svdvals(refinement_weight).sum()
+        self.spatial_edge_probabilities = refined_adj.clamp(1e-6, 1.0 - 1e-6).view(-1)
+        return refined_adj.view(-1)
+
+    def prepare_spatial_logits(
+            self,
+            task: str,
+            track_grad: bool = True,
+            ) -> None:
+        def _compute_spatial_logits() -> None:
+            new_features = self.construct_new_features(task)
+            logits = self.gcn(new_features,self.role_adj_matrix)
+            logits = self.mlp(logits)
+            raw_spatial_logits = min_max_norm(torch.flatten(logits @ logits.t()))
+            self.spatial_logits = self._refine_spatial_logits(raw_spatial_logits)
+
+        if track_grad:
+            _compute_spatial_logits()
+        else:
+            with torch.no_grad():
+                _compute_spatial_logits()
 
     def edge_selector_task_embedding(self, task: str) -> torch.Tensor:
         return torch.tensor(np.array(get_sentence_embedding(task)), dtype=torch.float32)
@@ -322,7 +397,7 @@ class Graph(ABC):
         self.clear_spatial_connection()
         log_probs = [torch.tensor(0.0, requires_grad=self.optimized_spatial and track_grad)]
         
-        for potential_connection, edge_logit, edge_mask in zip(self.potential_spatial_edges, self.spatial_logits, self.spatial_masks):
+        for edge_idx, (potential_connection, edge_logit, edge_mask) in enumerate(zip(self.potential_spatial_edges, self.spatial_logits, self.spatial_masks)):
             out_node:Node = self.find_node(potential_connection[0])
             in_node:Node = self.find_node(potential_connection[1])
             if edge_mask == 0.0:
@@ -332,7 +407,11 @@ class Graph(ABC):
                     out_node.add_successor(in_node,'spatial')
                 continue
             if not self.check_cycle(in_node, {out_node}):
-                edge_prob = torch.sigmoid(edge_logit / temperature)
+                if self.spatial_edge_probabilities is not None:
+                    edge_prob = self.spatial_edge_probabilities[edge_idx]
+                else:
+                    edge_prob = torch.sigmoid(edge_logit / temperature)
+                edge_prob = edge_prob.clamp(1e-6, 1.0 - 1e-6)
                 if threshold:
                     edge_prob = torch.tensor(1 if edge_prob > threshold else 0)
                 if torch.rand(1) < edge_prob:
@@ -412,10 +491,11 @@ class Graph(ABC):
         log_probs = 0
         self.edge_log_probs = []
         self.realized_edge_counts = []
+        task = inputs.get("task", str(inputs)) if isinstance(inputs, dict) else str(inputs)
+        self.prepare_spatial_logits(task, track_grad=track_grad)
         for round in range(num_rounds):
             log_probs += self.construct_spatial_connection(round, track_grad=track_grad)
             log_probs += self.construct_temporal_connection(round, track_grad=track_grad)
-            task = inputs.get("task", str(inputs)) if isinstance(inputs, dict) else str(inputs)
             self.apply_edge_selector(task, edge_selector, round)
             self.realized_edge_counts.append(self.communication_edge_count)
             
@@ -466,19 +546,7 @@ class Graph(ABC):
         log_probs = 0
         self.edge_log_probs = []
         self.realized_edge_counts = []
-        if track_grad:
-            new_features = self.construct_new_features(input['task'])
-            logits = self.gcn(new_features,self.role_adj_matrix)
-            logits = self.mlp(logits)
-            self.spatial_logits = logits @ logits.t()
-            self.spatial_logits = min_max_norm(torch.flatten(self.spatial_logits))
-        else:
-            with torch.no_grad():
-                new_features = self.construct_new_features(input['task'])
-                logits = self.gcn(new_features,self.role_adj_matrix)
-                logits = self.mlp(logits)
-                self.spatial_logits = logits @ logits.t()
-                self.spatial_logits = min_max_norm(torch.flatten(self.spatial_logits))
+        self.prepare_spatial_logits(input['task'], track_grad=track_grad)
 
         for round in range(num_rounds):
             log_probs += self.construct_spatial_connection(round, track_grad=track_grad)
@@ -589,6 +657,8 @@ class Graph(ABC):
 def min_max_norm(tensor:torch.Tensor):
     min_val = tensor.min()
     max_val = tensor.max()
+    if torch.isclose(max_val, min_val):
+        return torch.zeros_like(tensor)
     normalized_0_to_1 = (tensor - min_val) / (max_val - min_val)
     normalized_minus1_to_1 = normalized_0_to_1 * 2 - 1
     return normalized_minus1_to_1
