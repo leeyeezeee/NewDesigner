@@ -167,7 +167,13 @@ def parse_args():
         "--num_entropy_samples",
         type=int,
         default=4,
-        help="Samples per agent used to estimate semantic entropy. Use at least 2.",
+        help="Samples per agent used to estimate KHEAT uncertainty. Use at least 2.",
+    )
+    parser.add_argument(
+        "--kle_heat_t",
+        type=float,
+        default=0.3,
+        help="Heat-kernel lengthscale for KHEAT uncertainty.",
     )
     parser.add_argument("--llm_name", type=str, default="gpt-4o")
     parser.add_argument(
@@ -206,7 +212,7 @@ def parse_args():
     elif args.agent_names is not None or args.agent_nums is not None:
         parser.error("--agent_names and --agent_nums must be provided together.")
     if args.num_entropy_samples < 2:
-        parser.error("--num_entropy_samples must be at least 2 to estimate entropy.")
+        parser.error("--num_entropy_samples must be at least 2 to estimate KHEAT uncertainty.")
     return args
 
 
@@ -485,6 +491,7 @@ async def average_agent_semantic_entropy(
     graph,
     question: str,
     judge: SemanticEntailmentJudge,
+    heat_t: float = 0.3,
 ) -> Tuple[float, Dict[str, float]]:
     agents = decision_agent_nodes(graph)
     entropy_tasks = []
@@ -496,7 +503,7 @@ async def average_agent_semantic_entropy(
         if not samples:
             continue
         entropy_nodes.append(node)
-        entropy_tasks.append(semantic_uncertainty(question, samples, judge))
+        entropy_tasks.append(semantic_uncertainty(question, samples, judge, heat_t=heat_t))
 
     if not entropy_tasks:
         return 0.0, {}
@@ -554,11 +561,13 @@ async def run_record_inference(
 async def attach_semantic_entropy(
     result: InferenceResult,
     judge: SemanticEntailmentJudge,
+    heat_t: float = 0.3,
 ) -> Dict[str, Any]:
     avg_entropy, per_agent_entropy = await average_agent_semantic_entropy(
         result.realized_graph,
         result.input_dict["task"],
         judge,
+        heat_t=heat_t,
     )
 
     return {
@@ -635,7 +644,7 @@ def plot_distribution(
         color="#FF5252",
         label="Incorrect",
     )
-    plt.xlabel("Average Agent Semantic Entropy")
+    plt.xlabel("Average Agent KHEAT Uncertainty")
     plt.ylabel("Probability")
     plt.title(f"{dataset_name} {mode_name} Graph")
     plt.legend()
@@ -711,7 +720,7 @@ async def main():
         entropy_start = time.time()
         batch_rows = await asyncio.gather(
             *[
-                attach_semantic_entropy(inference_result, judge)
+                attach_semantic_entropy(inference_result, judge, heat_t=args.kle_heat_t)
                 for inference_result in inference_results
             ]
         )
@@ -722,7 +731,7 @@ async def main():
         total_count += len(batch_rows)
         print(f"Accuracy so far: {correct_count / total_count:.4f}")
         print(f"Inference time: {inference_seconds:.3f}s")
-        print(f"Semantic entropy time: {entropy_seconds:.3f}s")
+        print(f"KHEAT uncertainty time: {entropy_seconds:.3f}s")
 
     correct_values = [
         row["average_agent_semantic_entropy"] for row in rows if row["is_correct"]

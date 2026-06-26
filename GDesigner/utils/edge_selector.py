@@ -57,7 +57,8 @@ def build_edge_selector_examples(
             target_id,
             task_embedding=task_embedding,
         )
-        label = 1.0 if float(detail["entropy_delta"]) > entropy_tau else 0.0
+        uncertainty_delta = float(detail.get("uncertainty_delta", detail.get("entropy_delta", 0.0)))
+        label = 1.0 if uncertainty_delta > entropy_tau else 0.0
         examples.append({
             "features": features.detach().float(),
             "label": torch.tensor(label, dtype=torch.float32),

@@ -53,9 +53,11 @@ def parse_args():
     parser.add_argument('--imp_per_iterations', type=int, default=5,
                         help="Prune temporal edges every few iterations when --optimized_temporal is set.")
     parser.add_argument('--use_edge_selector', action='store_true',
-                        help="Enable semantic-entropy selector training and selector pruning during evaluation.")
+                        help="Enable KHEAT uncertainty selector training and selector pruning during evaluation.")
     parser.add_argument('--num_entropy_samples', type=int, default=1,
-                        help="Samples per agent before and after communication for semantic entropy. Automatically raised to 2 when --use_edge_selector is set.")
+                        help="Samples per agent before and after communication for KHEAT. Automatically raised to 2 when --use_edge_selector is set.")
+    parser.add_argument('--kle_heat_t', type=float, default=0.3,
+                        help="Heat-kernel lengthscale for KHEAT uncertainty.")
     parser.add_argument('--semantic_judge_llm_name', type=str, default="gpt-4o-mini",
                         help="OpenAI-compatible semantic judge model name. Independent from --llm_name.")
     parser.add_argument('--semantic_judge_api_key', type=str, default="",
@@ -67,7 +69,7 @@ def parse_args():
     parser.add_argument('--semantic_judge_max_concurrency', type=int, default=None,
                         help="Maximum concurrent semantic judge API requests. Defaults to SEMANTIC_JUDGE_MAX_CONCURRENCY or 16.")
     parser.add_argument('--negative_edge_reward_scale', type=float, default=1.0,
-                        help="Scale for negative edge rewards when an edge increases semantic entropy.")
+                        help="Scale for negative edge rewards when an edge increases KHEAT uncertainty.")
     parser.add_argument('--nonpositive_edge_penalty', type=float, default=0.01,
                         help="Deprecated compatibility option; normalized edge rewards do not add a zero-gain penalty.")
     parser.add_argument('--selector_buffer_size', type=int, default=512,
@@ -216,6 +218,7 @@ async def main():
                     effective_num_entropy_samples,
                     negative_reward_scale=args.negative_edge_reward_scale,
                     nonpositive_penalty=args.nonpositive_edge_penalty,
+                    kle_heat_t=args.kle_heat_t,
                 )
                 selector_buffer.add_many(build_edge_selector_examples(
                     realized_graph,

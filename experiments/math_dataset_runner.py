@@ -189,6 +189,7 @@ async def run_math_dataset(
                     effective_num_entropy_samples,
                     negative_reward_scale=args.negative_edge_reward_scale,
                     nonpositive_penalty=args.nonpositive_edge_penalty,
+                    kle_heat_t=getattr(args, "kle_heat_t", 0.3),
                 )
                 selector_buffer.add_many(build_edge_selector_examples(
                     realized_graph,

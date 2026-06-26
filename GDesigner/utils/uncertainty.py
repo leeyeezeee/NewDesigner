@@ -1,10 +1,12 @@
 import asyncio
 import math
 import os
+import re
 from collections import Counter
 from typing import Any, Dict, Iterable, List, Optional, Tuple, TypeVar
 
 import httpx
+import numpy as np
 from openai import APIConnectionError, APITimeoutError, RateLimitError
 from tenacity import (
     AsyncRetrying,
@@ -20,6 +22,14 @@ _DEFAULT_JUDGE_TIMEOUT = 120.0
 _DEFAULT_JUDGE_CONNECT_TIMEOUT = 10.0
 _DEFAULT_JUDGE_MAX_RETRIES = 3
 _DEFAULT_JUDGE_MAX_CONCURRENCY = 16
+_DEFAULT_KLE_HEAT_T = 0.3
+
+_NLI_LABELS = ("entailment", "neutral", "contradiction")
+_NLI_LABEL_SCORES = {
+    "entailment": 1.0,
+    "neutral": 0.5,
+    "contradiction": 0.0,
+}
 
 
 def _float_env(name: str, default: float) -> float:
@@ -38,6 +48,86 @@ def _int_env(name: str, default: int) -> int:
 
 def _judge_http_timeout(read_timeout: float, connect_timeout: float) -> httpx.Timeout:
     return httpx.Timeout(timeout=read_timeout, connect=connect_timeout)
+
+
+def _parse_nli_label(verdict: str) -> str:
+    normalized = re.sub(r"[^a-z]+", " ", verdict.lower()).strip()
+    if not normalized:
+        return "neutral"
+
+    first_token = normalized.split()[0]
+    if first_token.startswith("entail"):
+        return "entailment"
+    if first_token.startswith("neutral"):
+        return "neutral"
+    if first_token.startswith("contrad"):
+        return "contradiction"
+
+    matches = [
+        label
+        for label in _NLI_LABELS
+        if re.search(rf"\b{label}\b", normalized)
+    ]
+    if len(matches) == 1:
+        return matches[0]
+    return "neutral"
+
+
+def heat_kernel_language_entropy(
+    weight_matrix: Iterable[Iterable[float]],
+    heat_t: float = _DEFAULT_KLE_HEAT_T,
+) -> Tuple[float, Dict[str, Any]]:
+    if heat_t < 0:
+        raise ValueError("KHEAT lengthscale --kle_heat_t must be non-negative.")
+
+    weights = np.asarray(weight_matrix, dtype=float)
+    if weights.size == 0:
+        return 0.0, {
+            "kernel": "heat",
+            "kle_heat_t": float(heat_t),
+            "weights": [],
+            "laplacian_eigenvalues": [],
+            "kernel_eigenvalues": [],
+        }
+    if weights.ndim != 2 or weights.shape[0] != weights.shape[1]:
+        raise ValueError("KHEAT requires a square semantic weight matrix.")
+
+    num_outputs = int(weights.shape[0])
+    if num_outputs <= 1:
+        return 0.0, {
+            "kernel": "heat",
+            "kle_heat_t": float(heat_t),
+            "weights": weights.tolist(),
+            "laplacian_eigenvalues": [],
+            "kernel_eigenvalues": [1.0] if num_outputs == 1 else [],
+        }
+
+    weights = np.maximum((weights + weights.T) / 2.0, 0.0)
+    np.fill_diagonal(weights, 0.0)
+    laplacian = np.diag(weights.sum(axis=1)) - weights
+    laplacian_eigenvalues = np.linalg.eigvalsh(laplacian)
+    laplacian_eigenvalues = np.maximum(laplacian_eigenvalues, 0.0)
+    kernel_eigenvalues = np.exp(-float(heat_t) * laplacian_eigenvalues)
+    trace = float(kernel_eigenvalues.sum())
+    if trace <= 0:
+        return 0.0, {
+            "kernel": "heat",
+            "kle_heat_t": float(heat_t),
+            "weights": weights.tolist(),
+            "laplacian_eigenvalues": laplacian_eigenvalues.tolist(),
+            "kernel_eigenvalues": [],
+        }
+
+    density_eigenvalues = kernel_eigenvalues / trace
+    positive_eigenvalues = density_eigenvalues[density_eigenvalues > 0]
+    entropy = -float(np.sum(positive_eigenvalues * np.log(positive_eigenvalues)))
+    return entropy, {
+        "kernel": "heat",
+        "kle_heat_t": float(heat_t),
+        "weights": weights.tolist(),
+        "laplacian_eigenvalues": laplacian_eigenvalues.tolist(),
+        "kernel_eigenvalues": density_eigenvalues.tolist(),
+    }
 
 
 def semantic_entropy(labels: Iterable[str]) -> float:
@@ -160,7 +250,7 @@ class SemanticEntailmentJudge:
                 async with self._request_semaphore:
                     return await self._client.chat.completions.create(**request_kwargs)
 
-    async def entails(self, question: str, premise: str, hypothesis: str) -> bool:
+    async def nli_label(self, question: str, premise: str, hypothesis: str) -> str:
         if self._client is None:
             raise RuntimeError(
                 "SemanticEntailmentJudge is not configured. For remote OpenAI, set "
@@ -200,8 +290,44 @@ class SemanticEntailmentJudge:
             request_kwargs["extra_body"] = extra_body
         response = await self._create_completion(request_kwargs)
         verdict = response.choices[0].message.content or ""
-        verdict = verdict.strip().lower()
-        return verdict.startswith("entail")
+        return _parse_nli_label(verdict)
+
+    async def nli_score(self, question: str, premise: str, hypothesis: str) -> float:
+        label = await self.nli_label(question, premise, hypothesis)
+        return _NLI_LABEL_SCORES[label]
+
+    async def entails(self, question: str, premise: str, hypothesis: str) -> bool:
+        label = await self.nli_label(question, premise, hypothesis)
+        return label == "entailment"
+
+    async def semantic_weight_matrix(
+        self,
+        question: str,
+        outputs: Iterable[Any],
+    ) -> List[List[float]]:
+        valid_outputs = [str(output).strip() for output in outputs if str(output).strip()]
+        num_outputs = len(valid_outputs)
+        weights = np.zeros((num_outputs, num_outputs), dtype=float)
+        tasks = []
+        task_pairs = []
+
+        for i in range(num_outputs):
+            for j in range(i + 1, num_outputs):
+                if valid_outputs[i] == valid_outputs[j]:
+                    weights[i, j] = weights[j, i] = 2.0
+                    continue
+                tasks.append(asyncio.gather(
+                    self.nli_score(question, valid_outputs[i], valid_outputs[j]),
+                    self.nli_score(question, valid_outputs[j], valid_outputs[i]),
+                ))
+                task_pairs.append((i, j))
+
+        if tasks:
+            pair_scores = await asyncio.gather(*tasks)
+            for (i, j), (forward_score, backward_score) in zip(task_pairs, pair_scores):
+                weights[i, j] = weights[j, i] = float(forward_score) + float(backward_score)
+
+        return weights.tolist()
 
     async def equivalent(self, question: str, output_a: str, output_b: str) -> bool:
         if output_a.strip() == output_b.strip():
@@ -253,9 +379,23 @@ async def semantic_uncertainty(
     question: str,
     outputs: Iterable[T],
     judge: SemanticEntailmentJudge,
-) -> Tuple[float, List[str]]:
-    labels = await judge.cluster_outputs(question, outputs)
-    return semantic_entropy(labels), labels
+    heat_t: float = _DEFAULT_KLE_HEAT_T,
+) -> Tuple[float, Dict[str, Any]]:
+    valid_outputs = [str(output).strip() for output in outputs if str(output).strip()]
+    if len(valid_outputs) <= 1:
+        return 0.0, {
+            "kernel": "heat",
+            "kle_heat_t": float(heat_t),
+            "outputs": valid_outputs,
+            "weights": [[0.0]] if valid_outputs else [],
+            "laplacian_eigenvalues": [],
+            "kernel_eigenvalues": [1.0] if valid_outputs else [],
+        }
+
+    weights = await judge.semantic_weight_matrix(question, valid_outputs)
+    entropy, details = heat_kernel_language_entropy(weights, heat_t=heat_t)
+    details["outputs"] = valid_outputs
+    return entropy, details
 
 
 def edge_key(edge_info: Dict[str, Any]) -> str:
@@ -292,14 +432,14 @@ async def _sample_node_outputs(
 
 
 def _edge_reward_from_delta(
-    entropy_delta: float,
+    uncertainty_delta: float,
     negative_reward_scale: float,
     nonpositive_penalty: float,
 ) -> float:
-    if entropy_delta > 0:
-        return entropy_delta
-    if entropy_delta < 0:
-        return negative_reward_scale * entropy_delta
+    if uncertainty_delta > 0:
+        return uncertainty_delta
+    if uncertainty_delta < 0:
+        return negative_reward_scale * uncertainty_delta
     return 0.0
 
 
@@ -311,17 +451,17 @@ def _normalize_edge_rewards(
     if not details:
         return {}
 
-    entropy_deltas = [
-        float(detail["entropy_delta"])
+    uncertainty_deltas = [
+        float(detail.get("uncertainty_delta", detail.get("entropy_delta", 0.0)))
         for detail in details.values()
     ]
-    max_abs_delta = max(abs(delta) for delta in entropy_deltas)
+    max_abs_delta = max(abs(delta) for delta in uncertainty_deltas)
 
     rewards: Dict[str, float] = {}
     for key, detail in details.items():
-        entropy_delta = float(detail["entropy_delta"])
+        uncertainty_delta = float(detail.get("uncertainty_delta", detail.get("entropy_delta", 0.0)))
         normalized_delta = (
-            entropy_delta / max_abs_delta
+            uncertainty_delta / max_abs_delta
             if max_abs_delta > 0
             else 0.0
         )
@@ -330,6 +470,7 @@ def _normalize_edge_rewards(
             negative_reward_scale=negative_reward_scale,
             nonpositive_penalty=nonpositive_penalty,
         )
+        detail["normalized_uncertainty_delta"] = normalized_delta
         detail["normalized_entropy_delta"] = normalized_delta
         detail["reward"] = reward
         rewards[key] = reward
@@ -344,8 +485,9 @@ async def edge_entropy_rewards(
     num_entropy_samples: int,
     negative_reward_scale: float = 1.0,
     nonpositive_penalty: float = 0.01,
+    kle_heat_t: float = _DEFAULT_KLE_HEAT_T,
 ) -> Tuple[Dict[str, float], Dict[str, Dict[str, Any]]]:
-    """Measure each selected edge by removing only that edge from its target input."""
+    """Measure each selected edge by removing it and comparing KHEAT uncertainty."""
     if not graph.edge_log_probs or num_entropy_samples <= 1:
         return {}, {}
 
@@ -355,7 +497,7 @@ async def edge_entropy_rewards(
             histories[(node_id, history_item["round"])] = history_item
 
     details: Dict[str, Dict[str, Any]] = {}
-    after_cache: Dict[Tuple[str, int], Tuple[float, List[str]]] = {}
+    after_cache: Dict[Tuple[str, int], Tuple[float, Dict[str, Any]]] = {}
 
     for edge_info in graph.edge_log_probs:
         target_id = edge_info["target"]
@@ -403,34 +545,45 @@ async def edge_entropy_rewards(
 
         after_cache_key = (target_id, round_idx)
         if after_cache_key in after_cache:
-            before_entropy, before_labels = await semantic_uncertainty(question, before_outputs, judge)
-            after_entropy, after_labels = after_cache[after_cache_key]
+            before_uncertainty, before_uncertainty_details = await semantic_uncertainty(
+                question,
+                before_outputs,
+                judge,
+                heat_t=kle_heat_t,
+            )
+            after_uncertainty, after_uncertainty_details = after_cache[after_cache_key]
         else:
             after_outputs = history_item.get("entropy_samples", [])
             if not after_outputs:
                 continue
             before_result, after_result = await asyncio.gather(
-                semantic_uncertainty(question, before_outputs, judge),
-                semantic_uncertainty(question, after_outputs, judge),
+                semantic_uncertainty(question, before_outputs, judge, heat_t=kle_heat_t),
+                semantic_uncertainty(question, after_outputs, judge, heat_t=kle_heat_t),
             )
-            before_entropy, before_labels = before_result
-            after_entropy, after_labels = after_result
-            after_cache[after_cache_key] = (after_entropy, after_labels)
+            before_uncertainty, before_uncertainty_details = before_result
+            after_uncertainty, after_uncertainty_details = after_result
+            after_cache[after_cache_key] = (after_uncertainty, after_uncertainty_details)
             history_item["entropy_samples"] = []
 
-        entropy_delta = before_entropy - after_entropy
+        uncertainty_delta = before_uncertainty - after_uncertainty
         details[key] = {
             "type": edge_type,
             "round": round_idx,
             "source": source_id,
             "target": target_id,
-            "before_entropy": before_entropy,
-            "after_entropy": after_entropy,
-            "entropy_delta": entropy_delta,
-            "normalized_entropy_delta": entropy_delta,
+            "uncertainty_method": "kle_heat",
+            "kle_heat_t": float(kle_heat_t),
+            "before_uncertainty": before_uncertainty,
+            "after_uncertainty": after_uncertainty,
+            "uncertainty_delta": uncertainty_delta,
+            "normalized_uncertainty_delta": uncertainty_delta,
+            "before_entropy": before_uncertainty,
+            "after_entropy": after_uncertainty,
+            "entropy_delta": uncertainty_delta,
+            "normalized_entropy_delta": uncertainty_delta,
             "reward": 0.0,
-            "before_labels": before_labels,
-            "after_labels": after_labels,
+            "before_uncertainty_details": before_uncertainty_details,
+            "after_uncertainty_details": after_uncertainty_details,
         }
 
     rewards = _normalize_edge_rewards(

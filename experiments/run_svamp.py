@@ -37,8 +37,10 @@ def parse_args():
     parser.add_argument("--decision_method", type=str, default="FinalRefer")
     parser.add_argument("--metrics_file", type=str, default="result/svamp.jsonl")
     parser.add_argument("--use_edge_selector", action="store_true",
-                        help="Enable semantic-entropy selector training and selector pruning during evaluation.")
+                        help="Enable KHEAT uncertainty selector training and selector pruning during evaluation.")
     parser.add_argument("--num_entropy_samples", type=int, default=1)
+    parser.add_argument("--kle_heat_t", type=float, default=0.3,
+                        help="Heat-kernel lengthscale for KHEAT uncertainty.")
     parser.add_argument("--semantic_judge_llm_name", type=str, default="gpt-4o-mini")
     parser.add_argument("--semantic_judge_api_key", type=str, default="")
     parser.add_argument("--semantic_judge_base_url", type=str, default="")

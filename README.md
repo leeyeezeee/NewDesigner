@@ -41,10 +41,10 @@ For example, if you want to verify the results on the `gsm8k` dataset, you can e
 python experiments/run_gsm8k.py --mode FullConnected --batch_size 4 --agent_nums 4 --num_iterations 10 --num_rounds 1 --optimized_spatial
 ```
 
-When semantic edge rewards are enabled, the judge can use any OpenAI-compatible local vLLM server:
+When KHEAT edge rewards are enabled, the judge can use any OpenAI-compatible local vLLM server:
 
 ```bash
-python experiments/run_gsm8k.py --optimized_spatial --uncertainty_lambda 1.0 --num_entropy_samples 2 --semantic_judge_llm_name Qwen/Qwen2.5-7B-Instruct --semantic_judge_base_url http://localhost:8000/v1 --semantic_judge_max_concurrency 32
+python experiments/run_gsm8k.py --optimized_spatial --use_edge_selector --num_entropy_samples 10 --kle_heat_t 0.3 --semantic_judge_llm_name Qwen/Qwen2.5-7B-Instruct --semantic_judge_base_url http://localhost:8000/v1 --semantic_judge_max_concurrency 32
 ```
 
 ## Acknowledgement
