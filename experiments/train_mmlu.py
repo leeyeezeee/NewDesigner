@@ -20,6 +20,7 @@ from GDesigner.utils.uncertainty import (
     SemanticEntailmentJudge,
     edge_entropy_rewards,
 )
+from GDesigner.utils.ig_scorer import make_target_spec
 from experiments.refinement_loss import refinement_regularization_loss
 
 async def train(graph:Graph,
@@ -42,6 +43,7 @@ async def train(graph:Graph,
             nonpositive_edge_penalty: float = 0.01,
             selector_buffer_size: int = 512,
             selector_entropy_tau: float = 0.2,
+            selector_ig_tau: float = 0.0,
             anchor_reg_weight: float = 1.0,
             sparsity_reg_weight: float = 1.0,
           ):
@@ -136,12 +138,14 @@ async def train(graph:Graph,
                     negative_reward_scale=negative_edge_reward_scale,
                     nonpositive_penalty=nonpositive_edge_penalty,
                     kle_heat_t=kle_heat_t,
+                    target_spec=make_target_spec("mmlu", correct_answer),
                 )
                 selector_buffer.add_many(build_edge_selector_examples(
                     realized_graph,
                     input_dict["task"],
                     edge_details,
                     selector_entropy_tau,
+                    selector_ig_tau,
                 ))
             realized_graph.clear_execution_history()
             utility = {

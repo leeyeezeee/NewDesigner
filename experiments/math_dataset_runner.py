@@ -20,6 +20,7 @@ from GDesigner.utils.uncertainty import (
     SemanticEntailmentJudge,
     edge_entropy_rewards,
 )
+from GDesigner.utils.ig_scorer import make_target_spec
 from experiments.refinement_loss import refinement_regularization_loss
 
 
@@ -190,12 +191,14 @@ async def run_math_dataset(
                     negative_reward_scale=args.negative_edge_reward_scale,
                     nonpositive_penalty=args.nonpositive_edge_penalty,
                     kle_heat_t=getattr(args, "kle_heat_t", 0.3),
+                    target_spec=make_target_spec(dataset_name, true_answer),
                 )
                 selector_buffer.add_many(build_edge_selector_examples(
                     realized_graph,
                     record["task"],
                     edge_details,
                     getattr(args, "selector_entropy_tau", 0.0),
+                    getattr(args, "selector_ig_tau", 0.0),
                 ))
             realized_graph.clear_execution_history()
             utility = {

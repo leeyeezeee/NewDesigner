@@ -40,6 +40,7 @@ def build_edge_selector_examples(
     task: str,
     edge_details: Dict[str, Dict],
     entropy_tau: float,
+    ig_tau: float = 0.0,
 ) -> List[Dict[str, torch.Tensor]]:
     if not edge_details:
         return []
@@ -58,7 +59,15 @@ def build_edge_selector_examples(
             task_embedding=task_embedding,
         )
         uncertainty_delta = float(detail.get("uncertainty_delta", detail.get("entropy_delta", 0.0)))
-        label = 1.0 if uncertainty_delta > entropy_tau else 0.0
+        ig_gain = detail.get("ig_gain")
+        if ig_gain is None:
+            label = 1.0 if uncertainty_delta > entropy_tau else 0.0
+        else:
+            ig_gain = float(ig_gain)
+            label = 1.0 if (
+                ig_gain > ig_tau
+                or (ig_gain >= 0.0 and uncertainty_delta > entropy_tau)
+            ) else 0.0
         examples.append({
             "features": features.detach().float(),
             "label": torch.tensor(label, dtype=torch.float32),

@@ -28,6 +28,7 @@ from GDesigner.utils.uncertainty import (
     SemanticEntailmentJudge,
     edge_entropy_rewards,
 )
+from GDesigner.utils.ig_scorer import make_target_spec
 from experiments.refinement_loss import refinement_regularization_loss
 
 def dataloader(data_list, batch_size, i_batch):
@@ -56,8 +57,9 @@ def parse_args():
                         help="Enable KHEAT uncertainty selector training and selector pruning during evaluation.")
     parser.add_argument('--num_entropy_samples', type=int, default=1,
                         help="Samples per agent before and after communication for KHEAT. Automatically raised to 2 when --use_edge_selector is set.")
-    parser.add_argument('--kle_heat_t', type=float, default=0.3,
-                        help="Heat-kernel lengthscale for KHEAT uncertainty.")
+    # KLE temporarily disabled; keep this hyperparameter ready for future re-enable.
+    # parser.add_argument('--kle_heat_t', type=float, default=0.3,
+    #                     help="Heat-kernel lengthscale for KHEAT uncertainty.")
     parser.add_argument('--semantic_judge_llm_name', type=str, default="gpt-4o-mini",
                         help="OpenAI-compatible semantic judge model name. Independent from --llm_name.")
     parser.add_argument('--semantic_judge_api_key', type=str, default="",
@@ -76,6 +78,8 @@ def parse_args():
                         help="Replay buffer capacity for selector edge samples.")
     parser.add_argument('--selector_entropy_tau', type=float, default=0.2,
                         help="Entropy delta threshold for positive selector labels.")
+    parser.add_argument('--selector_ig_tau', type=float, default=0.0,
+                        help="IG gain threshold for positive selector labels.")
     parser.add_argument('--refine_rank', type=int, default=4,
                         help="Rank used by the refined adjacency decoder.")
     parser.add_argument('--anchor_reg_weight', type=float, default=1.0,
@@ -218,13 +222,15 @@ async def main():
                     effective_num_entropy_samples,
                     negative_reward_scale=args.negative_edge_reward_scale,
                     nonpositive_penalty=args.nonpositive_edge_penalty,
-                    kle_heat_t=args.kle_heat_t,
+                    kle_heat_t=getattr(args, "kle_heat_t", 0.3),
+                    target_spec=make_target_spec("humaneval", tests=[test]),
                 )
                 selector_buffer.add_many(build_edge_selector_examples(
                     realized_graph,
                     task["prompt"],
                     edge_details,
                     args.selector_entropy_tau,
+                    args.selector_ig_tau,
                 ))
             realized_graph.clear_execution_history()
             utility = {

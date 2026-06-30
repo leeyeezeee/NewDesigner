@@ -169,12 +169,13 @@ def parse_args():
         default=4,
         help="Samples per agent used to estimate KHEAT uncertainty. Use at least 2.",
     )
-    parser.add_argument(
-        "--kle_heat_t",
-        type=float,
-        default=0.3,
-        help="Heat-kernel lengthscale for KHEAT uncertainty.",
-    )
+    # KLE temporarily disabled; keep this hyperparameter ready for future re-enable.
+    # parser.add_argument(
+    #     "--kle_heat_t",
+    #     type=float,
+    #     default=0.3,
+    #     help="Heat-kernel lengthscale for KHEAT uncertainty.",
+    # )
     parser.add_argument("--llm_name", type=str, default="gpt-4o")
     parser.add_argument(
         "--domain",
@@ -720,7 +721,7 @@ async def main():
         entropy_start = time.time()
         batch_rows = await asyncio.gather(
             *[
-                attach_semantic_entropy(inference_result, judge, heat_t=args.kle_heat_t)
+                attach_semantic_entropy(inference_result, judge)
                 for inference_result in inference_results
             ]
         )

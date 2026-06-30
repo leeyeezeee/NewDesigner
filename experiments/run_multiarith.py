@@ -39,8 +39,9 @@ def parse_args():
     parser.add_argument("--use_edge_selector", action="store_true",
                         help="Enable KHEAT uncertainty selector training and selector pruning during evaluation.")
     parser.add_argument("--num_entropy_samples", type=int, default=1)
-    parser.add_argument("--kle_heat_t", type=float, default=0.3,
-                        help="Heat-kernel lengthscale for KHEAT uncertainty.")
+    # KLE temporarily disabled; keep this hyperparameter ready for future re-enable.
+    # parser.add_argument("--kle_heat_t", type=float, default=0.3,
+    #                     help="Heat-kernel lengthscale for KHEAT uncertainty.")
     parser.add_argument("--semantic_judge_llm_name", type=str, default="gpt-4o-mini")
     parser.add_argument("--semantic_judge_api_key", type=str, default="")
     parser.add_argument("--semantic_judge_base_url", type=str, default="")
@@ -50,6 +51,7 @@ def parse_args():
     parser.add_argument("--nonpositive_edge_penalty", type=float, default=0.01)
     parser.add_argument("--selector_buffer_size", type=int, default=512)
     parser.add_argument("--selector_entropy_tau", type=float, default=0.2)
+    parser.add_argument("--selector_ig_tau", type=float, default=0.0)
     parser.add_argument("--refine_rank", type=int, default=4,
                         help="Rank used by the refined adjacency decoder.")
     parser.add_argument("--anchor_reg_weight", type=float, default=1.0,

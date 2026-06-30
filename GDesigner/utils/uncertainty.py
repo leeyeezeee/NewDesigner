@@ -15,6 +15,8 @@ from tenacity import (
     wait_random_exponential,
 )
 
+from GDesigner.utils.ig_scorer import FinalAnswerScorer, TargetSpec
+
 
 T = TypeVar("T")
 
@@ -384,18 +386,19 @@ async def semantic_uncertainty(
     valid_outputs = [str(output).strip() for output in outputs if str(output).strip()]
     if len(valid_outputs) <= 1:
         return 0.0, {
-            "kernel": "heat",
-            "kle_heat_t": float(heat_t),
+            "method": "semantic_entropy",
             "outputs": valid_outputs,
-            "weights": [[0.0]] if valid_outputs else [],
-            "laplacian_eigenvalues": [],
-            "kernel_eigenvalues": [1.0] if valid_outputs else [],
+            "labels": ["cluster_0"] if valid_outputs else [],
         }
 
-    weights = await judge.semantic_weight_matrix(question, valid_outputs)
-    entropy, details = heat_kernel_language_entropy(weights, heat_t=heat_t)
-    details["outputs"] = valid_outputs
-    return entropy, details
+    # KLE is retained above for later re-enable; for now use cluster semantic entropy.
+    labels = await judge.cluster_outputs(question, valid_outputs)
+    entropy = semantic_entropy(labels)
+    return entropy, {
+        "method": "semantic_entropy",
+        "outputs": valid_outputs,
+        "labels": labels,
+    }
 
 
 def edge_key(edge_info: Dict[str, Any]) -> str:
@@ -486,8 +489,10 @@ async def edge_entropy_rewards(
     negative_reward_scale: float = 1.0,
     nonpositive_penalty: float = 0.01,
     kle_heat_t: float = _DEFAULT_KLE_HEAT_T,
+    target_spec: Optional[TargetSpec] = None,
+    ig_scorer: Optional[FinalAnswerScorer] = None,
 ) -> Tuple[Dict[str, float], Dict[str, Dict[str, Any]]]:
-    """Measure each selected edge by removing it and comparing KHEAT uncertainty."""
+    """Measure each selected edge by removing it and comparing semantic uncertainty."""
     if not graph.edge_log_probs or num_entropy_samples <= 1:
         return {}, {}
 
@@ -498,6 +503,9 @@ async def edge_entropy_rewards(
 
     details: Dict[str, Dict[str, Any]] = {}
     after_cache: Dict[Tuple[str, int], Tuple[float, Dict[str, Any]]] = {}
+    after_outputs_cache: Dict[Tuple[str, int], List[Any]] = {}
+    after_score_cache: Dict[Tuple[str, int], Any] = {}
+    scorer = ig_scorer or (FinalAnswerScorer() if target_spec is not None else None)
 
     for edge_info in graph.edge_log_probs:
         target_id = edge_info["target"]
@@ -552,6 +560,7 @@ async def edge_entropy_rewards(
                 heat_t=kle_heat_t,
             )
             after_uncertainty, after_uncertainty_details = after_cache[after_cache_key]
+            after_outputs = after_outputs_cache.get(after_cache_key, [])
         else:
             after_outputs = history_item.get("entropy_samples", [])
             if not after_outputs:
@@ -563,16 +572,45 @@ async def edge_entropy_rewards(
             before_uncertainty, before_uncertainty_details = before_result
             after_uncertainty, after_uncertainty_details = after_result
             after_cache[after_cache_key] = (after_uncertainty, after_uncertainty_details)
+            after_outputs_cache[after_cache_key] = list(after_outputs)
             history_item["entropy_samples"] = []
 
         uncertainty_delta = before_uncertainty - after_uncertainty
+        ig_gain = None
+        before_answer_score = None
+        after_answer_score = None
+        if target_spec is not None and scorer is not None:
+            before_score_task = scorer.score_outputs(
+                graph.decision_node,
+                input_data,
+                before_uncertainty_details.get("outputs", before_outputs),
+                target_spec,
+                cluster_labels=before_uncertainty_details.get("labels"),
+            )
+            if after_cache_key in after_score_cache:
+                before_score = await before_score_task
+                after_score = after_score_cache[after_cache_key]
+            else:
+                before_score, after_score = await asyncio.gather(
+                    before_score_task,
+                    scorer.score_outputs(
+                        graph.decision_node,
+                        input_data,
+                        after_uncertainty_details.get("outputs", after_outputs),
+                        target_spec,
+                        cluster_labels=after_uncertainty_details.get("labels"),
+                    ),
+                )
+                after_score_cache[after_cache_key] = after_score
+            before_answer_score = before_score.score
+            after_answer_score = after_score.score
+            ig_gain = after_answer_score - before_answer_score
         details[key] = {
             "type": edge_type,
             "round": round_idx,
             "source": source_id,
             "target": target_id,
-            "uncertainty_method": "kle_heat",
-            "kle_heat_t": float(kle_heat_t),
+            "uncertainty_method": "semantic_entropy",
             "before_uncertainty": before_uncertainty,
             "after_uncertainty": after_uncertainty,
             "uncertainty_delta": uncertainty_delta,
@@ -585,6 +623,13 @@ async def edge_entropy_rewards(
             "before_uncertainty_details": before_uncertainty_details,
             "after_uncertainty_details": after_uncertainty_details,
         }
+        if ig_gain is not None:
+            details[key]["ig_gain"] = float(ig_gain)
+            details[key]["before_answer_score"] = float(before_answer_score)
+            details[key]["after_answer_score"] = float(after_answer_score)
+            details[key]["before_answer_details"] = before_score.details
+            details[key]["after_answer_details"] = after_score.details
+            details[key]["ig_mode"] = target_spec.mode
 
     rewards = _normalize_edge_rewards(
         details,
