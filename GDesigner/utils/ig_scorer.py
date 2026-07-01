@@ -1,3 +1,4 @@
+import ast
 import asyncio
 import math
 import re
@@ -39,9 +40,11 @@ def make_target_spec(
 ) -> TargetSpec:
     dataset_key = dataset.lower()
     if dataset_key == "mmlu":
-        return TargetSpec(dataset=dataset_key, mode="choice_logprob", correct=str(correct), choices=["A", "B", "C", "D"])
+        choices = ["A", "B", "C", "D"]
+        return TargetSpec(dataset=dataset_key, mode="yesno_logprob", correct=_require_choice_target(correct, choices), choices=choices)
     if dataset_key == "aqua":
-        return TargetSpec(dataset=dataset_key, mode="choice_logprob", correct=str(correct), choices=["A", "B", "C", "D", "E"])
+        choices = ["A", "B", "C", "D", "E"]
+        return TargetSpec(dataset=dataset_key, mode="yesno_logprob", correct=_require_choice_target(correct, choices), choices=choices)
     if dataset_key == "humaneval":
         return TargetSpec(dataset=dataset_key, mode="execution", tests=list(tests or []))
     return TargetSpec(dataset=dataset_key, mode="yesno_logprob", correct=str(correct), choices=["Yes", "No"])
@@ -65,12 +68,117 @@ def _normalize_label(label: str) -> str:
     return normalized[:1]
 
 
+def _choice_label_set(labels: Sequence[str]) -> set[str]:
+    return {_normalize_label(label) for label in labels}
+
+
+def _all_single_character_labels(labels: Sequence[str]) -> bool:
+    return all(len(_normalize_label(label)) == 1 for label in labels)
+
+
+def _standalone_label_from_text(text: Any, labels: Sequence[str]) -> Optional[str]:
+    normalized_labels = _choice_label_set(labels)
+    value = str(text).strip()
+    if not value:
+        return None
+
+    if _all_single_character_labels(labels):
+        matches = [
+            match.group(1).upper()
+            for match in re.finditer(
+                r"(?<![A-Za-z0-9])([A-Za-z0-9])(?:[\)\].,:;])?(?![A-Za-z0-9])",
+                value,
+            )
+            if match.group(1).upper() in normalized_labels
+        ]
+        unique_matches = sorted(set(matches))
+        return unique_matches[0] if len(unique_matches) == 1 else None
+
+    for label in labels:
+        normalized = _normalize_label(label)
+        if re.search(rf"(?<![A-Za-z0-9]){re.escape(str(label))}(?![A-Za-z0-9])", value, flags=re.IGNORECASE):
+            return normalized
+    return None
+
+
+def _require_choice_target(correct: Any, labels: Sequence[str]) -> str:
+    target = _standalone_label_from_text(correct, labels)
+    if target is None:
+        label_text = ", ".join(str(label) for label in labels)
+        raise ValueError(
+            f"Could not extract a unique correct option label from {correct!r}; "
+            f"expected one of: {label_text}."
+        )
+    return target
+
+
+def _completion_label_from_token(token: str, labels: Sequence[str]) -> Optional[str]:
+    normalized_labels = _choice_label_set(labels)
+    value = re.sub(r"^[^A-Za-z0-9]+", "", str(token).strip())
+    if not value:
+        return None
+
+    if _all_single_character_labels(labels):
+        match = re.match(r"^([A-Za-z0-9])(?:[\)\].,:;]|$)", value)
+        if match:
+            normalized = match.group(1).upper()
+            return normalized if normalized in normalized_labels else None
+        return None
+
+    for label in labels:
+        label_text = str(label).strip()
+        normalized = _normalize_label(label_text)
+        if re.match(rf"^{re.escape(label_text)}(?:[^A-Za-z0-9]|$)", value, flags=re.IGNORECASE):
+            return normalized if normalized in normalized_labels else None
+    return None
+
+
 def _extract_python_code(output: Any) -> str:
     text = str(output)
     fenced = re.search(r"```(?:python)?\s*(.*?)```", text, flags=re.DOTALL | re.IGNORECASE)
     if fenced:
         return fenced.group(1).strip()
     return text.strip()
+
+
+def _humaneval_entry_point(test_source: str) -> Optional[str]:
+    try:
+        tree = ast.parse(test_source)
+    except SyntaxError:
+        return None
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        if not isinstance(node.func, ast.Name) or node.func.id != "check":
+            continue
+        if node.args and isinstance(node.args[0], ast.Name):
+            return node.args[0].id
+    return None
+
+
+def _humaneval_assert_tests(test_source: str) -> List[str]:
+    try:
+        tree = ast.parse(test_source)
+    except SyntaxError:
+        return []
+
+    check_fn = next(
+        (
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "check"
+        ),
+        None,
+    )
+    if check_fn is None:
+        return []
+
+    return [
+        ast.unparse(statement)
+        for statement in check_fn.body
+        if isinstance(statement, ast.Assert)
+    ]
 
 
 def _completion_token_logprob(logprob_item: Any) -> tuple[str, float]:
@@ -246,8 +354,34 @@ class FinalAnswerScorer:
         if not tests:
             raise ValueError("HumanEval IG scoring requires execution tests.")
         code = _extract_python_code(output)
+        if target_spec.dataset == "humaneval":
+            return self._humaneval_execution_score(code, tests)
         is_solved, _, _ = PyExecutor().execute(code, tests, timeout=100, verbose=False)
         return 1.0 if is_solved else 0.0
+
+    def _humaneval_execution_score(self, code: str, tests: Sequence[str]) -> float:
+        from GDesigner.tools.coding.python_executor import PyExecutor
+
+        per_assert_tests: List[str] = []
+        for test_source in tests:
+            entry_point = _humaneval_entry_point(test_source)
+            assert_tests = _humaneval_assert_tests(test_source)
+            if entry_point is None:
+                raise ValueError("HumanEval IG scoring could not parse the test entry point.")
+            if not assert_tests:
+                raise ValueError("HumanEval IG scoring requires at least one assert test.")
+            per_assert_tests.extend([
+                f"candidate = {entry_point}\n{assert_test}"
+                for assert_test in assert_tests
+            ])
+
+        if not per_assert_tests:
+            raise ValueError("HumanEval IG scoring requires at least one assert test.")
+
+        _, _, states = PyExecutor().execute(code, per_assert_tests, timeout=100, verbose=False)
+        if len(states) != len(per_assert_tests):
+            raise RuntimeError("HumanEval IG scoring received an incomplete assertion result set.")
+        return sum(1.0 for state in states if state) / len(per_assert_tests)
 
     async def _logprob_score(
         self,
@@ -263,7 +397,7 @@ class FinalAnswerScorer:
         elif target_spec.mode == "yesno_logprob":
             labels = ["Yes", "No"]
             target = "Yes"
-            messages = self._verifier_messages(decision_node, input_data, output, target_spec.correct)
+            messages = self._verifier_messages(decision_node, input_data, output, target_spec)
         else:
             return 0.0
         return await self._conditional_label_logprob(decision_node.llm, messages, labels, target)
@@ -285,7 +419,8 @@ class FinalAnswerScorer:
         label_text = ", ".join(str(label) for label in labels)
         user_prompt = (
             f"{user_prompt}\n\n"
-            f"Answer with exactly one option label from: {label_text}."
+            f"Answer with exactly one option label from: {label_text}.\n"
+            "Your entire reply must be exactly one label token and nothing else."
         )
         return [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]
 
@@ -294,7 +429,7 @@ class FinalAnswerScorer:
         decision_node,
         input_data: Dict[str, Any],
         output: Any,
-        correct_answer: str,
+        target_spec: TargetSpec,
     ) -> List[Dict[str, str]]:
         role = decision_node.prompt_set.get_decision_role()
         task = input_data.get("task", str(input_data))
@@ -302,10 +437,22 @@ class FinalAnswerScorer:
             f"{role}\n"
             "You are a strict answer verifier. Reply with exactly one token: Yes or No."
         )
+        if target_spec.choices:
+            label_text = ", ".join(str(label) for label in target_spec.choices)
+            user_prompt = (
+                f"Task:\n{task}\n\n"
+                f"Candidate response:\n{output}\n\n"
+                f"Valid option labels:\n{label_text}\n\n"
+                f"Reference correct option label:\n{target_spec.correct}\n\n"
+                "Does the candidate response choose or clearly imply the reference correct option label? "
+                "Reply with Yes or No only."
+            )
+            return [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]
+
         user_prompt = (
             f"Task:\n{task}\n\n"
             f"Candidate response:\n{output}\n\n"
-            f"Reference final answer:\n{correct_answer}\n\n"
+            f"Reference final answer:\n{target_spec.correct}\n\n"
             "Does the candidate response imply the same final answer as the reference? "
             "Reply with Yes or No only."
         )
@@ -351,10 +498,15 @@ class FinalAnswerScorer:
         label_logprobs = {_normalize_label(label): _LOGPROB_FLOOR for label in labels}
         for logprob_item in _top_logprobs_from_response(response):
             token, logprob = _completion_token_logprob(logprob_item)
-            normalized = _normalize_label(token)
+            normalized = _completion_label_from_token(token, labels)
             if normalized in label_logprobs:
                 label_logprobs[normalized] = max(label_logprobs[normalized], logprob)
 
         normalized_target = _normalize_label(target)
+        if normalized_target not in label_logprobs:
+            label_text = ", ".join(str(label) for label in labels)
+            raise ValueError(
+                f"Target label {target!r} is not one of the scoring labels: {label_text}."
+            )
         target_logprob = label_logprobs.get(normalized_target, _LOGPROB_FLOOR)
         return target_logprob - _logsumexp(list(label_logprobs.values()))
