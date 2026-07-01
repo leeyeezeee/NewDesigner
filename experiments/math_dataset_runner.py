@@ -197,7 +197,6 @@ async def run_math_dataset(
                     realized_graph,
                     record["task"],
                     edge_details,
-                    getattr(args, "selector_entropy_tau", 0.0),
                     getattr(args, "selector_ig_tau", 0.0),
                 ))
             realized_graph.clear_execution_history()

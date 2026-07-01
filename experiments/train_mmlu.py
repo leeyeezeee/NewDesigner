@@ -42,7 +42,6 @@ async def train(graph:Graph,
             negative_edge_reward_scale: float = 1.0,
             nonpositive_edge_penalty: float = 0.01,
             selector_buffer_size: int = 512,
-            selector_entropy_tau: float = 0.2,
             selector_ig_tau: float = 0.0,
             anchor_reg_weight: float = 1.0,
             sparsity_reg_weight: float = 1.0,
@@ -144,7 +143,6 @@ async def train(graph:Graph,
                     realized_graph,
                     input_dict["task"],
                     edge_details,
-                    selector_entropy_tau,
                     selector_ig_tau,
                 ))
             realized_graph.clear_execution_history()
@@ -157,7 +155,7 @@ async def train(graph:Graph,
             loss_list.append(single_loss)
             print(f"correct answer:{correct_answer}")
             print(f"edge entropy rewards:{edge_rewards}")
-    
+
         utility_loss = torch.mean(torch.stack(loss_list))
         reg_loss, anchor_loss, sparse_loss = refinement_regularization_loss(
             realized_graphs,

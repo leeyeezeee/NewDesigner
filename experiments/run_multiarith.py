@@ -50,7 +50,6 @@ def parse_args():
     parser.add_argument("--negative_edge_reward_scale", type=float, default=1.0)
     parser.add_argument("--nonpositive_edge_penalty", type=float, default=0.01)
     parser.add_argument("--selector_buffer_size", type=int, default=512)
-    parser.add_argument("--selector_entropy_tau", type=float, default=0.2)
     parser.add_argument("--selector_ig_tau", type=float, default=0.0)
     parser.add_argument("--refine_rank", type=int, default=4,
                         help="Rank used by the refined adjacency decoder.")

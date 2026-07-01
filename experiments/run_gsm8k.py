@@ -76,8 +76,6 @@ def parse_args():
                         help="Deprecated compatibility option; normalized edge rewards do not add a zero-gain penalty.")
     parser.add_argument('--selector_buffer_size', type=int, default=512,
                         help="Replay buffer capacity for selector edge samples.")
-    parser.add_argument('--selector_entropy_tau', type=float, default=0.2,
-                        help="Entropy delta threshold for positive selector labels.")
     parser.add_argument('--selector_ig_tau', type=float, default=0.0,
                         help="IG gain threshold for positive selector labels.")
     parser.add_argument('--refine_rank', type=int, default=4,
@@ -228,7 +226,6 @@ async def main():
                     realized_graph,
                     task["task"],
                     edge_details,
-                    args.selector_entropy_tau,
                     args.selector_ig_tau,
                 ))
             realized_graph.clear_execution_history()

@@ -63,8 +63,6 @@ def parse_args():
                         help="Deprecated compatibility option; normalized edge rewards do not add a zero-gain penalty.")
     parser.add_argument('--selector_buffer_size', type=int, default=512,
                         help="Replay buffer capacity for selector edge samples.")
-    parser.add_argument('--selector_entropy_tau', type=float, default=0.2,
-                        help="Entropy delta threshold for positive selector labels.")
     parser.add_argument('--selector_ig_tau', type=float, default=0.0,
                         help="IG gain threshold for positive selector labels.")
     parser.add_argument('--refine_rank', type=int, default=4,
@@ -126,7 +124,6 @@ async def main():
                     negative_edge_reward_scale=args.negative_edge_reward_scale,
                     nonpositive_edge_penalty=args.nonpositive_edge_penalty,
                     selector_buffer_size=args.selector_buffer_size,
-                    selector_entropy_tau=args.selector_entropy_tau,
                     selector_ig_tau=args.selector_ig_tau,
                     anchor_reg_weight=args.anchor_reg_weight,
                     sparsity_reg_weight=args.sparsity_reg_weight)
