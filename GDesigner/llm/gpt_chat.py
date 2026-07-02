@@ -14,6 +14,7 @@ from GDesigner.llm.llm_registry import LLMRegistry
 
 OPENAI_API_KEYS = ['']
 BASE_URL = ''
+_OPENAI_COMPATIBLE_TIMEOUT_SECONDS = 1200.0
 
 load_dotenv()
 
@@ -89,8 +90,11 @@ def _message_dicts(messages: List[Message]) -> List[Dict[str, Any]]:
     ]
 
 
-def _openai_client_kwargs(base_url: str) -> Dict[str, str]:
-    client_kwargs = {"api_key": _agent_api_key(base_url)}
+def _openai_client_kwargs(base_url: str) -> Dict[str, Any]:
+    client_kwargs = {
+        "api_key": _agent_api_key(base_url),
+        "timeout": _OPENAI_COMPATIBLE_TIMEOUT_SECONDS,
+    }
     if base_url:
         client_kwargs["base_url"] = base_url
     return client_kwargs

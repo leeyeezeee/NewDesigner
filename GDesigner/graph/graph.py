@@ -14,6 +14,10 @@ from GDesigner.llm.profile_embedding import get_sentence_embedding
 from GDesigner.gnn.gcn import GCN,MLP
 from torch_geometric.utils import dense_to_sparse
 
+_DECISION_NODE_MAX_TRIES = 5
+_DECISION_NODE_TIMEOUT_SECONDS = 1200
+
+
 class Graph(ABC):
     """
     A framework for managing and executing a network of nodes using a language model.
@@ -527,7 +531,14 @@ class Graph(ABC):
             self.update_memory()
             
         self.connect_decision_node()
-        self.decision_node.execute(inputs)
+        tries = 0
+        while tries < _DECISION_NODE_MAX_TRIES:
+            try:
+                self.decision_node.execute(inputs)
+                break
+            except Exception as e:
+                print(f"Error during execution of decision node: {e}")
+                tries += 1
         final_answers = self.decision_node.outputs
         if len(final_answers) == 0:
             final_answers.append("No answer of the decision node")
@@ -585,7 +596,17 @@ class Graph(ABC):
             self.update_memory()
             
         self.connect_decision_node()
-        await self.decision_node.async_execute(input)
+        tries = 0
+        while tries < _DECISION_NODE_MAX_TRIES:
+            try:
+                await asyncio.wait_for(
+                    self.decision_node.async_execute(input),
+                    timeout=_DECISION_NODE_TIMEOUT_SECONDS,
+                )
+                break
+            except Exception as e:
+                print(f"Error during execution of decision node: {e}")
+                tries += 1
         final_answers = self.decision_node.outputs
         if len(final_answers) == 0:
             final_answers.append("No answer of the decision node")
