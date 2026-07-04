@@ -9,6 +9,7 @@ sys.stdout.reconfigure(encoding="utf-8")
 from datasets.gsm8k_dataset import gsm_get_predict, multiarith_data_process
 from GDesigner.tools.reader.readers import JSONReader
 from GDesigner.utils.const import GDesigner_ROOT
+from experiments.teacher_forcing_reward import add_teacher_forcing_reward_args
 from math_dataset_runner import numeric_correct, run_math_dataset
 
 
@@ -38,7 +39,7 @@ def parse_args():
     parser.add_argument("--metrics_file", type=str, default="result/multiarith.jsonl")
     parser.add_argument("--use_edge_selector", action="store_true",
                         help="Enable KHEAT uncertainty selector training and selector pruning during evaluation.")
-    parser.add_argument("--num_entropy_samples", type=int, default=1)
+    parser.add_argument("--num_entropy_samples", type=int, default=5)
     # KLE temporarily disabled; keep this hyperparameter ready for future re-enable.
     # parser.add_argument("--kle_heat_t", type=float, default=0.3,
     #                     help="Heat-kernel lengthscale for KHEAT uncertainty.")
@@ -57,6 +58,7 @@ def parse_args():
                         help="Weight for G-Designer refined adjacency anchor regularization.")
     parser.add_argument("--sparsity_reg_weight", type=float, default=1.0,
                         help="Weight for G-Designer refined adjacency nuclear-norm sparsity regularization.")
+    add_teacher_forcing_reward_args(parser)
     parser.add_argument("--optimized_spatial", action="store_true")
     parser.add_argument("--optimized_temporal", action="store_true")
     args = parser.parse_args()

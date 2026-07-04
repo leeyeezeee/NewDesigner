@@ -27,9 +27,14 @@ from GDesigner.utils.uncertainty import (
     SemanticEntailmentJudge,
     edge_entropy_rewards,
 )
-from GDesigner.utils.ig_scorer import make_target_spec
+from GDesigner.utils.ig_scorer import FinalAnswerScorer, make_target_spec
 from datasets.gsm8k_dataset import gsm_data_process,gsm_get_predict
 from experiments.refinement_loss import refinement_regularization_loss
+from experiments.teacher_forcing_reward import (
+    add_teacher_forcing_reward_args,
+    graph_teacher_forcing_score,
+    teacher_forcing_edge_loss,
+)
 
 def dataloader(data_list, batch_size, i_batch):
     return data_list[i_batch*batch_size:i_batch*batch_size + batch_size]
@@ -55,7 +60,7 @@ def parse_args():
                         help="Prune temporal edges every few iterations when --optimized_temporal is set.")
     parser.add_argument('--use_edge_selector', action='store_true',
                         help="Enable KHEAT uncertainty selector training and selector pruning during evaluation.")
-    parser.add_argument('--num_entropy_samples', type=int, default=1,
+    parser.add_argument('--num_entropy_samples', type=int, default=5,
                         help="Samples per agent before and after communication for KHEAT. Automatically raised to 2 when --use_edge_selector is set.")
     # KLE temporarily disabled; keep this hyperparameter ready for future re-enable.
     # parser.add_argument('--kle_heat_t', type=float, default=0.3,
@@ -84,6 +89,7 @@ def parse_args():
                         help="Weight for G-Designer refined adjacency anchor regularization.")
     parser.add_argument('--sparsity_reg_weight', type=float, default=1.0,
                         help="Weight for G-Designer refined adjacency nuclear-norm sparsity regularization.")
+    add_teacher_forcing_reward_args(parser)
     parser.add_argument('--num_iterations', type=int, default=10,help="The num of training iterations.")
     parser.add_argument('--domain', type=str, default="gsm8k",help="Domain (the same as dataset name), default 'gsm8k'")
     parser.add_argument('--agent_names', nargs='+', type=str, default=['MathSolver'],
@@ -128,9 +134,18 @@ async def main():
     if graph.optimized_temporal:
         optimizer_params.append(graph.temporal_logits)
     optimizer = torch.optim.Adam(optimizer_params, lr=args.lr)
-    effective_num_entropy_samples = max(2, int(args.num_entropy_samples)) if args.use_edge_selector else max(1, int(args.num_entropy_samples))
+    use_graph_tf_reward = bool(getattr(args, "use_graph_tf_reward", False))
+    effective_num_entropy_samples = (
+        max(2, int(args.num_entropy_samples))
+        if (args.use_edge_selector or use_graph_tf_reward)
+        else max(1, int(args.num_entropy_samples))
+    )
     optimize_enabled = args.optimized_spatial or args.optimized_temporal
-    use_semantic_edges_for_analysis = optimize_enabled and args.use_edge_selector and effective_num_entropy_samples > 1
+    use_semantic_edges_for_analysis = (
+        optimize_enabled
+        and (args.use_edge_selector or use_graph_tf_reward)
+        and effective_num_entropy_samples > 1
+    )
     semantic_judge = None
     if use_semantic_edges_for_analysis:
         semantic_judge = SemanticEntailmentJudge(
@@ -144,10 +159,11 @@ async def main():
     selector_buffer = None
     selector_optimizer = None
     selector_trained = False
-    if use_semantic_edges_for_analysis:
+    if args.use_edge_selector and use_semantic_edges_for_analysis:
         edge_selector = EdgeSelector(graph.features.size(1))
         selector_buffer = SelectorReplayBuffer(args.selector_buffer_size)
         selector_optimizer = torch.optim.Adam(edge_selector.parameters(), lr=1e-3)
+    tf_scorer = FinalAnswerScorer() if use_graph_tf_reward else None
 
     num_batches = int(len(dataset)/args.batch_size)
     total_solved, total_executed = (0, 0)
@@ -165,79 +181,163 @@ async def main():
         answers = []
         realized_graphs = []
         input_dicts = []
-        
+        record_input_dicts = []
+        sample_groups = []
+
         current_batch = dataloader(dataset,args.batch_size,i_batch)
         if current_batch is None:
             print("No more data available.")
             break
-        
+
         for i_record, record in enumerate(current_batch):
-            realized_graph = copy.deepcopy(graph)
-            realized_graph.gcn = graph.gcn
-            realized_graph.mlp = graph.mlp
-            realized_graph.refinement_weight = graph.refinement_weight
-            realized_graph.temporal_logits = graph.temporal_logits
-            realized_graphs.append(realized_graph)
             task = record["task"]
-            step = record["step"]
             answer = record["answer"]
             answers.append(answer)
             input_dict = {"task": task}
-            input_dicts.append(input_dict)
-            answer_log_probs.append(asyncio.create_task(
-                realized_graph.arun(
-                    input_dict,
-                    args.num_rounds,
-                    num_entropy_samples=batch_entropy_samples,
-                    record_execution_history=use_semantic_edges,
-                    track_grad=train_updates_enabled,
-                    edge_selector=batch_edge_selector,
-                )
-            ))
+            record_input_dicts.append(input_dict)
+            group_indices = []
+            sample_count = (
+                max(1, int(args.graph_sample_count))
+                if (use_graph_tf_reward and train_updates_enabled)
+                else 1
+            )
+            for _ in range(sample_count):
+                realized_graph = copy.deepcopy(graph)
+                realized_graph.gcn = graph.gcn
+                realized_graph.mlp = graph.mlp
+                realized_graph.refinement_weight = graph.refinement_weight
+                realized_graph.temporal_logits = graph.temporal_logits
+                group_indices.append(len(realized_graphs))
+                realized_graphs.append(realized_graph)
+                input_dicts.append(input_dict)
+                answer_log_probs.append(asyncio.create_task(
+                    realized_graph.arun(
+                        input_dict,
+                        args.num_rounds,
+                        num_entropy_samples=batch_entropy_samples,
+                        record_execution_history=use_semantic_edges,
+                        track_grad=train_updates_enabled,
+                        edge_selector=batch_edge_selector,
+                    )
+                ))
+            sample_groups.append(group_indices)
         raw_results = await asyncio.gather(*answer_log_probs)
         raw_answers, log_probs = zip(*raw_results)
         loss_list: List[torch.Tensor] = []
         utilities: List[dict] = []
 
-        for task, answer, log_prob, true_answer, realized_graph, input_dict in zip(current_batch, raw_answers, log_probs, answers, realized_graphs, input_dicts):
-            predict_answer = gsm_get_predict(answer[0])
-            is_solved = float(predict_answer)==float(true_answer)
-            total_solved = total_solved + is_solved
-            total_executed = total_executed + 1
-            accuracy = total_solved/ total_executed
-            if not train_updates_enabled:
-                total_edges += sum(realized_graph.realized_edge_counts)
-                edge_samples += 1
-            edge_rewards = {}
-            edge_details = {}
-            if is_solved and use_semantic_edges:
-                edge_rewards, edge_details = await edge_entropy_rewards(
-                    realized_graph,
-                    task["task"],
-                    input_dict,
-                    semantic_judge,
-                    effective_num_entropy_samples,
-                    negative_reward_scale=args.negative_edge_reward_scale,
-                    nonpositive_penalty=args.nonpositive_edge_penalty,
-                    kle_heat_t=getattr(args, "kle_heat_t", 0.3),
-                    target_spec=make_target_spec("gsm8k", true_answer),
-                )
-                selector_buffer.add_many(build_edge_selector_examples(
-                    realized_graph,
-                    task["task"],
-                    edge_details,
-                    args.selector_ig_tau,
-                ))
-            realized_graph.clear_execution_history()
-            utility = {
-                "correctness": is_solved,
-                "edge_entropy_rewards": edge_rewards,
-            }
-            utilities.append(utility)
-            single_loss = -log_prob * is_solved
-            loss_list.append(single_loss)
+        if use_graph_tf_reward and train_updates_enabled:
+            graph_groups = []
+            score_groups = []
+            edge_detail_groups = []
+            for record, true_answer, group_indices, input_dict in zip(
+                current_batch,
+                answers,
+                sample_groups,
+                record_input_dicts,
+            ):
+                target_spec = make_target_spec("gsm8k", true_answer)
+                graph_group = []
+                score_group = []
+                edge_detail_group = []
+                for sample_pos, graph_idx in enumerate(group_indices):
+                    realized_graph = realized_graphs[graph_idx]
+                    raw_answer = raw_answers[graph_idx]
+                    graph_score = await graph_teacher_forcing_score(
+                        tf_scorer,
+                        realized_graph,
+                        input_dict,
+                        raw_answer,
+                        target_spec,
+                    )
+                    edge_rewards, edge_details = await edge_entropy_rewards(
+                        realized_graph,
+                        record["task"],
+                        input_dict,
+                        semantic_judge,
+                        effective_num_entropy_samples,
+                        negative_reward_scale=args.negative_edge_reward_scale,
+                        nonpositive_penalty=args.nonpositive_edge_penalty,
+                        kle_heat_t=getattr(args, "kle_heat_t", 0.3),
+                        target_spec=target_spec,
+                        ig_scorer=tf_scorer,
+                    )
+                    if selector_buffer is not None:
+                        selector_buffer.add_many(build_edge_selector_examples(
+                            realized_graph,
+                            record["task"],
+                            edge_details,
+                            args.selector_ig_tau,
+                        ))
+                    if sample_pos == 0:
+                        predict_answer = gsm_get_predict(raw_answer[0])
+                        is_solved = float(predict_answer) == float(true_answer)
+                        total_solved = total_solved + is_solved
+                        total_executed = total_executed + 1
+                        accuracy = total_solved / total_executed
+                        utilities.append({
+                            "correctness": is_solved,
+                            "graph_tf_score": graph_score.score,
+                            "edge_entropy_rewards": edge_rewards,
+                        })
+                    graph_group.append(realized_graph)
+                    score_group.append(graph_score.score)
+                    edge_detail_group.append(edge_details)
+                    realized_graph.clear_execution_history()
+                graph_groups.append(graph_group)
+                score_groups.append(score_group)
+                edge_detail_groups.append(edge_detail_group)
+            reference_loss = torch.mean(torch.stack(list(log_probs)))
+            utility_loss, tf_summaries = teacher_forcing_edge_loss(
+                graph_groups,
+                score_groups,
+                edge_detail_groups,
+                reference_loss,
+                graph_softmax_temperature=args.graph_softmax_temperature,
+                edge_tanh_temperature=args.edge_tanh_temperature,
+            )
+            print("teacher forcing graph summaries:", tf_summaries)
+        else:
+            for task, answer, log_prob, true_answer, realized_graph, input_dict in zip(current_batch, raw_answers, log_probs, answers, realized_graphs, input_dicts):
+                predict_answer = gsm_get_predict(answer[0])
+                is_solved = float(predict_answer)==float(true_answer)
+                total_solved = total_solved + is_solved
+                total_executed = total_executed + 1
+                accuracy = total_solved/ total_executed
+                if not train_updates_enabled:
+                    total_edges += sum(realized_graph.realized_edge_counts)
+                    edge_samples += 1
+                edge_rewards = {}
+                edge_details = {}
+                if is_solved and use_semantic_edges:
+                    edge_rewards, edge_details = await edge_entropy_rewards(
+                        realized_graph,
+                        task["task"],
+                        input_dict,
+                        semantic_judge,
+                        effective_num_entropy_samples,
+                        negative_reward_scale=args.negative_edge_reward_scale,
+                        nonpositive_penalty=args.nonpositive_edge_penalty,
+                        kle_heat_t=getattr(args, "kle_heat_t", 0.3),
+                        target_spec=make_target_spec("gsm8k", true_answer),
+                    )
+                    if selector_buffer is not None:
+                        selector_buffer.add_many(build_edge_selector_examples(
+                            realized_graph,
+                            task["task"],
+                            edge_details,
+                            args.selector_ig_tau,
+                        ))
+                realized_graph.clear_execution_history()
+                utility = {
+                    "correctness": is_solved,
+                    "edge_entropy_rewards": edge_rewards,
+                }
+                utilities.append(utility)
+                single_loss = -log_prob * is_solved
+                loss_list.append(single_loss)
 
-        utility_loss = torch.mean(torch.stack(loss_list))
+            utility_loss = torch.mean(torch.stack(loss_list))
         reg_loss, anchor_loss, sparse_loss = refinement_regularization_loss(
             realized_graphs,
             utility_loss,

@@ -20,8 +20,12 @@ from GDesigner.utils.uncertainty import (
     SemanticEntailmentJudge,
     edge_entropy_rewards,
 )
-from GDesigner.utils.ig_scorer import make_target_spec
+from GDesigner.utils.ig_scorer import FinalAnswerScorer, make_target_spec
 from experiments.refinement_loss import refinement_regularization_loss
+from experiments.teacher_forcing_reward import (
+    graph_teacher_forcing_score,
+    teacher_forcing_edge_loss,
+)
 
 
 AnswerParser = Callable[[str], str]
@@ -78,15 +82,16 @@ async def run_math_dataset(
         optimizer_params.append(graph.temporal_logits)
     optimizer = torch.optim.Adam(optimizer_params, lr=args.lr)
 
+    use_graph_tf_reward = bool(getattr(args, "use_graph_tf_reward", False))
     effective_num_entropy_samples = (
         max(2, int(args.num_entropy_samples))
-        if args.use_edge_selector
+        if (args.use_edge_selector or use_graph_tf_reward)
         else max(1, int(args.num_entropy_samples))
     )
     optimize_enabled = args.optimized_spatial or args.optimized_temporal
     use_semantic_edges_for_analysis = (
         optimize_enabled
-        and args.use_edge_selector
+        and (args.use_edge_selector or use_graph_tf_reward)
         and effective_num_entropy_samples > 1
     )
     semantic_judge = None
@@ -102,10 +107,11 @@ async def run_math_dataset(
     selector_buffer = None
     selector_optimizer = None
     selector_trained = False
-    if use_semantic_edges_for_analysis:
+    if args.use_edge_selector and use_semantic_edges_for_analysis:
         edge_selector = EdgeSelector(graph.features.size(1))
         selector_buffer = SelectorReplayBuffer(getattr(args, "selector_buffer_size", 512))
         selector_optimizer = torch.optim.Adam(edge_selector.parameters(), lr=1e-3)
+    tf_scorer = FinalAnswerScorer() if use_graph_tf_reward else None
 
     num_batches = int(len(dataset) / args.batch_size)
     total_solved, total_executed = (0, 0)
@@ -123,6 +129,8 @@ async def run_math_dataset(
         answers = []
         realized_graphs = []
         input_dicts = []
+        record_input_dicts = []
+        sample_groups = []
 
         current_batch = dataloader(dataset, args.batch_size, i_batch)
         if current_batch is None:
@@ -130,85 +138,169 @@ async def run_math_dataset(
             break
 
         for record in current_batch:
-            realized_graph = copy.deepcopy(graph)
-            realized_graph.gcn = graph.gcn
-            realized_graph.mlp = graph.mlp
-            realized_graph.refinement_weight = graph.refinement_weight
-            realized_graph.temporal_logits = graph.temporal_logits
-            realized_graphs.append(realized_graph)
             task = record["task"]
             answers.append(record["answer"])
             input_dict = {"task": task}
-            input_dicts.append(input_dict)
-            answer_log_probs.append(
-                asyncio.create_task(
-                    realized_graph.arun(
-                        input_dict,
-                        args.num_rounds,
-                        num_entropy_samples=batch_entropy_samples,
-                        record_execution_history=use_semantic_edges,
-                        track_grad=train_updates_enabled,
-                        edge_selector=batch_edge_selector,
+            record_input_dicts.append(input_dict)
+            group_indices = []
+            sample_count = (
+                max(1, int(getattr(args, "graph_sample_count", 5)))
+                if (use_graph_tf_reward and train_updates_enabled)
+                else 1
+            )
+            for _ in range(sample_count):
+                realized_graph = copy.deepcopy(graph)
+                realized_graph.gcn = graph.gcn
+                realized_graph.mlp = graph.mlp
+                realized_graph.refinement_weight = graph.refinement_weight
+                realized_graph.temporal_logits = graph.temporal_logits
+                group_indices.append(len(realized_graphs))
+                realized_graphs.append(realized_graph)
+                input_dicts.append(input_dict)
+                answer_log_probs.append(
+                    asyncio.create_task(
+                        realized_graph.arun(
+                            input_dict,
+                            args.num_rounds,
+                            num_entropy_samples=batch_entropy_samples,
+                            record_execution_history=use_semantic_edges,
+                            track_grad=train_updates_enabled,
+                            edge_selector=batch_edge_selector,
+                        )
                     )
                 )
-            )
+            sample_groups.append(group_indices)
 
         raw_results = await asyncio.gather(*answer_log_probs)
         raw_answers, log_probs = zip(*raw_results)
         loss_list: List[torch.Tensor] = []
         utilities: List[dict] = []
 
-        for record, answer, log_prob, true_answer, realized_graph, input_dict in zip(
-            current_batch,
-            raw_answers,
-            log_probs,
-            answers,
-            realized_graphs,
-            input_dicts,
-        ):
-            predict_answer = answer_parser(answer[0])
-            is_solved = correctness_fn(predict_answer, true_answer)
-            correctness_reward = float(is_solved)
-            total_solved += int(is_solved)
-            total_executed += 1
-            accuracy = total_solved / total_executed
-            if not train_updates_enabled:
-                total_edges += sum(realized_graph.realized_edge_counts)
-                edge_samples += 1
-
-            edge_rewards = {}
-            edge_details = {}
-            if (
-                is_solved
-                and use_semantic_edges
+        if use_graph_tf_reward and train_updates_enabled:
+            graph_groups = []
+            score_groups = []
+            edge_detail_groups = []
+            for record, true_answer, group_indices, input_dict in zip(
+                current_batch,
+                answers,
+                sample_groups,
+                record_input_dicts,
             ):
-                edge_rewards, edge_details = await edge_entropy_rewards(
-                    realized_graph,
-                    record["task"],
-                    input_dict,
-                    semantic_judge,
-                    effective_num_entropy_samples,
-                    negative_reward_scale=args.negative_edge_reward_scale,
-                    nonpositive_penalty=args.nonpositive_edge_penalty,
-                    kle_heat_t=getattr(args, "kle_heat_t", 0.3),
-                    target_spec=make_target_spec(dataset_name, true_answer),
-                )
-                selector_buffer.add_many(build_edge_selector_examples(
-                    realized_graph,
-                    record["task"],
-                    edge_details,
-                    getattr(args, "selector_ig_tau", 0.0),
-                ))
-            realized_graph.clear_execution_history()
-            utility = {
-                "correctness": correctness_reward,
-                "edge_entropy_rewards": edge_rewards,
-            }
-            utilities.append(utility)
-            single_loss = -log_prob * correctness_reward
-            loss_list.append(single_loss)
+                target_spec = make_target_spec(dataset_name, true_answer)
+                graph_group = []
+                score_group = []
+                edge_detail_group = []
+                for sample_pos, graph_idx in enumerate(group_indices):
+                    realized_graph = realized_graphs[graph_idx]
+                    answer = raw_answers[graph_idx]
+                    graph_score = await graph_teacher_forcing_score(
+                        tf_scorer,
+                        realized_graph,
+                        input_dict,
+                        answer,
+                        target_spec,
+                    )
+                    edge_rewards, edge_details = await edge_entropy_rewards(
+                        realized_graph,
+                        record["task"],
+                        input_dict,
+                        semantic_judge,
+                        effective_num_entropy_samples,
+                        negative_reward_scale=args.negative_edge_reward_scale,
+                        nonpositive_penalty=args.nonpositive_edge_penalty,
+                        kle_heat_t=getattr(args, "kle_heat_t", 0.3),
+                        target_spec=target_spec,
+                        ig_scorer=tf_scorer,
+                    )
+                    if selector_buffer is not None:
+                        selector_buffer.add_many(build_edge_selector_examples(
+                            realized_graph,
+                            record["task"],
+                            edge_details,
+                            getattr(args, "selector_ig_tau", 0.0),
+                        ))
+                    if sample_pos == 0:
+                        predict_answer = answer_parser(answer[0])
+                        is_solved = correctness_fn(predict_answer, true_answer)
+                        correctness_reward = float(is_solved)
+                        total_solved += int(is_solved)
+                        total_executed += 1
+                        accuracy = total_solved / total_executed
+                        utilities.append({
+                            "correctness": correctness_reward,
+                            "graph_tf_score": graph_score.score,
+                            "edge_entropy_rewards": edge_rewards,
+                        })
+                    graph_group.append(realized_graph)
+                    score_group.append(graph_score.score)
+                    edge_detail_group.append(edge_details)
+                    realized_graph.clear_execution_history()
+                graph_groups.append(graph_group)
+                score_groups.append(score_group)
+                edge_detail_groups.append(edge_detail_group)
+            reference_loss = torch.mean(torch.stack(list(log_probs)))
+            utility_loss, tf_summaries = teacher_forcing_edge_loss(
+                graph_groups,
+                score_groups,
+                edge_detail_groups,
+                reference_loss,
+                graph_softmax_temperature=getattr(args, "graph_softmax_temperature", 1.0),
+                edge_tanh_temperature=getattr(args, "edge_tanh_temperature", 1.0),
+            )
+            print("teacher forcing graph summaries:", tf_summaries)
+        else:
+            for record, answer, log_prob, true_answer, realized_graph, input_dict in zip(
+                current_batch,
+                raw_answers,
+                log_probs,
+                answers,
+                realized_graphs,
+                input_dicts,
+            ):
+                predict_answer = answer_parser(answer[0])
+                is_solved = correctness_fn(predict_answer, true_answer)
+                correctness_reward = float(is_solved)
+                total_solved += int(is_solved)
+                total_executed += 1
+                accuracy = total_solved / total_executed
+                if not train_updates_enabled:
+                    total_edges += sum(realized_graph.realized_edge_counts)
+                    edge_samples += 1
 
-        utility_loss = torch.mean(torch.stack(loss_list))
+                edge_rewards = {}
+                edge_details = {}
+                if (
+                    is_solved
+                    and use_semantic_edges
+                ):
+                    edge_rewards, edge_details = await edge_entropy_rewards(
+                        realized_graph,
+                        record["task"],
+                        input_dict,
+                        semantic_judge,
+                        effective_num_entropy_samples,
+                        negative_reward_scale=args.negative_edge_reward_scale,
+                        nonpositive_penalty=args.nonpositive_edge_penalty,
+                        kle_heat_t=getattr(args, "kle_heat_t", 0.3),
+                        target_spec=make_target_spec(dataset_name, true_answer),
+                    )
+                    if selector_buffer is not None:
+                        selector_buffer.add_many(build_edge_selector_examples(
+                            realized_graph,
+                            record["task"],
+                            edge_details,
+                            getattr(args, "selector_ig_tau", 0.0),
+                        ))
+                realized_graph.clear_execution_history()
+                utility = {
+                    "correctness": correctness_reward,
+                    "edge_entropy_rewards": edge_rewards,
+                }
+                utilities.append(utility)
+                single_loss = -log_prob * correctness_reward
+                loss_list.append(single_loss)
+
+            utility_loss = torch.mean(torch.stack(loss_list))
         reg_loss, anchor_loss, sparse_loss = refinement_regularization_loss(
             realized_graphs,
             utility_loss,

@@ -14,6 +14,7 @@ from experiments.train_mmlu import train
 from experiments.evaluate_mmlu import evaluate
 from GDesigner.utils.const import GDesigner_ROOT
 from GDesigner.utils.metrics import reset_usage_counters, write_metrics_record
+from experiments.teacher_forcing_reward import add_teacher_forcing_reward_args
 
 
 
@@ -42,7 +43,7 @@ def parse_args():
                         help="Rate for temporal edge pruning when --optimized_temporal is set.")
     parser.add_argument('--use_edge_selector', action='store_true',
                         help="Enable KHEAT uncertainty selector training and selector pruning during evaluation.")
-    parser.add_argument('--num_entropy_samples', type=int, default=1,
+    parser.add_argument('--num_entropy_samples', type=int, default=5,
                         help="Samples per agent before and after communication for KHEAT. Automatically raised to 2 when --use_edge_selector is set.")
     # KLE temporarily disabled; keep this hyperparameter ready for future re-enable.
     # parser.add_argument('--kle_heat_t', type=float, default=0.3,
@@ -71,6 +72,7 @@ def parse_args():
                         help="Weight for G-Designer refined adjacency anchor regularization.")
     parser.add_argument('--sparsity_reg_weight', type=float, default=1.0,
                         help="Weight for G-Designer refined adjacency nuclear-norm sparsity regularization.")
+    add_teacher_forcing_reward_args(parser)
     parser.add_argument('--llm_name', type=str, default="gpt-4o",
                         help="Model name, None runs the default ChatGPT4")
     parser.add_argument('--domain', type=str, default="mmlu",
@@ -126,7 +128,11 @@ async def main():
                     selector_buffer_size=args.selector_buffer_size,
                     selector_ig_tau=args.selector_ig_tau,
                     anchor_reg_weight=args.anchor_reg_weight,
-                    sparsity_reg_weight=args.sparsity_reg_weight)
+                    sparsity_reg_weight=args.sparsity_reg_weight,
+                    use_graph_tf_reward=args.use_graph_tf_reward,
+                    graph_sample_count=args.graph_sample_count,
+                    graph_softmax_temperature=args.graph_softmax_temperature,
+                    edge_tanh_temperature=args.edge_tanh_temperature)
     else:
         edge_selector = None
 

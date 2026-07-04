@@ -484,7 +484,7 @@ async def edge_entropy_rewards(
     graph,
     question: str,
     input_data: Any,
-    judge: SemanticEntailmentJudge,
+    judge: Optional[SemanticEntailmentJudge],
     num_entropy_samples: int,
     negative_reward_scale: float = 1.0,
     nonpositive_penalty: float = 0.01,
@@ -492,7 +492,7 @@ async def edge_entropy_rewards(
     target_spec: Optional[TargetSpec] = None,
     ig_scorer: Optional[FinalAnswerScorer] = None,
 ) -> Tuple[Dict[str, float], Dict[str, Dict[str, Any]]]:
-    """Measure each selected edge by removing it and comparing semantic uncertainty."""
+    """Measure each selected edge by removing it and comparing the receiver state."""
     if not graph.edge_log_probs or num_entropy_samples <= 1:
         return {}, {}
 
@@ -552,7 +552,29 @@ async def edge_entropy_rewards(
             continue
 
         after_cache_key = (target_id, round_idx)
-        if after_cache_key in after_cache:
+        if after_cache_key in after_outputs_cache:
+            after_outputs = after_outputs_cache[after_cache_key]
+        else:
+            after_outputs = history_item.get("entropy_samples", [])
+            if not after_outputs:
+                continue
+            after_outputs_cache[after_cache_key] = list(after_outputs)
+            history_item["entropy_samples"] = []
+
+        if judge is None:
+            before_uncertainty = 0.0
+            after_uncertainty = 0.0
+            before_uncertainty_details = {
+                "method": "direct_final_answer_gain",
+                "outputs": list(before_outputs),
+                "labels": None,
+            }
+            after_uncertainty_details = {
+                "method": "direct_final_answer_gain",
+                "outputs": list(after_outputs),
+                "labels": None,
+            }
+        elif after_cache_key in after_cache:
             before_uncertainty, before_uncertainty_details = await semantic_uncertainty(
                 question,
                 before_outputs,
@@ -560,11 +582,7 @@ async def edge_entropy_rewards(
                 heat_t=kle_heat_t,
             )
             after_uncertainty, after_uncertainty_details = after_cache[after_cache_key]
-            after_outputs = after_outputs_cache.get(after_cache_key, [])
         else:
-            after_outputs = history_item.get("entropy_samples", [])
-            if not after_outputs:
-                continue
             before_result, after_result = await asyncio.gather(
                 semantic_uncertainty(question, before_outputs, judge, heat_t=kle_heat_t),
                 semantic_uncertainty(question, after_outputs, judge, heat_t=kle_heat_t),
@@ -572,8 +590,6 @@ async def edge_entropy_rewards(
             before_uncertainty, before_uncertainty_details = before_result
             after_uncertainty, after_uncertainty_details = after_result
             after_cache[after_cache_key] = (after_uncertainty, after_uncertainty_details)
-            after_outputs_cache[after_cache_key] = list(after_outputs)
-            history_item["entropy_samples"] = []
 
         uncertainty_delta = before_uncertainty - after_uncertainty
         ig_gain = None
@@ -610,7 +626,7 @@ async def edge_entropy_rewards(
             "round": round_idx,
             "source": source_id,
             "target": target_id,
-            "uncertainty_method": "semantic_entropy",
+            "uncertainty_method": "semantic_entropy" if judge is not None else "direct_final_answer_gain",
             "before_uncertainty": before_uncertainty,
             "after_uncertainty": after_uncertainty,
             "uncertainty_delta": uncertainty_delta,
