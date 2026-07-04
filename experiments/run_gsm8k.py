@@ -74,7 +74,7 @@ def parse_args():
     parser.add_argument('--semantic_judge_model_path', type=str, default="",
                         help="Optional judge model name override kept for backward compatibility.")
     parser.add_argument('--semantic_judge_max_concurrency', type=int, default=None,
-                        help="Maximum concurrent semantic judge API requests. Defaults to SEMANTIC_JUDGE_MAX_CONCURRENCY or 16.")
+                        help="Maximum concurrent semantic judge API requests. Defaults to SEMANTIC_JUDGE_MAX_CONCURRENCY or 64.")
     parser.add_argument('--negative_edge_reward_scale', type=float, default=1.0,
                         help="Scale for negative edge rewards when an edge increases KHEAT uncertainty.")
     parser.add_argument('--nonpositive_edge_penalty', type=float, default=0.01,
