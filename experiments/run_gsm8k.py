@@ -230,6 +230,9 @@ async def main():
             graph_groups = []
             score_groups = []
             edge_detail_groups = []
+            graph_tf_scores: List[float] = []
+            graph_tf_corrects: List[float] = []
+            graph_tf_edge_counts: List[float] = []
             for record, true_answer, group_indices, input_dict in zip(
                 current_batch,
                 answers,
@@ -250,7 +253,15 @@ async def main():
                         raw_answer,
                         target_spec,
                     )
-                    edge_rewards, edge_details = await edge_entropy_rewards(
+                    predict_answer = gsm_get_predict(raw_answer[0])
+                    try:
+                        is_solved = float(predict_answer) == float(true_answer)
+                    except (TypeError, ValueError):
+                        is_solved = False
+                    graph_tf_scores.append(float(graph_score.score))
+                    graph_tf_corrects.append(float(is_solved))
+                    graph_tf_edge_counts.append(float(sum(realized_graph.realized_edge_counts)))
+                    _edge_rewards, edge_details = await edge_entropy_rewards(
                         realized_graph,
                         record["task"],
                         input_dict,
@@ -261,6 +272,7 @@ async def main():
                         kle_heat_t=getattr(args, "kle_heat_t", 0.3),
                         target_spec=target_spec,
                         ig_scorer=tf_scorer,
+                        compute_rewards=False,
                     )
                     if selector_buffer is not None:
                         selector_buffer.add_many(build_edge_selector_examples(
@@ -270,15 +282,12 @@ async def main():
                             args.selector_ig_tau,
                         ))
                     if sample_pos == 0:
-                        predict_answer = gsm_get_predict(raw_answer[0])
-                        is_solved = float(predict_answer) == float(true_answer)
                         total_solved = total_solved + is_solved
                         total_executed = total_executed + 1
                         accuracy = total_solved / total_executed
                         utilities.append({
                             "correctness": is_solved,
                             "graph_tf_score": graph_score.score,
-                            "edge_entropy_rewards": edge_rewards,
                         })
                     graph_group.append(realized_graph)
                     score_group.append(graph_score.score)
@@ -296,7 +305,17 @@ async def main():
                 graph_softmax_temperature=args.graph_softmax_temperature,
                 edge_tanh_temperature=args.edge_tanh_temperature,
             )
-            print("teacher forcing graph summaries:", tf_summaries)
+            if graph_tf_scores:
+                avg_tf_score = sum(graph_tf_scores) / len(graph_tf_scores)
+                avg_correct = sum(graph_tf_corrects) / len(graph_tf_corrects)
+                avg_edges = sum(graph_tf_edge_counts) / len(graph_tf_edge_counts)
+                print(
+                    "graph tf metrics: "
+                    f"avg_score={avg_tf_score:.6f}, "
+                    f"accuracy={avg_correct:.6f}, "
+                    f"avg_edges={avg_edges:.6f}, "
+                    f"num_graphs={len(graph_tf_scores)}"
+                )
         else:
             for task, answer, log_prob, true_answer, realized_graph, input_dict in zip(current_batch, raw_answers, log_probs, answers, realized_graphs, input_dicts):
                 predict_answer = gsm_get_predict(answer[0])
@@ -364,7 +383,8 @@ async def main():
 
         print(f"Batch time {time.time() - start_ts:.3f}")
         print(f"Accuracy: {accuracy}")
-        print("utilities:", utilities)
+        if not use_graph_tf_reward:
+            print("utilities:", utilities)
         print("utility loss:", utility_loss.item())
         print("anchor loss:", anchor_loss.item())
         print("sparse loss:", sparse_loss.item())

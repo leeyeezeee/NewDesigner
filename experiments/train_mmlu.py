@@ -1,4 +1,5 @@
 import torch
+import json
 from typing import Iterator
 import pandas as pd
 import numpy as np
@@ -6,6 +7,7 @@ import time
 import asyncio
 from typing import List
 import copy
+from pathlib import Path
 
 from GDesigner.graph.graph import Graph
 from experiments.accuracy import Accuracy
@@ -26,6 +28,20 @@ from experiments.teacher_forcing_reward import (
     graph_teacher_forcing_score,
     teacher_forcing_edge_loss,
 )
+
+_GRAPH_TF_RECORD_FILE = "mmlu_graph_tf_records.jsonl"
+
+
+def _reset_jsonl(path: str) -> None:
+    record_path = Path(path)
+    record_path.parent.mkdir(parents=True, exist_ok=True)
+    record_path.write_text("", encoding="utf-8")
+
+
+def _append_jsonl(path: str, record: dict) -> None:
+    with Path(path).open("a", encoding="utf-8") as file:
+        file.write(json.dumps(record, ensure_ascii=False) + "\n")
+
 
 async def train(graph:Graph,
             dataset,
@@ -88,6 +104,8 @@ async def train(graph:Graph,
         selector_buffer = SelectorReplayBuffer(selector_buffer_size)
         selector_optimizer = torch.optim.Adam(edge_selector.parameters(), lr=1e-3)
     tf_scorer = FinalAnswerScorer() if use_graph_tf_reward else None
+    if use_graph_tf_reward:
+        _reset_jsonl(_GRAPH_TF_RECORD_FILE)
     
     optimizer_params = list(graph.gcn.parameters()) + list(graph.mlp.parameters()) + graph.refinement_parameters()
     if graph.optimized_temporal:
@@ -136,17 +154,20 @@ async def train(graph:Graph,
         raw_answers, log_probs = zip(*raw_results)
         loss_list: List[torch.Tensor] = []
         utilities: List[dict] = []
+        graph_tf_scores: List[float] = []
+        graph_tf_corrects: List[float] = []
+        graph_tf_edge_counts: List[float] = []
         answers: List[str] = []
         
         if use_graph_tf_reward:
             graph_groups = []
             score_groups = []
             edge_detail_groups = []
-            for correct_answer, group_indices, input_dict in zip(
+            for record_idx, (correct_answer, group_indices, input_dict) in enumerate(zip(
                 correct_answers,
                 sample_groups,
                 record_input_dicts,
-            ):
+            )):
                 assert isinstance(correct_answer, str), \
                         f"String expected but got {correct_answer} of type {type(correct_answer)} (1)"
                 target_spec = make_target_spec("mmlu", correct_answer)
@@ -163,7 +184,13 @@ async def train(graph:Graph,
                         raw_answer,
                         target_spec,
                     )
-                    edge_rewards, edge_details = await edge_entropy_rewards(
+                    record_answer = dataset.postprocess_answer(raw_answer)
+                    record_accuracy = Accuracy()
+                    record_accuracy.update(record_answer, correct_answer)
+                    graph_tf_scores.append(float(graph_score.score))
+                    graph_tf_corrects.append(float(record_accuracy.get()))
+                    graph_tf_edge_counts.append(float(sum(realized_graph.realized_edge_counts)))
+                    _edge_rewards, edge_details = await edge_entropy_rewards(
                         realized_graph,
                         input_dict["task"],
                         input_dict,
@@ -174,6 +201,7 @@ async def train(graph:Graph,
                         kle_heat_t=kle_heat_t,
                         target_spec=target_spec,
                         ig_scorer=tf_scorer,
+                        compute_rewards=False,
                     )
                     if selector_buffer is not None:
                         selector_buffer.add_many(build_edge_selector_examples(
@@ -191,10 +219,7 @@ async def train(graph:Graph,
                         utilities.append({
                             "correctness": correctness_reward,
                             "graph_tf_score": graph_score.score,
-                            "edge_entropy_rewards": edge_rewards,
                         })
-                        print(f"correct answer:{correct_answer}")
-                        print(f"edge entropy rewards:{edge_rewards}")
                     graph_group.append(realized_graph)
                     score_group.append(graph_score.score)
                     edge_detail_group.append(edge_details)
@@ -211,7 +236,22 @@ async def train(graph:Graph,
                 graph_softmax_temperature=graph_softmax_temperature,
                 edge_tanh_temperature=edge_tanh_temperature,
             )
-            print("teacher forcing graph summaries:", tf_summaries)
+            if graph_tf_scores:
+                graph_tf_summary = {
+                    "iteration": i_iter,
+                    "num_graphs": len(graph_tf_scores),
+                    "avg_graph_tf_score": sum(graph_tf_scores) / len(graph_tf_scores),
+                    "accuracy": sum(graph_tf_corrects) / len(graph_tf_corrects),
+                    "avg_edges": sum(graph_tf_edge_counts) / len(graph_tf_edge_counts),
+                }
+                _append_jsonl(_GRAPH_TF_RECORD_FILE, graph_tf_summary)
+                print(
+                    "graph tf metrics: "
+                    f"avg_score={graph_tf_summary['avg_graph_tf_score']:.6f}, "
+                    f"accuracy={graph_tf_summary['accuracy']:.6f}, "
+                    f"avg_edges={graph_tf_summary['avg_edges']:.6f}, "
+                    f"num_graphs={graph_tf_summary['num_graphs']}"
+                )
         else:
             for raw_answer, log_prob, correct_answer, realized_graph, input_dict in zip(raw_answers, log_probs, correct_answers, realized_graphs, input_dicts):
                 answer = dataset.postprocess_answer(raw_answer)
@@ -279,7 +319,8 @@ async def train(graph:Graph,
 
         print("answers:",answers)
         print(f"Batch time {time.time() - start_ts:.3f}")
-        print("utilities:", utilities) # [0.0, 0.0, 0.0, 1.0]
+        if not use_graph_tf_reward:
+            print("utilities:", utilities) # [0.0, 0.0, 0.0, 1.0]
         print("utility loss:", utility_loss.item())
         print("anchor loss:", anchor_loss.item())
         print("sparse loss:", sparse_loss.item())

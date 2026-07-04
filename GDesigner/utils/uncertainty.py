@@ -491,6 +491,7 @@ async def edge_entropy_rewards(
     kle_heat_t: float = _DEFAULT_KLE_HEAT_T,
     target_spec: Optional[TargetSpec] = None,
     ig_scorer: Optional[FinalAnswerScorer] = None,
+    compute_rewards: bool = True,
 ) -> Tuple[Dict[str, float], Dict[str, Dict[str, Any]]]:
     """Measure each selected edge by removing it and comparing the receiver state."""
     if not graph.edge_log_probs or num_entropy_samples <= 1:
@@ -647,10 +648,14 @@ async def edge_entropy_rewards(
             details[key]["after_answer_details"] = after_score.details
             details[key]["ig_mode"] = target_spec.mode
 
-    rewards = _normalize_edge_rewards(
-        details,
-        negative_reward_scale=negative_reward_scale,
-        nonpositive_penalty=nonpositive_penalty,
+    rewards = (
+        _normalize_edge_rewards(
+            details,
+            negative_reward_scale=negative_reward_scale,
+            nonpositive_penalty=nonpositive_penalty,
+        )
+        if compute_rewards
+        else {}
     )
     return rewards, details
 
