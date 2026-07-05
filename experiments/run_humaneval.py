@@ -89,6 +89,10 @@ def parse_args():
                         help="Weight for G-Designer refined adjacency anchor regularization.")
     parser.add_argument('--sparsity_reg_weight', type=float, default=1.0,
                         help="Weight for G-Designer refined adjacency nuclear-norm sparsity regularization.")
+    parser.add_argument('--edge_bias_scale', type=float, default=0.5,
+                        help="Scale for the trainable per-edge spatial bias residual.")
+    parser.add_argument('--edge_bias_l2_weight', type=float, default=1e-2,
+                        help="L2 regularization weight for the trainable per-edge spatial bias.")
     add_teacher_forcing_reward_args(parser)
     parser.add_argument('--num_iterations', type=int, default = 10,help="The num of training iterations.")
     parser.add_argument('--domain', type=str, default="humaneval",help="Domain (the same as dataset name), default 'humaneval'")
@@ -127,6 +131,7 @@ async def main():
                   optimized_spatial=args.optimized_spatial,
                   optimized_temporal=args.optimized_temporal,
                   refine_rank=args.refine_rank,
+                  edge_bias_scale=args.edge_bias_scale,
                   **kwargs)
     graph.gcn.train()
     graph.mlp.train()
@@ -205,6 +210,7 @@ async def main():
                 realized_graph.gcn = graph.gcn
                 realized_graph.mlp = graph.mlp
                 realized_graph.refinement_weight = graph.refinement_weight
+                realized_graph.spatial_edge_bias = graph.spatial_edge_bias
                 realized_graph.temporal_logits = graph.temporal_logits
                 group_indices.append(len(realized_graphs))
                 realized_graphs.append(realized_graph)
@@ -363,6 +369,7 @@ async def main():
             utility_loss,
             anchor_reg_weight=args.anchor_reg_weight,
             sparsity_reg_weight=args.sparsity_reg_weight,
+            edge_bias_l2_weight=args.edge_bias_l2_weight,
         )
         total_loss = utility_loss + reg_loss
         if train_updates_enabled:

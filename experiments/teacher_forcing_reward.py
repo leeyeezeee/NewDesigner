@@ -12,7 +12,7 @@ def add_teacher_forcing_reward_args(parser) -> None:
         action="store_true",
         help=(
             "Use multi-sampled graph teacher-forcing scores as graph-level "
-            "weights and edge KLE deltas as per-edge update weights."
+            "weights and semantic-cluster weighted IG gains as per-edge update weights."
         ),
     )
     parser.add_argument(
@@ -31,7 +31,7 @@ def add_teacher_forcing_reward_args(parser) -> None:
         "--edge_tanh_temperature",
         type=float,
         default=1.0,
-        help="Temperature for tanh normalization of edge KLE deltas.",
+        help="Temperature for tanh normalization of edge semantic-cluster weighted IG gains.",
     )
 
 
@@ -90,11 +90,11 @@ def teacher_forcing_edge_loss(
                 if not torch.is_tensor(log_prob):
                     continue
                 detail = edge_details.get(edge_key(edge_info), {})
-                if "uncertainty_delta" not in detail:
+                if "ig_gain" not in detail:
                     continue
 
                 normalized_gain = torch.tanh(
-                    log_prob.new_tensor(float(detail["uncertainty_delta"]) / edge_tanh_temperature)
+                    log_prob.new_tensor(float(detail["ig_gain"]) / edge_tanh_temperature)
                 )
                 coefficient = log_prob.new_tensor(float(graph_weight)) * normalized_gain
                 terms.append(-(coefficient * log_prob))

@@ -405,21 +405,17 @@ async def semantic_uncertainty(
     valid_outputs = [str(output).strip() for output in outputs if str(output).strip()]
     if len(valid_outputs) <= 1:
         return 0.0, {
-            "method": "kheat_language_entropy",
+            "method": "semantic_entropy",
             "outputs": valid_outputs,
-            "labels": None,
-            "weights": [[0.0]] if valid_outputs else [],
-            "kernel": "heat",
-            "kle_heat_t": float(heat_t),
+            "labels": ["cluster_0"] if valid_outputs else [],
         }
 
-    weights = await judge.semantic_weight_matrix(question, valid_outputs)
-    entropy, entropy_details = heat_kernel_language_entropy(weights, heat_t=heat_t)
+    labels = await judge.cluster_outputs(question, valid_outputs)
+    entropy = semantic_entropy(labels)
     return entropy, {
-        "method": "kheat_language_entropy",
+        "method": "semantic_entropy",
         "outputs": valid_outputs,
-        "labels": None,
-        **entropy_details,
+        "labels": labels,
     }
 
 
@@ -650,7 +646,7 @@ async def edge_entropy_rewards(
             "source": source_id,
             "target": target_id,
             "uncertainty_method": (
-                after_uncertainty_details.get("method", "kheat_language_entropy")
+                after_uncertainty_details.get("method", "semantic_entropy")
                 if judge is not None
                 else "direct_final_answer_gain"
             ),

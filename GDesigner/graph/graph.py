@@ -53,6 +53,7 @@ class Graph(ABC):
                 fixed_temporal_masks:List[List[int]] = None,
                 node_kwargs:List[Dict] = None,
                 refine_rank:int = 4,
+                edge_bias_scale: float = 0.5,
                 ):
         
         if fixed_spatial_masks is None:
@@ -79,17 +80,23 @@ class Graph(ABC):
         self.node_kwargs = node_kwargs if node_kwargs is not None else [{} for _ in agent_names]
         self.anchor_spatial_matrix = fixed_spatial_masks.view(len(agent_names), len(agent_names)).float()
         self.refine_rank = min(max(1, int(refine_rank)), len(agent_names))
+        self.edge_bias_scale = float(edge_bias_scale)
         self.refinement_weight = torch.nn.Parameter(
             torch.eye(self.refine_rank),
             requires_grad=optimized_spatial,
         )
         self.refinement_anchor_loss = torch.tensor(0.0)
         self.refinement_sparse_loss = torch.tensor(0.0)
+        self.edge_bias_l2_loss = torch.tensor(0.0)
         self.spatial_edge_probabilities = None
         
         self.init_nodes() # add nodes to the self.nodes
         self.node_id_to_index = {node_id: idx for idx, node_id in enumerate(self.nodes)}
         self.init_potential_edges() # add potential edges to the self.potential_spatial/temporal_edges
+        self.spatial_edge_bias = torch.nn.Parameter(
+            torch.zeros(len(self.potential_spatial_edges)),
+            requires_grad=optimized_spatial,
+        )
         
         self.prompt_set = PromptSetRegistry.get(domain)
         self.role_adj_matrix = self.construct_adj_matrix()
@@ -108,9 +115,12 @@ class Graph(ABC):
         self.temporal_masks = torch.nn.Parameter(fixed_temporal_masks,requires_grad=False)  # fixed edge masks
 
     def refinement_parameters(self) -> List[torch.nn.Parameter]:
+        parameters = []
         if self.refinement_weight.requires_grad:
-            return [self.refinement_weight]
-        return []
+            parameters.append(self.refinement_weight)
+        if self.spatial_edge_bias.requires_grad:
+            parameters.append(self.spatial_edge_bias)
+        return parameters
     
     def construct_adj_matrix(self):
         role_connect:List[Tuple[str,str]] = self.prompt_set.get_role_connection()
@@ -158,6 +168,7 @@ class Graph(ABC):
             reference = self.refinement_weight
         self.refinement_anchor_loss = reference.new_tensor(0.0)
         self.refinement_sparse_loss = reference.new_tensor(0.0)
+        self.edge_bias_l2_loss = reference.new_tensor(0.0)
 
     def _refine_spatial_logits(self, raw_spatial_logits: torch.Tensor) -> torch.Tensor:
         if not self.optimized_spatial:
@@ -192,8 +203,17 @@ class Graph(ABC):
             + 0.5 * torch.linalg.matrix_norm(anchor_adj - refined_adj, ord="fro").pow(2)
         )
         self.refinement_sparse_loss = torch.linalg.svdvals(refinement_weight).sum()
-        self.spatial_edge_probabilities = refined_adj.clamp(1e-6, 1.0 - 1e-6).view(-1)
-        return refined_adj.view(-1)
+        edge_bias = self.spatial_edge_bias.to(
+            device=raw_spatial_logits.device,
+            dtype=raw_spatial_logits.dtype,
+        ).view(self.num_nodes, self.num_nodes) * mask
+        active_edges = mask.sum().clamp_min(1.0)
+        self.edge_bias_l2_loss = edge_bias.pow(2).sum() / active_edges
+        refined_prob = refined_adj.clamp(1e-6, 1.0 - 1e-6)
+        refined_logits = torch.logit(refined_prob)
+        biased_logits = refined_logits + self.edge_bias_scale * edge_bias
+        self.spatial_edge_probabilities = torch.sigmoid(biased_logits).clamp(1e-6, 1.0 - 1e-6).view(-1)
+        return biased_logits.view(-1)
 
     def prepare_spatial_logits(
             self,

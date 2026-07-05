@@ -73,6 +73,7 @@ async def run_math_dataset(
         optimized_spatial=args.optimized_spatial,
         optimized_temporal=args.optimized_temporal,
         refine_rank=getattr(args, "refine_rank", 4),
+        edge_bias_scale=getattr(args, "edge_bias_scale", 0.5),
         **kwargs,
     )
     graph.gcn.train()
@@ -153,6 +154,7 @@ async def run_math_dataset(
                 realized_graph.gcn = graph.gcn
                 realized_graph.mlp = graph.mlp
                 realized_graph.refinement_weight = graph.refinement_weight
+                realized_graph.spatial_edge_bias = graph.spatial_edge_bias
                 realized_graph.temporal_logits = graph.temporal_logits
                 group_indices.append(len(realized_graphs))
                 realized_graphs.append(realized_graph)
@@ -322,6 +324,7 @@ async def run_math_dataset(
             utility_loss,
             anchor_reg_weight=getattr(args, "anchor_reg_weight", 1.0),
             sparsity_reg_weight=getattr(args, "sparsity_reg_weight", 1.0),
+            edge_bias_l2_weight=getattr(args, "edge_bias_l2_weight", 1e-2),
         )
         total_loss = utility_loss + reg_loss
         if train_updates_enabled:
