@@ -23,7 +23,7 @@ T = TypeVar("T")
 _DEFAULT_JUDGE_TIMEOUT = 120.0
 _DEFAULT_JUDGE_CONNECT_TIMEOUT = 10.0
 _DEFAULT_JUDGE_MAX_RETRIES = 3
-_DEFAULT_JUDGE_MAX_CONCURRENCY = 64
+_DEFAULT_JUDGE_MAX_CONCURRENCY = 16
 _DEFAULT_KLE_HEAT_T = 0.3
 
 _NLI_LABELS = ("entailment", "neutral", "contradiction")
@@ -226,18 +226,10 @@ class SemanticEntailmentJudge:
         if self.llm_name and self.api_key:
             from openai import AsyncOpenAI
 
-            http_client = httpx.AsyncClient(
-                timeout=_judge_http_timeout(self.timeout, self.connect_timeout),
-                limits=httpx.Limits(
-                    max_connections=self.max_concurrency,
-                    max_keepalive_connections=self.max_concurrency,
-                ),
-            )
             client_kwargs = {
                 "api_key": self.api_key,
                 "timeout": _judge_http_timeout(self.timeout, self.connect_timeout),
                 "max_retries": 0,
-                "http_client": http_client,
             }
             if self.base_url:
                 client_kwargs["base_url"] = self.base_url
@@ -318,35 +310,24 @@ class SemanticEntailmentJudge:
         valid_outputs = [str(output).strip() for output in outputs if str(output).strip()]
         num_outputs = len(valid_outputs)
         weights = np.zeros((num_outputs, num_outputs), dtype=float)
-        directed_tasks = []
-        directed_pairs = []
-        unordered_pairs = []
+        tasks = []
+        task_pairs = []
 
         for i in range(num_outputs):
             for j in range(i + 1, num_outputs):
                 if valid_outputs[i] == valid_outputs[j]:
                     weights[i, j] = weights[j, i] = 2.0
                     continue
-                unordered_pairs.append((i, j))
-                directed_pairs.append((i, j))
-                directed_tasks.append(asyncio.create_task(
-                    self.nli_score(question, valid_outputs[i], valid_outputs[j])
+                tasks.append(asyncio.gather(
+                    self.nli_score(question, valid_outputs[i], valid_outputs[j]),
+                    self.nli_score(question, valid_outputs[j], valid_outputs[i]),
                 ))
-                directed_pairs.append((j, i))
-                directed_tasks.append(asyncio.create_task(
-                    self.nli_score(question, valid_outputs[j], valid_outputs[i])
-                ))
+                task_pairs.append((i, j))
 
-        if directed_tasks:
-            directed_scores = await asyncio.gather(*directed_tasks)
-            score_by_pair = {
-                pair: float(score)
-                for pair, score in zip(directed_pairs, directed_scores)
-            }
-            for i, j in unordered_pairs:
-                weights[i, j] = weights[j, i] = (
-                    score_by_pair[(i, j)] + score_by_pair[(j, i)]
-                )
+        if tasks:
+            pair_scores = await asyncio.gather(*tasks)
+            for (i, j), (forward_score, backward_score) in zip(task_pairs, pair_scores):
+                weights[i, j] = weights[j, i] = float(forward_score) + float(backward_score)
 
         return weights.tolist()
 
@@ -410,6 +391,7 @@ async def semantic_uncertainty(
             "labels": ["cluster_0"] if valid_outputs else [],
         }
 
+    # KLE is retained above for later re-enable; for now use cluster semantic entropy.
     labels = await judge.cluster_outputs(question, valid_outputs)
     entropy = semantic_entropy(labels)
     return entropy, {
@@ -645,11 +627,7 @@ async def edge_entropy_rewards(
             "round": round_idx,
             "source": source_id,
             "target": target_id,
-            "uncertainty_method": (
-                after_uncertainty_details.get("method", "semantic_entropy")
-                if judge is not None
-                else "direct_final_answer_gain"
-            ),
+            "uncertainty_method": "semantic_entropy" if judge is not None else "direct_final_answer_gain",
             "before_uncertainty": before_uncertainty,
             "after_uncertainty": after_uncertainty,
             "uncertainty_delta": uncertainty_delta,
