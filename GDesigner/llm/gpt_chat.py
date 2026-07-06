@@ -46,10 +46,13 @@ def _optional_bool_env(name: str) -> Optional[bool]:
 
 
 def _chat_completion_extra_body(model: str) -> Dict[str, Any]:
-    enable_thinking = _optional_bool_env("QWEN_ENABLE_THINKING")
-    if enable_thinking is None or "qwen" not in model.lower():
+    if "qwen" not in model.lower():
         return {}
+    enable_thinking = _optional_bool_env("QWEN_ENABLE_THINKING")
+    if enable_thinking is None:
+        enable_thinking = False
     return {
+        "enable_thinking": enable_thinking,
         "chat_template_kwargs": {
             "enable_thinking": enable_thinking,
         }
