@@ -14,6 +14,7 @@ from experiments.train_mmlu import train
 from experiments.evaluate_mmlu import evaluate
 from GDesigner.utils.const import GDesigner_ROOT
 from GDesigner.utils.metrics import reset_usage_counters, write_metrics_record
+from experiments.checkpoint import save_graph_checkpoint
 from experiments.teacher_forcing_reward import add_teacher_forcing_reward_args
 
 
@@ -85,6 +86,8 @@ def parse_args():
                         help="the decision method of the final node")
     parser.add_argument('--metrics_file', type=str, default="result/mmlu.jsonl",
                         help="JSONL file to append final accuracy and cost metrics.")
+    parser.add_argument('--checkpoint_file', type=str, default="result/checkpoints/mmlu.pt",
+                        help="Path to overwrite with the trained graph checkpoint.")
     parser.add_argument('--optimized_spatial',action='store_true')
     parser.add_argument('--optimized_temporal',action='store_true')
     args = parser.parse_args()
@@ -139,6 +142,13 @@ async def main():
                     graph_sample_count=args.graph_sample_count,
                     graph_softmax_temperature=args.graph_softmax_temperature,
                     edge_tanh_temperature=args.edge_tanh_temperature)
+        save_graph_checkpoint(
+            graph,
+            args.checkpoint_file,
+            dataset="mmlu",
+            args=args,
+            edge_selector=edge_selector,
+        )
     else:
         edge_selector = None
 

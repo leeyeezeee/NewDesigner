@@ -29,6 +29,7 @@ from GDesigner.utils.uncertainty import (
 )
 from GDesigner.utils.ig_scorer import FinalAnswerScorer, make_target_spec
 from datasets.gsm8k_dataset import gsm_data_process,gsm_get_predict
+from experiments.checkpoint import save_graph_checkpoint
 from experiments.refinement_loss import refinement_regularization_loss
 from experiments.teacher_forcing_reward import (
     add_teacher_forcing_reward_args,
@@ -104,6 +105,8 @@ def parse_args():
                         help='The decison method of the GDesigner')
     parser.add_argument('--metrics_file', type=str, default="result/gsm8k.jsonl",
                         help="JSONL file to append final accuracy and cost metrics.")
+    parser.add_argument('--checkpoint_file', type=str, default="result/checkpoints/gsm8k.pt",
+                        help="Path to overwrite with the trained graph checkpoint.")
     parser.add_argument('--optimized_spatial',action='store_true')
     parser.add_argument('--optimized_temporal',action='store_true')
     args = parser.parse_args()
@@ -398,6 +401,15 @@ async def main():
         print("loss:", total_loss.item())
 
         if i_batch+1 == args.num_iterations:
+            save_graph_checkpoint(
+                graph,
+                args.checkpoint_file,
+                dataset="gsm8k",
+                args=args,
+                optimizer=optimizer,
+                edge_selector=edge_selector if selector_trained else None,
+                metrics={"train_accuracy": accuracy},
+            )
             total_solved = 0
             total_executed = 0
             total_edges = 0

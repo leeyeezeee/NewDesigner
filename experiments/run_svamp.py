@@ -37,6 +37,8 @@ def parse_args():
     parser.add_argument("--agent_nums", nargs="+", type=int, default=[4])
     parser.add_argument("--decision_method", type=str, default="FinalRefer")
     parser.add_argument("--metrics_file", type=str, default="result/svamp.jsonl")
+    parser.add_argument("--checkpoint_file", type=str, default="result/checkpoints/svamp.pt",
+                        help="Path to overwrite with the trained graph checkpoint.")
     parser.add_argument("--use_edge_selector", action="store_true",
                         help="Enable KHEAT uncertainty selector training and selector pruning during evaluation.")
     parser.add_argument("--num_entropy_samples", type=int, default=5)

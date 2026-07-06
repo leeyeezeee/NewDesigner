@@ -21,6 +21,7 @@ from GDesigner.utils.uncertainty import (
     edge_entropy_rewards,
 )
 from GDesigner.utils.ig_scorer import FinalAnswerScorer, make_target_spec
+from experiments.checkpoint import save_graph_checkpoint
 from experiments.refinement_loss import refinement_regularization_loss
 from experiments.teacher_forcing_reward import (
     graph_teacher_forcing_score,
@@ -354,6 +355,15 @@ async def run_math_dataset(
         print("loss:", total_loss.item())
 
         if i_batch + 1 == args.num_iterations:
+            save_graph_checkpoint(
+                graph,
+                getattr(args, "checkpoint_file", f"result/checkpoints/{dataset_name}.pt"),
+                dataset=dataset_name,
+                args=args,
+                optimizer=optimizer,
+                edge_selector=edge_selector if selector_trained else None,
+                metrics={"train_accuracy": accuracy},
+            )
             total_solved = 0
             total_executed = 0
             total_edges = 0
