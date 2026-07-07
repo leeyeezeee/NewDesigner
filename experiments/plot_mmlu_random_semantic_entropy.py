@@ -199,7 +199,7 @@ def parse_args():
     parser.add_argument(
         "--num_entropy_samples",
         type=int,
-        default=4,
+        default=5,
         help=(
             "Fresh graph+agent executions per task used to estimate final-answer "
             "semantic entropy."
