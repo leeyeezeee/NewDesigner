@@ -1,6 +1,5 @@
 import argparse
 import asyncio
-import copy
 import csv
 import math
 import os
@@ -8,6 +7,7 @@ import random
 import re
 import sys
 import time
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -34,6 +34,11 @@ from datasets.gsm8k_dataset import (
     svamp_data_process,
 )
 from datasets.mmlu_dataset import MMLUDataset
+from GDesigner.utils.uncertainty import (
+    SemanticEntailmentJudge,
+    semantic_entropy,
+    semantic_uncertainty,
+)
 
 
 RecordToInput = Callable[[Any], Dict[str, Any]]
@@ -68,15 +73,20 @@ class DatasetBundle:
 
 
 @dataclass
+class GraphSampleResult:
+    raw_final_answer: str
+    predicted_answer: str
+
+
+@dataclass
 class InferenceResult:
     dataset: str
     index: int
     input_dict: Dict[str, Any]
-    realized_graph: Graph
-    raw_final_answer: str
-    final_answer_token_logprobs: List[Any]
-    predicted_answer: str
+    raw_final_answers: List[str]
+    predicted_answers: List[str]
     target_answer: str
+    modal_predicted_answer: str
     is_correct: bool
 
 
@@ -142,8 +152,8 @@ DATASET_DEFAULTS: Dict[str, DatasetDefaults] = {
 def parse_args():
     parser = argparse.ArgumentParser(
         description=(
-            "Plot the post-communication distribution of final extracted-answer "
-            "logprob uncertainty for correct vs incorrect samples."
+            "Plot the distribution of final aggregated-answer semantic entropy "
+            "estimated by repeatedly resampling random communication graphs per task."
         )
     )
     parser.add_argument(
@@ -189,8 +199,11 @@ def parse_args():
     parser.add_argument(
         "--num_entropy_samples",
         type=int,
-        default=1,
-        help="Samples per non-final agent during graph execution. Use 1 for logprob plotting.",
+        default=4,
+        help=(
+            "Fresh graph+agent executions per task used to estimate final-answer "
+            "semantic entropy."
+        ),
     )
     # KLE temporarily disabled; keep this hyperparameter ready for future re-enable.
     # parser.add_argument(
@@ -209,15 +222,35 @@ def parse_args():
     parser.add_argument("--decision_method", type=str, default=None)
     parser.add_argument("--agent_names", nargs="+", type=str, default=None)
     parser.add_argument("--agent_nums", nargs="+", type=int, default=None)
-    parser.add_argument("--semantic_judge_llm_name", type=str, default="", help=argparse.SUPPRESS)
-    parser.add_argument("--semantic_judge_api_key", type=str, default="", help=argparse.SUPPRESS)
-    parser.add_argument("--semantic_judge_base_url", type=str, default="", help=argparse.SUPPRESS)
-    parser.add_argument("--semantic_judge_model_path", type=str, default="", help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--semantic_judge_llm_name",
+        type=str,
+        default="",
+        help="OpenAI-compatible semantic judge model name. Uses env defaults when omitted.",
+    )
+    parser.add_argument(
+        "--semantic_judge_api_key",
+        type=str,
+        default="",
+        help="API key for the semantic judge. Uses SEMANTIC_JUDGE_API_KEY or OPENAI_API_KEY when omitted.",
+    )
+    parser.add_argument(
+        "--semantic_judge_base_url",
+        type=str,
+        default="",
+        help="Base URL for the semantic judge API, e.g. a local vLLM OpenAI-compatible endpoint.",
+    )
+    parser.add_argument(
+        "--semantic_judge_model_path",
+        type=str,
+        default="",
+        help="Optional local judge model path/name override.",
+    )
     parser.add_argument(
         "--semantic_judge_max_concurrency",
         type=int,
         default=None,
-        help=argparse.SUPPRESS,
+        help="Maximum concurrent semantic judge requests.",
     )
     parser.add_argument("--humaneval_timeout", type=int, default=100)
     parser.add_argument("--bins", type=int, default=25)
@@ -721,65 +754,142 @@ async def compute_correctness(bundle: DatasetBundle, predicted: str, target: str
     return bundle.is_correct(predicted, target)
 
 
-async def run_record_inference(
-    graph: Graph,
-    bundle: DatasetBundle,
-    record_index: int,
-    record,
-    args,
-) -> InferenceResult:
-    realized_graph = copy.deepcopy(graph)
-    realized_graph.gcn = graph.gcn
-    realized_graph.mlp = graph.mlp
-    realized_graph.temporal_logits = graph.temporal_logits
+def build_graph(bundle: DatasetBundle, args, agent_names: List[str]) -> Graph:
+    kwargs = get_graph_kwargs(args.mode, len(agent_names))
+    graph = Graph(
+        domain=bundle.graph_domain,
+        llm_name=args.llm_name,
+        agent_names=agent_names,
+        decision_method=bundle.decision_method,
+        optimized_spatial=False,
+        optimized_temporal=False,
+        **kwargs,
+    )
+    graph.gcn.eval()
+    graph.mlp.eval()
+    return graph
 
-    input_dict = bundle.record_to_input(record)
+
+async def run_graph_sample(
+    bundle: DatasetBundle,
+    input_dict: Dict[str, Any],
+    args,
+    agent_names: List[str],
+) -> GraphSampleResult:
+    realized_graph = build_graph(bundle, args, agent_names)
     raw_answer, _log_prob = await realized_graph.arun(
         input_dict,
         bundle.num_rounds,
-        num_entropy_samples=args.num_entropy_samples,
+        num_entropy_samples=1,
         record_execution_history=False,
         track_grad=False,
-        record_decision_logprobs=True,
+        record_decision_logprobs=False,
     )
 
     raw_final_answer = first_answer(raw_answer)
     predicted_answer = bundle.parse_prediction(raw_answer)
+    return GraphSampleResult(
+        raw_final_answer=raw_final_answer,
+        predicted_answer=predicted_answer,
+    )
+
+
+def modal_answer(answers: Sequence[str]) -> str:
+    valid_answers = [str(answer) for answer in answers if str(answer).strip()]
+    if not valid_answers:
+        return ""
+
+    counts = Counter(valid_answers)
+    best_answer = valid_answers[0]
+    for answer in valid_answers[1:]:
+        if counts[answer] > counts[best_answer]:
+            best_answer = answer
+    return best_answer
+
+
+async def run_record_inference(
+    bundle: DatasetBundle,
+    record_index: int,
+    record,
+    args,
+    agent_names: List[str],
+) -> InferenceResult:
+    input_dict = bundle.record_to_input(record)
+    sample_results = await asyncio.gather(
+        *[
+            run_graph_sample(bundle, input_dict, args, agent_names)
+            for _sample_idx in range(args.num_entropy_samples)
+        ]
+    )
+
+    raw_final_answers = [sample.raw_final_answer for sample in sample_results]
+    predicted_answers = [sample.predicted_answer for sample in sample_results]
     target_answer = bundle.record_to_target(record)
-    is_correct = await compute_correctness(bundle, predicted_answer, target_answer)
+    modal_predicted_answer = modal_answer(predicted_answers)
+    is_correct = await compute_correctness(bundle, modal_predicted_answer, target_answer)
     return InferenceResult(
         dataset=bundle.name,
         index=record_index,
         input_dict=input_dict,
-        realized_graph=realized_graph,
-        raw_final_answer=raw_final_answer,
-        final_answer_token_logprobs=list(
-            getattr(realized_graph.decision_node, "last_response_token_logprobs", [])
-        ),
-        predicted_answer=predicted_answer,
+        raw_final_answers=raw_final_answers,
+        predicted_answers=predicted_answers,
         target_answer=target_answer,
+        modal_predicted_answer=modal_predicted_answer,
         is_correct=is_correct,
     )
 
 
-async def attach_final_answer_logprob_uncertainty(
+def exact_answer_semantic_entropy(outputs: Iterable[Any]) -> Tuple[float, Dict[str, Any]]:
+    valid_outputs = [str(output).strip() for output in outputs if str(output).strip()]
+    if len(valid_outputs) <= 1:
+        return 0.0, {
+            "method": "exact_answer_entropy",
+            "outputs": valid_outputs,
+            "labels": ["cluster_0"] if valid_outputs else [],
+        }
+
+    label_by_answer: Dict[str, str] = {}
+    labels: List[str] = []
+    for output in valid_outputs:
+        normalized = " ".join(output.lower().split())
+        if normalized not in label_by_answer:
+            label_by_answer[normalized] = f"cluster_{len(label_by_answer)}"
+        labels.append(label_by_answer[normalized])
+
+    return semantic_entropy(labels), {
+        "method": "exact_answer_entropy",
+        "outputs": valid_outputs,
+        "labels": labels,
+    }
+
+
+async def attach_final_answer_semantic_entropy(
     result: InferenceResult,
+    judge: Optional[SemanticEntailmentJudge],
 ) -> Dict[str, Any]:
-    logprob_stats = final_answer_logprob_stats(
-        result.dataset,
-        result.raw_final_answer,
-        result.predicted_answer,
-        result.final_answer_token_logprobs,
-    )
+    question = str(result.input_dict.get("task", result.input_dict))
+    if judge is not None and judge.is_configured:
+        entropy, details = await semantic_uncertainty(
+            question,
+            result.predicted_answers,
+            judge,
+        )
+    else:
+        entropy, details = exact_answer_semantic_entropy(result.predicted_answers)
 
     return {
         "dataset": result.dataset,
         "index": result.index,
-        "raw_final_answer": result.raw_final_answer,
-        "predicted_answer": result.predicted_answer,
         "target_answer": result.target_answer,
+        "modal_predicted_answer": result.modal_predicted_answer,
         "is_correct": result.is_correct,
-        **logprob_stats,
+        "num_graph_samples": len(result.predicted_answers),
+        "semantic_entropy": entropy,
+        "semantic_method": details.get("method", "semantic_entropy"),
+        "semantic_labels": details.get("labels", []),
+        "semantic_outputs": details.get("outputs", []),
+        "predicted_answers": result.predicted_answers,
+        "raw_final_answers": result.raw_final_answers,
     }
 
 
@@ -791,20 +901,16 @@ def save_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
             fieldnames=[
                 "dataset",
                 "index",
-                "raw_final_answer",
-                "predicted_answer",
                 "target_answer",
+                "modal_predicted_answer",
                 "is_correct",
-                "final_answer_span_text",
-                "final_answer_span_start",
-                "final_answer_span_end",
-                "final_answer_token_count",
-                "final_answer_mean_logprob",
-                "final_answer_mean_probability",
-                "final_answer_logprob_uncertainty",
-                "has_extracted_answer_span",
-                "has_final_answer_logprobs",
-                "final_answer_logprob_tokens",
+                "num_graph_samples",
+                "semantic_entropy",
+                "semantic_method",
+                "semantic_labels",
+                "semantic_outputs",
+                "predicted_answers",
+                "raw_final_answers",
             ],
         )
         writer.writeheader()
@@ -812,7 +918,10 @@ def save_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
             writer.writerow(
                 {
                     **row,
-                    "final_answer_logprob_tokens": repr(row["final_answer_logprob_tokens"]),
+                    "semantic_labels": repr(row["semantic_labels"]),
+                    "semantic_outputs": repr(row["semantic_outputs"]),
+                    "predicted_answers": repr(row["predicted_answers"]),
+                    "raw_final_answers": repr(row["raw_final_answers"]),
                 }
             )
 
@@ -855,7 +964,7 @@ def plot_distribution(
         color="#FF5252",
         label="Incorrect",
     )
-    plt.xlabel("Final Agent Extracted Answer Uncertainty (-mean logprob)")
+    plt.xlabel("Final Aggregated Answer Semantic Entropy (Random Graph Resampling)")
     plt.ylabel("Probability")
     plt.title(f"{dataset_name} {mode_name} Graph")
     plt.legend()
@@ -867,10 +976,10 @@ def plot_distribution(
 
 def default_output_paths(dataset_name: str, args) -> Tuple[Path, Path]:
     output_file = args.output_file or (
-        f"result/{dataset_name}_{args.mode.lower()}_final_answer_logprob_uncertainty_distribution.png"
+        f"result/{dataset_name}_{args.mode.lower()}_semantic_entropy_distribution.png"
     )
     csv_file = args.csv_file or (
-        f"result/{dataset_name}_{args.mode.lower()}_final_answer_logprob_uncertainty_distribution.csv"
+        f"result/{dataset_name}_{args.mode.lower()}_semantic_entropy_distribution.csv"
     )
     return Path(output_file), Path(csv_file)
 
@@ -883,18 +992,15 @@ async def main():
     agent_names = [
         name for name, num in zip(bundle.agent_names, bundle.agent_nums) for _ in range(num)
     ]
-    kwargs = get_graph_kwargs(args.mode, len(agent_names))
-    graph = Graph(
-        domain=bundle.graph_domain,
-        llm_name=args.llm_name,
-        agent_names=agent_names,
-        decision_method=bundle.decision_method,
-        optimized_spatial=False,
-        optimized_temporal=False,
-        **kwargs,
+    semantic_judge = SemanticEntailmentJudge(
+        llm_name=args.semantic_judge_llm_name,
+        api_key=args.semantic_judge_api_key,
+        base_url=args.semantic_judge_base_url,
+        model_path=args.semantic_judge_model_path,
+        max_concurrency=args.semantic_judge_max_concurrency,
     )
-    graph.gcn.eval()
-    graph.mlp.eval()
+    if not semantic_judge.is_configured:
+        print("Semantic judge is not configured; falling back to exact extracted-answer entropy.")
 
     rows: List[Dict[str, Any]] = []
     correct_count = 0
@@ -906,41 +1012,41 @@ async def main():
         inference_start = time.time()
         inference_results = await asyncio.gather(
             *[
-                run_record_inference(graph, bundle, record_index, record, args)
+                run_record_inference(bundle, record_index, record, args, agent_names)
                 for record_index, record in batch
             ]
         )
         inference_seconds = time.time() - inference_start
 
-        logprob_start = time.time()
+        entropy_start = time.time()
         batch_rows = await asyncio.gather(
             *[
-                attach_final_answer_logprob_uncertainty(inference_result)
+                attach_final_answer_semantic_entropy(inference_result, semantic_judge)
                 for inference_result in inference_results
             ]
         )
-        logprob_seconds = time.time() - logprob_start
+        entropy_seconds = time.time() - entropy_start
 
         rows.extend(batch_rows)
         correct_count += sum(int(row["is_correct"]) for row in batch_rows)
         total_count += len(batch_rows)
         print(f"Accuracy so far: {correct_count / total_count:.4f}")
         print(f"Inference time: {inference_seconds:.3f}s")
-        print(f"Logprob uncertainty time: {logprob_seconds:.3f}s")
+        print(f"Semantic entropy time: {entropy_seconds:.3f}s")
 
     correct_values = [
-        row["final_answer_logprob_uncertainty"]
+        row["semantic_entropy"]
         for row in rows
         if row["is_correct"]
-        and row["final_answer_logprob_uncertainty"] is not None
-        and math.isfinite(row["final_answer_logprob_uncertainty"])
+        and row["semantic_entropy"] is not None
+        and math.isfinite(row["semantic_entropy"])
     ]
     incorrect_values = [
-        row["final_answer_logprob_uncertainty"]
+        row["semantic_entropy"]
         for row in rows
         if not row["is_correct"]
-        and row["final_answer_logprob_uncertainty"] is not None
-        and math.isfinite(row["final_answer_logprob_uncertainty"])
+        and row["semantic_entropy"] is not None
+        and math.isfinite(row["semantic_entropy"])
     ]
 
     output_file, csv_file = default_output_paths(bundle.name, args)
@@ -957,7 +1063,7 @@ async def main():
     print(f"Saved plot: {output_file}")
     print(f"Correct samples: {len(correct_values)}")
     print(f"Incorrect samples: {len(incorrect_values)}")
-    print(f"Rows with answer logprobs: {len(correct_values) + len(incorrect_values)} / {len(rows)}")
+    print(f"Rows with semantic entropy: {len(correct_values) + len(incorrect_values)} / {len(rows)}")
 
 
 if __name__ == "__main__":
