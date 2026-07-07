@@ -855,7 +855,7 @@ def plot_distribution(
         color="#FF5252",
         label="Incorrect",
     )
-    plt.xlabel("Final Extracted Answer Logprob Uncertainty (-mean logprob)")
+    plt.xlabel("Final Agent Extracted Answer Uncertainty (-mean logprob)")
     plt.ylabel("Probability")
     plt.title(f"{dataset_name} {mode_name} Graph")
     plt.legend()
