@@ -179,15 +179,6 @@ def parse_args():
         default=1,
         help="Samples per non-final agent during graph execution. Use 1 for logprob plotting.",
     )
-    parser.add_argument(
-        "--llm_max_concurrency",
-        type=int,
-        default=None,
-        help=(
-            "Max in-process concurrent LLM API requests. "
-            "Can also be set with AGENT_MAX_CONCURRENCY."
-        ),
-    )
     # KLE temporarily disabled; keep this hyperparameter ready for future re-enable.
     # parser.add_argument(
     #     "--kle_heat_t",
@@ -233,8 +224,6 @@ def parse_args():
         parser.error("--agent_names and --agent_nums must be provided together.")
     if args.num_entropy_samples < 1:
         parser.error("--num_entropy_samples must be at least 1.")
-    if args.llm_max_concurrency is not None and args.llm_max_concurrency < 1:
-        parser.error("--llm_max_concurrency must be at least 1 when provided.")
     return args
 
 
@@ -864,8 +853,6 @@ def default_output_paths(dataset_name: str, args) -> Tuple[Path, Path]:
 
 async def main():
     args = parse_args()
-    if args.llm_max_concurrency is not None:
-        os.environ["AGENT_MAX_CONCURRENCY"] = str(args.llm_max_concurrency)
     seed_everything(args.seed)
     bundle = resolve_dataset_bundle(args)
 

@@ -1,7 +1,5 @@
 import aiohttp
-import asyncio
 import math
-from contextlib import asynccontextmanager
 from typing import List, Union, Optional
 from tenacity import retry, wait_random_exponential, stop_after_attempt
 from typing import Dict, Any
@@ -18,7 +16,6 @@ from GDesigner.llm.llm_registry import LLMRegistry
 OPENAI_API_KEYS = ['']
 BASE_URL = ''
 _OPENAI_COMPATIBLE_TIMEOUT_SECONDS = 1200.0
-_ASYNC_REQUEST_SEMAPHORES: Dict[Any, Any] = {}
 
 load_dotenv()
 
@@ -47,40 +44,6 @@ def _optional_bool_env(name: str) -> Optional[bool]:
     if value is None or value == "":
         return None
     return value.strip().lower() in {"1", "true", "yes", "y", "on"}
-
-
-def _optional_positive_int_env(*names: str) -> Optional[int]:
-    for name in names:
-        value = os.getenv(name)
-        if value is None or value == "":
-            continue
-        limit = int(value)
-        if limit <= 0:
-            return None
-        return limit
-    return None
-
-
-def _async_request_semaphore() -> Optional[asyncio.Semaphore]:
-    limit = _optional_positive_int_env("AGENT_MAX_CONCURRENCY", "LLM_MAX_CONCURRENCY")
-    if limit is None:
-        return None
-    loop = asyncio.get_running_loop()
-    existing = _ASYNC_REQUEST_SEMAPHORES.get(loop)
-    if existing is None or existing[0] != limit:
-        existing = (limit, asyncio.Semaphore(limit))
-        _ASYNC_REQUEST_SEMAPHORES[loop] = existing
-    return existing[1]
-
-
-@asynccontextmanager
-async def _llm_request_slot():
-    semaphore = _async_request_semaphore()
-    if semaphore is None:
-        yield
-        return
-    async with semaphore:
-        yield
 
 
 def _chat_completion_extra_body(model: str) -> Dict[str, Any]:
@@ -119,13 +82,12 @@ async def custom_achat(
             "msg": repr(msg),
         }
     }
-    async with _llm_request_slot():
-        async with aiohttp.ClientSession() as session:
-            async with session.post(request_url, headers=headers ,json=data) as response:
-                response_data = await response.json()
-                prompt = "".join([item['content'] for item in msg])
-                cost_count(prompt,response_data['data'],model)
-                return response_data['data']
+    async with aiohttp.ClientSession() as session:
+        async with session.post(request_url, headers=headers ,json=data) as response:
+            response_data = await response.json()
+            prompt = "".join([item['content'] for item in msg])
+            cost_count(prompt,response_data['data'],model)
+            return response_data['data']
 
 
 def _message_dicts(messages: List[Message]) -> List[Dict[str, Any]]:
@@ -214,10 +176,9 @@ async def openai_compatible_achat(
     extra_body = _chat_completion_extra_body(model)
     if extra_body:
         request_kwargs["extra_body"] = extra_body
-    async with _llm_request_slot():
-        response = await AsyncOpenAI(**_openai_client_kwargs(base_url)).chat.completions.create(
-            **request_kwargs,
-        )
+    response = await AsyncOpenAI(**_openai_client_kwargs(base_url)).chat.completions.create(
+        **request_kwargs,
+    )
     outputs = [_choice_content(choice) for choice in response.choices]
     prompt = "".join([item["content"] for item in msg])
     for output in outputs:
