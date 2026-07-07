@@ -75,8 +75,9 @@ class InferenceResult:
     predicted_answer: str
     target_answer: str
     is_correct: bool
-    mean_agent_topk_token_entropy: Optional[float]
-    agent_topk_token_entropy_details: List[Dict[str, Any]]
+    mean_agent_token_logprob: Optional[float]
+    mean_agent_token_probability: Optional[float]
+    agent_token_logprob_details: List[Dict[str, Any]]
 
 
 @dataclass(frozen=True)
@@ -141,8 +142,8 @@ DATASET_DEFAULTS: Dict[str, DatasetDefaults] = {
 def parse_args():
     parser = argparse.ArgumentParser(
         description=(
-            "Plot the distribution of mean agent uncertainty from top-k token "
-            "entropy over the first generated tokens in one sampled graph per task."
+            "Plot the distribution of mean agent token probability from generated "
+            "token logprobs over the first tokens in one sampled graph per task."
         )
     )
     parser.add_argument(
@@ -186,12 +187,6 @@ def parse_args():
         help="Override dataset-specific default communication rounds.",
     )
     parser.add_argument(
-        "--topk",
-        type=int,
-        default=5,
-        help="Number of top token candidates used to compute each token entropy.",
-    )
-    parser.add_argument(
         "--k",
         type=int,
         default=16,
@@ -225,8 +220,6 @@ def parse_args():
         parser.error("--agent_names and --agent_nums must be provided together.")
     if args.num_rounds is not None and args.num_rounds < 1:
         parser.error("--num_rounds must be at least 1 when provided.")
-    if args.topk < 1:
-        parser.error("--topk must be at least 1.")
     if args.k < 1:
         parser.error("--k must be at least 1.")
     return args
@@ -727,62 +720,61 @@ def build_graph(bundle: DatasetBundle, args, agent_names: List[str]) -> Graph:
     return graph
 
 
-def top_logprob_entropy(token_info: Any, topk: int) -> Optional[float]:
-    top_entries = attr_or_key(token_info, "top_logprobs", []) or []
-    logprobs: List[float] = []
-    for entry in top_entries[:topk]:
-        logprob = attr_or_key(entry, "logprob")
-        if logprob is None:
-            continue
-        logprob = float(logprob)
-        if math.isfinite(logprob):
-            logprobs.append(logprob)
-
-    if not logprobs:
+def token_probability_from_logprob(logprob: Optional[float]) -> Optional[float]:
+    if logprob is None:
         return None
-
-    max_logprob = max(logprobs)
-    exp_values = [math.exp(logprob - max_logprob) for logprob in logprobs]
-    normalizer = sum(exp_values)
-    if normalizer <= 0:
+    logprob = float(logprob)
+    if not math.isfinite(logprob):
         return None
-
-    probabilities = [value / normalizer for value in exp_values]
-    return float(
-        -sum(probability * math.log(probability) for probability in probabilities if probability > 0)
-    )
+    return 0.0 if logprob < -745 else float(math.exp(logprob))
 
 
-def output_topk_token_entropy(
+def output_token_logprob_probability_stats(
     token_logprobs: Sequence[Any],
     k_tokens: int,
-    topk: int,
 ) -> Dict[str, Any]:
-    token_entropies = []
+    logprobs = []
+    probabilities = []
+    tokens = []
     for token_info in token_logprobs[:k_tokens]:
-        entropy = top_logprob_entropy(token_info, topk)
-        if entropy is not None and math.isfinite(entropy):
-            token_entropies.append(entropy)
+        logprob = attr_or_key(token_info, "logprob")
+        probability = attr_or_key(token_info, "probability")
+        if probability is None:
+            probability = token_probability_from_logprob(logprob)
+        if logprob is None or probability is None:
+            continue
+        logprob = float(logprob)
+        probability = float(probability)
+        if not math.isfinite(logprob) or not math.isfinite(probability):
+            continue
+        tokens.append(str(attr_or_key(token_info, "token", "")))
+        logprobs.append(logprob)
+        probabilities.append(probability)
 
-    if not token_entropies:
+    if not logprobs:
         return {
-            "entropy": None,
+            "mean_logprob": None,
+            "mean_probability": None,
             "tokens_used": 0,
-            "token_entropies": [],
+            "tokens": [],
+            "token_logprobs": [],
+            "token_probabilities": [],
         }
 
     return {
-        "entropy": float(np.mean(token_entropies)),
-        "tokens_used": len(token_entropies),
-        "token_entropies": token_entropies,
+        "mean_logprob": float(np.mean(logprobs)),
+        "mean_probability": float(np.mean(probabilities)),
+        "tokens_used": len(logprobs),
+        "tokens": tokens,
+        "token_logprobs": logprobs,
+        "token_probabilities": probabilities,
     }
 
 
-def collect_agent_topk_token_entropy(
+def collect_agent_token_logprob_probability(
     graph: Graph,
     k_tokens: int,
-    topk: int,
-) -> Tuple[Optional[float], List[Dict[str, Any]]]:
+) -> Tuple[Optional[float], Optional[float], List[Dict[str, Any]]]:
     details = []
     for node in graph.nodes.values():
         histories = node.execution_history or [
@@ -795,7 +787,7 @@ def collect_agent_topk_token_entropy(
             for output_index, token_logprobs in enumerate(
                 history.get("output_token_logprobs", [])
             ):
-                stats = output_topk_token_entropy(token_logprobs, k_tokens, topk)
+                stats = output_token_logprob_probability_stats(token_logprobs, k_tokens)
                 details.append(
                     {
                         "node_id": node.id,
@@ -803,20 +795,29 @@ def collect_agent_topk_token_entropy(
                         "role": node.role,
                         "round": history.get("round", ""),
                         "output_index": output_index,
-                        "entropy": stats["entropy"],
+                        "mean_logprob": stats["mean_logprob"],
+                        "mean_probability": stats["mean_probability"],
                         "tokens_used": stats["tokens_used"],
-                        "token_entropies": stats["token_entropies"],
+                        "tokens": stats["tokens"],
+                        "token_logprobs": stats["token_logprobs"],
+                        "token_probabilities": stats["token_probabilities"],
                     }
                 )
 
-    valid_entropies = [
-        detail["entropy"]
+    valid_logprobs = [
+        detail["mean_logprob"]
         for detail in details
-        if detail["entropy"] is not None and math.isfinite(detail["entropy"])
+        if detail["mean_logprob"] is not None and math.isfinite(detail["mean_logprob"])
     ]
-    if not valid_entropies:
-        return None, details
-    return float(np.mean(valid_entropies)), details
+    valid_probabilities = [
+        detail["mean_probability"]
+        for detail in details
+        if detail["mean_probability"] is not None
+        and math.isfinite(detail["mean_probability"])
+    ]
+    mean_logprob = float(np.mean(valid_logprobs)) if valid_logprobs else None
+    mean_probability = float(np.mean(valid_probabilities)) if valid_probabilities else None
+    return mean_logprob, mean_probability, details
 
 
 async def run_record_inference(
@@ -835,7 +836,7 @@ async def run_record_inference(
         record_execution_history=True,
         track_grad=False,
         record_node_logprobs=True,
-        node_top_logprobs=args.topk,
+        node_logprob_token_limit=args.k,
         record_decision_logprobs=False,
     )
 
@@ -843,10 +844,9 @@ async def run_record_inference(
     predicted_answer = bundle.parse_prediction(raw_answer)
     target_answer = bundle.record_to_target(record)
     is_correct = await compute_correctness(bundle, predicted_answer, target_answer)
-    mean_entropy, entropy_details = collect_agent_topk_token_entropy(
+    mean_logprob, mean_probability, logprob_details = collect_agent_token_logprob_probability(
         realized_graph,
         args.k,
-        args.topk,
     )
     return InferenceResult(
         dataset=bundle.name,
@@ -856,12 +856,13 @@ async def run_record_inference(
         predicted_answer=predicted_answer,
         target_answer=target_answer,
         is_correct=is_correct,
-        mean_agent_topk_token_entropy=mean_entropy,
-        agent_topk_token_entropy_details=entropy_details,
+        mean_agent_token_logprob=mean_logprob,
+        mean_agent_token_probability=mean_probability,
+        agent_token_logprob_details=logprob_details,
     )
 
 
-async def attach_agent_topk_token_uncertainty(
+async def attach_agent_token_logprob_probability(
     result: InferenceResult,
 ) -> Dict[str, Any]:
     return {
@@ -871,8 +872,9 @@ async def attach_agent_topk_token_uncertainty(
         "predicted_answer": result.predicted_answer,
         "target_answer": result.target_answer,
         "is_correct": result.is_correct,
-        "mean_agent_topk_token_entropy": result.mean_agent_topk_token_entropy,
-        "agent_topk_token_entropy_details": result.agent_topk_token_entropy_details,
+        "mean_agent_token_logprob": result.mean_agent_token_logprob,
+        "mean_agent_token_probability": result.mean_agent_token_probability,
+        "agent_token_logprob_details": result.agent_token_logprob_details,
     }
 
 
@@ -888,8 +890,9 @@ def save_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
                 "predicted_answer",
                 "target_answer",
                 "is_correct",
-                "mean_agent_topk_token_entropy",
-                "agent_topk_token_entropy_details",
+                "mean_agent_token_logprob",
+                "mean_agent_token_probability",
+                "agent_token_logprob_details",
             ],
         )
         writer.writeheader()
@@ -897,8 +900,8 @@ def save_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
             writer.writerow(
                 {
                     **row,
-                    "agent_topk_token_entropy_details": repr(
-                        row["agent_topk_token_entropy_details"]
+                    "agent_token_logprob_details": repr(
+                        row["agent_token_logprob_details"]
                     ),
                 }
             )
@@ -942,7 +945,7 @@ def plot_distribution(
         color="#FF5252",
         label="Incorrect",
     )
-    plt.xlabel("Mean Agent Top-k Token Entropy (First K Tokens)")
+    plt.xlabel("Mean Agent Token Probability (First K Tokens)")
     plt.ylabel("Probability")
     plt.title(f"{dataset_name} {mode_name} Graph")
     plt.legend()
@@ -954,10 +957,10 @@ def plot_distribution(
 
 def default_output_paths(dataset_name: str, args) -> Tuple[Path, Path]:
     output_file = args.output_file or (
-        f"result/{dataset_name}_{args.mode.lower()}_agent_topk_token_entropy_distribution.png"
+        f"result/{dataset_name}_{args.mode.lower()}_agent_token_probability_distribution.png"
     )
     csv_file = args.csv_file or (
-        f"result/{dataset_name}_{args.mode.lower()}_agent_topk_token_entropy_distribution.csv"
+        f"result/{dataset_name}_{args.mode.lower()}_agent_token_probability_distribution.csv"
     )
     return Path(output_file), Path(csv_file)
 
@@ -990,7 +993,7 @@ async def main():
         uncertainty_start = time.time()
         batch_rows = await asyncio.gather(
             *[
-                attach_agent_topk_token_uncertainty(inference_result)
+                attach_agent_token_logprob_probability(inference_result)
                 for inference_result in inference_results
             ]
         )
@@ -1001,21 +1004,21 @@ async def main():
         total_count += len(batch_rows)
         print(f"Accuracy so far: {correct_count / total_count:.4f}")
         print(f"Inference time: {inference_seconds:.3f}s")
-        print(f"Top-k token entropy time: {uncertainty_seconds:.3f}s")
+        print(f"Token logprob probability time: {uncertainty_seconds:.3f}s")
 
     correct_values = [
-        row["mean_agent_topk_token_entropy"]
+        row["mean_agent_token_probability"]
         for row in rows
         if row["is_correct"]
-        and row["mean_agent_topk_token_entropy"] is not None
-        and math.isfinite(row["mean_agent_topk_token_entropy"])
+        and row["mean_agent_token_probability"] is not None
+        and math.isfinite(row["mean_agent_token_probability"])
     ]
     incorrect_values = [
-        row["mean_agent_topk_token_entropy"]
+        row["mean_agent_token_probability"]
         for row in rows
         if not row["is_correct"]
-        and row["mean_agent_topk_token_entropy"] is not None
-        and math.isfinite(row["mean_agent_topk_token_entropy"])
+        and row["mean_agent_token_probability"] is not None
+        and math.isfinite(row["mean_agent_token_probability"])
     ]
 
     output_file, csv_file = default_output_paths(bundle.name, args)
@@ -1032,7 +1035,7 @@ async def main():
     print(f"Saved plot: {output_file}")
     print(f"Correct samples: {len(correct_values)}")
     print(f"Incorrect samples: {len(incorrect_values)}")
-    print(f"Rows with top-k token entropy: {len(correct_values) + len(incorrect_values)} / {len(rows)}")
+    print(f"Rows with token probability: {len(correct_values) + len(incorrect_values)} / {len(rows)}")
 
 
 if __name__ == "__main__":

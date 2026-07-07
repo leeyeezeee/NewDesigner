@@ -48,7 +48,6 @@ class MathSolver(Node):
         response = self.llm.gen(
             message,
             return_logprobs=kwargs.get("return_logprobs", False),
-            top_logprobs=kwargs.get("top_logprobs"),
         )
         return response
 
@@ -61,7 +60,6 @@ class MathSolver(Node):
         response = await self.llm.agen(
             message,
             return_logprobs=kwargs.get("return_logprobs", False),
-            top_logprobs=kwargs.get("top_logprobs"),
         )
         if self.role == "Programming Expert":
             response_text = response.content if isinstance(response, LLMGeneration) else response

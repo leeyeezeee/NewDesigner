@@ -512,7 +512,7 @@ class Graph(ABC):
                   track_grad: bool = True,
                   edge_selector = None,
                   record_node_logprobs: bool = False,
-                  node_top_logprobs: Optional[int] = None,
+                  node_logprob_token_limit: Optional[int] = None,
                   record_decision_logprobs: bool = False,) -> List[Any]:
         # inputs:{'task':"xxx"}
         log_probs = 0
@@ -540,7 +540,7 @@ class Graph(ABC):
                             num_entropy_samples=num_entropy_samples,
                             record_execution_history=record_execution_history,
                             return_logprobs=record_node_logprobs,
-                            top_logprobs=node_top_logprobs,
+                            logprob_token_limit=node_logprob_token_limit,
                         ) # output is saved in the node.outputs
                         break
                     except Exception as e:
@@ -582,7 +582,7 @@ class Graph(ABC):
                   track_grad: bool = True,
                   edge_selector = None,
                   record_node_logprobs: bool = False,
-                  node_top_logprobs: Optional[int] = None,
+                  node_logprob_token_limit: Optional[int] = None,
                   record_decision_logprobs: bool = False,) -> List[Any]:
         # inputs:{'task':"xxx"}
         log_probs = 0
@@ -611,7 +611,7 @@ class Graph(ABC):
                                 num_entropy_samples=num_entropy_samples,
                                 record_execution_history=record_execution_history,
                                 return_logprobs=record_node_logprobs,
-                                top_logprobs=node_top_logprobs,
+                                logprob_token_limit=node_logprob_token_limit,
                             ),
                             timeout=max_time,
                         ) # output is saved in the node.outputs

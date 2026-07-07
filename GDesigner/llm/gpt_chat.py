@@ -134,21 +134,6 @@ def _choice_token_logprobs(choice: Any) -> List[TokenLogProb]:
         token = _get_attr_or_key(token_info, "token", "")
         logprob = _get_attr_or_key(token_info, "logprob")
         token_bytes = _get_attr_or_key(token_info, "bytes")
-        top_logprobs = []
-        for top_info in _get_attr_or_key(token_info, "top_logprobs", []) or []:
-            top_token = _get_attr_or_key(top_info, "token", "")
-            top_logprob = _get_attr_or_key(top_info, "logprob")
-            top_bytes = _get_attr_or_key(top_info, "bytes")
-            if top_logprob is not None:
-                top_logprob = float(top_logprob)
-            top_logprobs.append(
-                {
-                    "token": str(top_token),
-                    "logprob": top_logprob,
-                    "probability": _probability_from_logprob(top_logprob),
-                    "bytes": top_bytes,
-                }
-            )
         if logprob is not None:
             logprob = float(logprob)
         token_logprobs.append(
@@ -157,7 +142,6 @@ def _choice_token_logprobs(choice: Any) -> List[TokenLogProb]:
                 logprob=logprob,
                 probability=_probability_from_logprob(logprob),
                 bytes=token_bytes,
-                top_logprobs=top_logprobs,
             )
         )
     return token_logprobs

@@ -52,7 +52,6 @@ class AnalyzeAgent(Node):
         response = self.llm.gen(
             message,
             return_logprobs=kwargs.get("return_logprobs", False),
-            top_logprobs=kwargs.get("top_logprobs"),
         )
         return response
 
@@ -64,7 +63,6 @@ class AnalyzeAgent(Node):
         response = await self.llm.agen(
             message,
             return_logprobs=kwargs.get("return_logprobs", False),
-            top_logprobs=kwargs.get("top_logprobs"),
         )
         if self.wiki_summary != "":
             if isinstance(response, LLMGeneration):

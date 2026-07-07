@@ -46,7 +46,6 @@ class AdverarialAgent(Node):
         response = self.llm.gen(
             message,
             return_logprobs=kwargs.get("return_logprobs", False),
-            top_logprobs=kwargs.get("top_logprobs"),
         )
         return response
 
@@ -58,6 +57,5 @@ class AdverarialAgent(Node):
         response = await self.llm.agen(
             message,
             return_logprobs=kwargs.get("return_logprobs", False),
-            top_logprobs=kwargs.get("top_logprobs"),
         )
         return response

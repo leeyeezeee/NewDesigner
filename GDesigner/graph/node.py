@@ -183,7 +183,10 @@ class Node(ABC):
         })
 
     @staticmethod
-    def _as_output_and_logprob_lists(result: Any) -> tuple[List[Any], List[Any]]:
+    def _as_output_and_logprob_lists(
+        result: Any,
+        logprob_token_limit: Optional[int] = None,
+    ) -> tuple[List[Any], List[Any]]:
         if isinstance(result, list):
             results = result
         else:
@@ -194,14 +197,24 @@ class Node(ABC):
         for item in results:
             if isinstance(item, LLMGeneration):
                 outputs.append(item.content)
-                token_logprobs.append(list(item.token_logprobs))
+                item_logprobs = list(item.token_logprobs)
+                if logprob_token_limit is not None:
+                    item_logprobs = item_logprobs[:logprob_token_limit]
+                token_logprobs.append(item_logprobs)
             else:
                 outputs.append(item)
                 token_logprobs.append([])
         return outputs, token_logprobs
 
-    def _set_execution_outputs(self, results: List[Any]):
-        split_results = [self._as_output_and_logprob_lists(result) for result in results]
+    def _set_execution_outputs(
+        self,
+        results: List[Any],
+        logprob_token_limit: Optional[int] = None,
+    ):
+        split_results = [
+            self._as_output_and_logprob_lists(result, logprob_token_limit)
+            for result in results
+        ]
         output_groups = [outputs for outputs, _token_logprobs in split_results]
         token_logprob_groups = [
             token_logprobs for _outputs, token_logprobs in split_results
@@ -223,6 +236,7 @@ class Node(ABC):
         round_idx = kwargs.pop("round_idx", None)
         num_entropy_samples = kwargs.pop("num_entropy_samples", 1)
         record_execution_history = kwargs.pop("record_execution_history", True)
+        logprob_token_limit = kwargs.pop("logprob_token_limit", None)
         num_entropy_samples = max(1, int(num_entropy_samples))
         self.outputs = []
         self.entropy_samples = []
@@ -233,7 +247,7 @@ class Node(ABC):
             for _ in range(num_entropy_samples)
         ]
 
-        self._set_execution_outputs(results)
+        self._set_execution_outputs(results, logprob_token_limit)
         if record_execution_history:
             self._record_execution(round_idx, spatial_info, temporal_info)
         return self.outputs
@@ -243,6 +257,7 @@ class Node(ABC):
         round_idx = kwargs.pop("round_idx", None)
         num_entropy_samples = kwargs.pop("num_entropy_samples", 1)
         record_execution_history = kwargs.pop("record_execution_history", True)
+        logprob_token_limit = kwargs.pop("logprob_token_limit", None)
         num_entropy_samples = max(1, int(num_entropy_samples))
 
         self.outputs = []
@@ -254,7 +269,7 @@ class Node(ABC):
             for _ in range(num_entropy_samples)
         ]
         results = await asyncio.gather(*tasks, return_exceptions=False)
-        self._set_execution_outputs(results)
+        self._set_execution_outputs(results, logprob_token_limit)
         if record_execution_history:
             self._record_execution(round_idx, spatial_info, temporal_info)
         return self.outputs
