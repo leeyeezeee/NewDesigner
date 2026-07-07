@@ -510,7 +510,8 @@ class Graph(ABC):
                   num_entropy_samples: int = 1,
                   record_execution_history: bool = True,
                   track_grad: bool = True,
-                  edge_selector = None,) -> List[Any]:
+                  edge_selector = None,
+                  record_decision_logprobs: bool = False,) -> List[Any]:
         # inputs:{'task':"xxx"}
         log_probs = 0
         self.edge_log_probs = []
@@ -554,7 +555,10 @@ class Graph(ABC):
         tries = 0
         while tries < _DECISION_NODE_MAX_TRIES:
             try:
-                self.decision_node.execute(inputs)
+                self.decision_node.execute(
+                    inputs,
+                    return_logprobs=record_decision_logprobs,
+                )
                 break
             except Exception as e:
                 print(f"Error during execution of decision node: {e}")
@@ -572,7 +576,8 @@ class Graph(ABC):
                   num_entropy_samples: int = 1,
                   record_execution_history: bool = True,
                   track_grad: bool = True,
-                  edge_selector = None,) -> List[Any]:
+                  edge_selector = None,
+                  record_decision_logprobs: bool = False,) -> List[Any]:
         # inputs:{'task':"xxx"}
         log_probs = 0
         self.edge_log_probs = []
@@ -620,7 +625,10 @@ class Graph(ABC):
         while tries < _DECISION_NODE_MAX_TRIES:
             try:
                 await asyncio.wait_for(
-                    self.decision_node.async_execute(input),
+                    self.decision_node.async_execute(
+                        input,
+                        return_logprobs=record_decision_logprobs,
+                    ),
                     timeout=_DECISION_NODE_TIMEOUT_SECONDS,
                 )
                 break

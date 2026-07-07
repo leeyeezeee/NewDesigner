@@ -1,7 +1,22 @@
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import List, Union, Optional
 
 from GDesigner.llm.format import Message
+
+
+@dataclass(frozen=True)
+class TokenLogProb:
+    token: str
+    logprob: Optional[float]
+    probability: Optional[float] = None
+    bytes: Optional[List[int]] = None
+
+
+@dataclass(frozen=True)
+class LLMGeneration:
+    content: str
+    token_logprobs: List[TokenLogProb]
 
 
 class LLM(ABC):
@@ -16,7 +31,9 @@ class LLM(ABC):
         max_tokens: Optional[int] = None,
         temperature: Optional[float] = None,
         num_comps: Optional[int] = None,
-        ) -> Union[List[str], str]:
+        return_logprobs: bool = False,
+        top_logprobs: Optional[int] = None,
+        ) -> Union[List[str], str, List[LLMGeneration], LLMGeneration]:
 
         pass
 
@@ -27,6 +44,8 @@ class LLM(ABC):
         max_tokens: Optional[int] = None,
         temperature: Optional[float] = None,
         num_comps: Optional[int] = None,
-        ) -> Union[List[str], str]:
+        return_logprobs: bool = False,
+        top_logprobs: Optional[int] = None,
+        ) -> Union[List[str], str, List[LLMGeneration], LLMGeneration]:
 
         pass

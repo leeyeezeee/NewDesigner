@@ -2,9 +2,22 @@ from typing import List,Any,Dict
 
 from GDesigner.graph.node import Node
 from GDesigner.agents.agent_registry import AgentRegistry
+from GDesigner.llm.llm import LLMGeneration
 from GDesigner.llm.llm_registry import LLMRegistry
 from GDesigner.prompt.prompt_set_registry import PromptSetRegistry
 from GDesigner.tools.coding.python_executor import PyExecutor
+
+
+def _store_generation_metadata(node: Node, response):
+    if isinstance(response, LLMGeneration):
+        node.last_response_text = response.content
+        node.last_response_token_logprobs = list(response.token_logprobs)
+        return response.content
+
+    node.last_response_text = response if isinstance(response, str) else str(response)
+    node.last_response_token_logprobs = []
+    return response
+
 
 @AgentRegistry.register('FinalWriteCode')
 class FinalWriteCode(Node):
@@ -12,6 +25,8 @@ class FinalWriteCode(Node):
         super().__init__(id, "FinalWriteCode" ,domain, llm_name)
         self.llm = LLMRegistry.get(llm_name)
         self.prompt_set = PromptSetRegistry.get(domain)
+        self.last_response_text = ""
+        self.last_response_token_logprobs = []
 
     def extract_example(self, prompt: str) -> list:
         prompt = prompt['task']
@@ -52,8 +67,11 @@ class FinalWriteCode(Node):
   
         system_prompt, user_prompt = self._process_inputs(input, spatial_info, temporal_info)
         message = [{'role':'system','content':system_prompt},{'role':'user','content':user_prompt}]
-        response = self.llm.gen(message)
-        return response
+        response = self.llm.gen(
+            message,
+            return_logprobs=kwargs.get("return_logprobs", False),
+        )
+        return _store_generation_metadata(self, response)
     
     async def _async_execute(self, input:Dict[str,str],  spatial_info:Dict[str,Any], temporal_info:Dict[str,Any],**kwargs):
         """ To be overriden by the descendant class """
@@ -61,8 +79,11 @@ class FinalWriteCode(Node):
   
         system_prompt, user_prompt = self._process_inputs(input, spatial_info, temporal_info)
         message = [{'role':'system','content':system_prompt},{'role':'user','content':user_prompt}]
-        response = await self.llm.agen(message)
-        return response
+        response = await self.llm.agen(
+            message,
+            return_logprobs=kwargs.get("return_logprobs", False),
+        )
+        return _store_generation_metadata(self, response)
 
 
 @AgentRegistry.register('FinalRefer')
@@ -71,6 +92,8 @@ class FinalRefer(Node):
         super().__init__(id, "FinalRefer" ,domain, llm_name)
         self.llm = LLMRegistry.get(llm_name)
         self.prompt_set = PromptSetRegistry.get(domain)
+        self.last_response_text = ""
+        self.last_response_token_logprobs = []
 
     def _process_inputs(self, raw_inputs:Dict[str,str], spatial_info:Dict[str,Any], temporal_info:Dict[str,Any], **kwargs)->List[Any]:
         """ To be overriden by the descendant class """
@@ -92,8 +115,11 @@ class FinalRefer(Node):
   
         system_prompt, user_prompt = self._process_inputs(input, spatial_info, temporal_info)
         message = [{'role':'system','content':system_prompt},{'role':'user','content':user_prompt}]
-        response = self.llm.gen(message)
-        return response
+        response = self.llm.gen(
+            message,
+            return_logprobs=kwargs.get("return_logprobs", False),
+        )
+        return _store_generation_metadata(self, response)
     
     async def _async_execute(self, input:Dict[str,str],  spatial_info:Dict[str,Any], temporal_info:Dict[str,Any],**kwargs):
         """ To be overriden by the descendant class """
@@ -101,8 +127,11 @@ class FinalRefer(Node):
   
         system_prompt, user_prompt = self._process_inputs(input, spatial_info, temporal_info)
         message = [{'role':'system','content':system_prompt},{'role':'user','content':user_prompt}]
-        response = await self.llm.agen(message)
-        return response
+        response = await self.llm.agen(
+            message,
+            return_logprobs=kwargs.get("return_logprobs", False),
+        )
+        return _store_generation_metadata(self, response)
 
 @AgentRegistry.register('FinalDirect')
 class FinalDirect(Node):

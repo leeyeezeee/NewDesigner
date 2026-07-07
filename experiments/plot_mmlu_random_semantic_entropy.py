@@ -2,8 +2,10 @@ import argparse
 import asyncio
 import copy
 import csv
+import math
 import os
 import random
+import re
 import sys
 import time
 from dataclasses import dataclass
@@ -23,7 +25,6 @@ sys.stdout.reconfigure(encoding="utf-8")
 from GDesigner.graph.graph import Graph
 from GDesigner.tools.coding.python_executor import PyExecutor
 from GDesigner.tools.reader.readers import JSONLReader, JSONReader
-from GDesigner.utils.uncertainty import SemanticEntailmentJudge, semantic_uncertainty
 from datasets.MMLU.download import download as download_mmlu
 from datasets.aqua_dataset import aqua_data_process, aqua_get_predict
 from datasets.gsm8k_dataset import (
@@ -70,9 +71,18 @@ class InferenceResult:
     index: int
     input_dict: Dict[str, Any]
     realized_graph: Graph
+    raw_final_answer: str
+    final_answer_token_logprobs: List[Any]
     predicted_answer: str
     target_answer: str
     is_correct: bool
+
+
+@dataclass(frozen=True)
+class AnswerSpan:
+    text: str
+    start: int
+    end: int
 
 
 DATASET_DEFAULTS: Dict[str, DatasetDefaults] = {
@@ -124,8 +134,8 @@ DATASET_DEFAULTS: Dict[str, DatasetDefaults] = {
 def parse_args():
     parser = argparse.ArgumentParser(
         description=(
-            "Plot the post-communication distribution of average agent semantic "
-            "entropy for correct vs incorrect samples."
+            "Plot the post-communication distribution of final extracted-answer "
+            "logprob uncertainty for correct vs incorrect samples."
         )
     )
     parser.add_argument(
@@ -166,8 +176,8 @@ def parse_args():
     parser.add_argument(
         "--num_entropy_samples",
         type=int,
-        default=4,
-        help="Samples per agent used to estimate KHEAT uncertainty. Use at least 2.",
+        default=1,
+        help="Samples per non-final agent during graph execution. Use 1 for logprob plotting.",
     )
     # KLE temporarily disabled; keep this hyperparameter ready for future re-enable.
     # parser.add_argument(
@@ -186,15 +196,15 @@ def parse_args():
     parser.add_argument("--decision_method", type=str, default=None)
     parser.add_argument("--agent_names", nargs="+", type=str, default=None)
     parser.add_argument("--agent_nums", nargs="+", type=int, default=None)
-    parser.add_argument("--semantic_judge_llm_name", type=str, default="gpt-4o-mini")
-    parser.add_argument("--semantic_judge_api_key", type=str, default="")
-    parser.add_argument("--semantic_judge_base_url", type=str, default="")
-    parser.add_argument("--semantic_judge_model_path", type=str, default="")
+    parser.add_argument("--semantic_judge_llm_name", type=str, default="", help=argparse.SUPPRESS)
+    parser.add_argument("--semantic_judge_api_key", type=str, default="", help=argparse.SUPPRESS)
+    parser.add_argument("--semantic_judge_base_url", type=str, default="", help=argparse.SUPPRESS)
+    parser.add_argument("--semantic_judge_model_path", type=str, default="", help=argparse.SUPPRESS)
     parser.add_argument(
         "--semantic_judge_max_concurrency",
         type=int,
         default=None,
-        help="Maximum concurrent semantic judge requests. Defaults to env or 16.",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument("--humaneval_timeout", type=int, default=100)
     parser.add_argument("--bins", type=int, default=25)
@@ -212,8 +222,8 @@ def parse_args():
             parser.error("The number of agent names must match the number of agent counts.")
     elif args.agent_names is not None or args.agent_nums is not None:
         parser.error("--agent_names and --agent_nums must be provided together.")
-    if args.num_entropy_samples < 2:
-        parser.error("--num_entropy_samples must be at least 2 to estimate KHEAT uncertainty.")
+    if args.num_entropy_samples < 1:
+        parser.error("--num_entropy_samples must be at least 1.")
     return args
 
 
@@ -481,41 +491,204 @@ def iter_batches(items: Iterable[Any], batch_size: int, limit: Optional[int]):
         yield batch
 
 
-def decision_agent_nodes(graph) -> List[Any]:
-    participants = [
-        node for node in graph.decision_node.spatial_predecessors if node.id in graph.nodes
-    ]
-    return participants or list(graph.nodes.values())
+def attr_or_key(value: Any, name: str, default: Any = None) -> Any:
+    if isinstance(value, dict):
+        return value.get(name, default)
+    return getattr(value, name, default)
 
 
-async def average_agent_semantic_entropy(
-    graph,
-    question: str,
-    judge: SemanticEntailmentJudge,
-    heat_t: float = 0.3,
-) -> Tuple[float, Dict[str, float]]:
-    agents = decision_agent_nodes(graph)
-    entropy_tasks = []
-    entropy_nodes = []
+def token_char_spans(token_logprobs: Sequence[Any]) -> Tuple[str, List[Dict[str, Any]]]:
+    reconstructed_parts = []
+    spans = []
+    cursor = 0
+    for token_info in token_logprobs:
+        token = str(attr_or_key(token_info, "token", ""))
+        logprob = attr_or_key(token_info, "logprob")
+        probability = attr_or_key(token_info, "probability")
+        if logprob is not None:
+            logprob = float(logprob)
+        if probability is None and logprob is not None:
+            probability = 0.0 if logprob < -745 else math.exp(logprob)
 
-    for node in agents:
-        samples = list(node.entropy_samples) or list(node.outputs)
-        samples = [str(sample) for sample in samples if str(sample).strip()]
-        if not samples:
-            continue
-        entropy_nodes.append(node)
-        entropy_tasks.append(semantic_uncertainty(question, samples, judge, heat_t=heat_t))
+        start = cursor
+        end = start + len(token)
+        reconstructed_parts.append(token)
+        spans.append(
+            {
+                "token": token,
+                "start": start,
+                "end": end,
+                "logprob": logprob,
+                "probability": probability,
+            }
+        )
+        cursor = end
+    return "".join(reconstructed_parts), spans
 
-    if not entropy_tasks:
-        return 0.0, {}
 
-    entropy_results = await asyncio.gather(*entropy_tasks)
-    per_agent_entropy = {
-        node.id: float(entropy)
-        for node, (entropy, _labels) in zip(entropy_nodes, entropy_results)
+def substring_span(
+    text: str,
+    needle: str,
+    start: int = 0,
+    last: bool = False,
+    case_sensitive: bool = True,
+) -> Optional[AnswerSpan]:
+    if not needle:
+        return None
+    haystack = text if case_sensitive else text.lower()
+    target = needle if case_sensitive else needle.lower()
+    index = haystack.rfind(target, start) if last else haystack.find(target, start)
+    if index < 0:
+        return None
+    end = index + len(needle)
+    return AnswerSpan(text=text[index:end], start=index, end=end)
+
+
+def last_digit_span(text: str, answer: str, start: int = 0) -> Optional[AnswerSpan]:
+    if not answer:
+        return None
+    matches = list(re.finditer(r"\d+", text[start:]))
+    for match in reversed(matches):
+        if match.group(0) == answer:
+            span_start = start + match.start()
+            span_end = start + match.end()
+            return AnswerSpan(text=text[span_start:span_end], start=span_start, end=span_end)
+    return None
+
+
+def last_upper_letter_span(text: str, answer: str, start: int = 0) -> Optional[AnswerSpan]:
+    if len(answer) != 1 or not answer.isupper():
+        return None
+    matches = list(re.finditer(r"[A-Z]", text[start:]))
+    for match in reversed(matches):
+        if match.group(0) == answer:
+            span_start = start + match.start()
+            span_end = start + match.end()
+            return AnswerSpan(text=text[span_start:span_end], start=span_start, end=span_end)
+    return None
+
+
+def locate_mmlu_answer_span(text: str, answer: str) -> Optional[AnswerSpan]:
+    marker = "answer is"
+    marker_index = text.find(marker)
+    if marker_index >= 0:
+        marker_end = marker_index + len(marker)
+        return substring_span(text, answer, marker_end)
+    if text and answer and text[0] == answer:
+        return AnswerSpan(text=text[0], start=0, end=1)
+    return substring_span(text, answer)
+
+
+def locate_math_answer_span(text: str, answer: str) -> Optional[AnswerSpan]:
+    for marker in ("The answer is ", "the answer is "):
+        marker_index = text.rfind(marker)
+        if marker_index >= 0:
+            marker_end = marker_index + len(marker)
+            return (
+                last_digit_span(text, answer, marker_end)
+                or substring_span(text, answer, marker_end)
+            )
+    return last_digit_span(text, answer) or substring_span(text, answer, last=True)
+
+
+def locate_aqua_answer_span(text: str, answer: str) -> Optional[AnswerSpan]:
+    for marker in ("The answer is ", "the answer is "):
+        marker_index = text.rfind(marker)
+        if marker_index >= 0:
+            marker_end = marker_index + len(marker)
+            return (
+                last_upper_letter_span(text, answer, marker_end)
+                or substring_span(text, answer, marker_end)
+            )
+    return last_upper_letter_span(text, answer) or substring_span(text, answer, last=True)
+
+
+def locate_humaneval_answer_span(text: str, answer: str) -> Optional[AnswerSpan]:
+    exact_span = substring_span(text, answer)
+    if exact_span is not None:
+        return exact_span
+    stripped_answer = answer.strip()
+    if stripped_answer and stripped_answer != answer:
+        return substring_span(text, stripped_answer)
+    return None
+
+
+def locate_extracted_answer_span(
+    dataset_name: str,
+    response_text: str,
+    extracted_answer: str,
+) -> Optional[AnswerSpan]:
+    answer = "" if extracted_answer is None else str(extracted_answer)
+    if not answer:
+        return None
+    if dataset_name == "mmlu":
+        return locate_mmlu_answer_span(response_text, answer)
+    if dataset_name in {"gsm8k", "svamp", "multiarith"}:
+        return locate_math_answer_span(response_text, answer)
+    if dataset_name == "aqua":
+        return locate_aqua_answer_span(response_text, answer)
+    if dataset_name == "humaneval":
+        return locate_humaneval_answer_span(response_text, answer)
+    return substring_span(response_text, answer)
+
+
+def final_answer_logprob_stats(
+    dataset_name: str,
+    response_text: str,
+    extracted_answer: str,
+    token_logprobs: Sequence[Any],
+) -> Dict[str, Any]:
+    reconstructed_text, token_spans = token_char_spans(token_logprobs)
+    span_text_source = reconstructed_text or response_text
+    answer_span = locate_extracted_answer_span(
+        dataset_name,
+        span_text_source,
+        extracted_answer,
+    )
+    stats = {
+        "final_answer_span_text": answer_span.text if answer_span else "",
+        "final_answer_span_start": answer_span.start if answer_span else "",
+        "final_answer_span_end": answer_span.end if answer_span else "",
+        "final_answer_token_count": 0,
+        "final_answer_mean_logprob": None,
+        "final_answer_mean_probability": None,
+        "final_answer_logprob_uncertainty": None,
+        "final_answer_logprob_tokens": [],
+        "has_extracted_answer_span": answer_span is not None,
+        "has_final_answer_logprobs": bool(token_spans),
     }
-    average_entropy = float(np.mean(list(per_agent_entropy.values())))
-    return average_entropy, per_agent_entropy
+    if answer_span is None or not token_spans:
+        return stats
+
+    overlapping_tokens = [
+        token_span
+        for token_span in token_spans
+        if token_span["end"] > answer_span.start and token_span["start"] < answer_span.end
+        and token_span["logprob"] is not None
+        and math.isfinite(token_span["logprob"])
+    ]
+    if not overlapping_tokens:
+        return stats
+
+    logprobs = [token_span["logprob"] for token_span in overlapping_tokens]
+    mean_logprob = float(np.mean(logprobs))
+    stats.update(
+        {
+            "final_answer_token_count": len(overlapping_tokens),
+            "final_answer_mean_logprob": mean_logprob,
+            "final_answer_mean_probability": float(math.exp(mean_logprob)),
+            "final_answer_logprob_uncertainty": float(-mean_logprob),
+            "final_answer_logprob_tokens": [
+                {
+                    "token": token_span["token"],
+                    "logprob": token_span["logprob"],
+                    "probability": token_span["probability"],
+                }
+                for token_span in overlapping_tokens
+            ],
+        }
+    )
+    return stats
 
 
 async def compute_correctness(bundle: DatasetBundle, predicted: str, target: str) -> bool:
@@ -543,8 +716,10 @@ async def run_record_inference(
         num_entropy_samples=args.num_entropy_samples,
         record_execution_history=False,
         track_grad=False,
+        record_decision_logprobs=True,
     )
 
+    raw_final_answer = first_answer(raw_answer)
     predicted_answer = bundle.parse_prediction(raw_answer)
     target_answer = bundle.record_to_target(record)
     is_correct = await compute_correctness(bundle, predicted_answer, target_answer)
@@ -553,32 +728,34 @@ async def run_record_inference(
         index=record_index,
         input_dict=input_dict,
         realized_graph=realized_graph,
+        raw_final_answer=raw_final_answer,
+        final_answer_token_logprobs=list(
+            getattr(realized_graph.decision_node, "last_response_token_logprobs", [])
+        ),
         predicted_answer=predicted_answer,
         target_answer=target_answer,
         is_correct=is_correct,
     )
 
 
-async def attach_semantic_entropy(
+async def attach_final_answer_logprob_uncertainty(
     result: InferenceResult,
-    judge: SemanticEntailmentJudge,
-    heat_t: float = 0.3,
 ) -> Dict[str, Any]:
-    avg_entropy, per_agent_entropy = await average_agent_semantic_entropy(
-        result.realized_graph,
-        result.input_dict["task"],
-        judge,
-        heat_t=heat_t,
+    logprob_stats = final_answer_logprob_stats(
+        result.dataset,
+        result.raw_final_answer,
+        result.predicted_answer,
+        result.final_answer_token_logprobs,
     )
 
     return {
         "dataset": result.dataset,
         "index": result.index,
+        "raw_final_answer": result.raw_final_answer,
         "predicted_answer": result.predicted_answer,
         "target_answer": result.target_answer,
         "is_correct": result.is_correct,
-        "average_agent_semantic_entropy": avg_entropy,
-        "per_agent_semantic_entropy": per_agent_entropy,
+        **logprob_stats,
     }
 
 
@@ -590,11 +767,20 @@ def save_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
             fieldnames=[
                 "dataset",
                 "index",
+                "raw_final_answer",
                 "predicted_answer",
                 "target_answer",
                 "is_correct",
-                "average_agent_semantic_entropy",
-                "per_agent_semantic_entropy",
+                "final_answer_span_text",
+                "final_answer_span_start",
+                "final_answer_span_end",
+                "final_answer_token_count",
+                "final_answer_mean_logprob",
+                "final_answer_mean_probability",
+                "final_answer_logprob_uncertainty",
+                "has_extracted_answer_span",
+                "has_final_answer_logprobs",
+                "final_answer_logprob_tokens",
             ],
         )
         writer.writeheader()
@@ -602,7 +788,7 @@ def save_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
             writer.writerow(
                 {
                     **row,
-                    "per_agent_semantic_entropy": repr(row["per_agent_semantic_entropy"]),
+                    "final_answer_logprob_tokens": repr(row["final_answer_logprob_tokens"]),
                 }
             )
 
@@ -645,12 +831,11 @@ def plot_distribution(
         color="#FF5252",
         label="Incorrect",
     )
-    plt.xlabel("Average Agent KHEAT Uncertainty")
+    plt.xlabel("Final Extracted Answer Logprob Uncertainty (-mean logprob)")
     plt.ylabel("Probability")
     plt.title(f"{dataset_name} {mode_name} Graph")
     plt.legend()
     plt.grid(axis="y", alpha=0.2)
-    plt.gca().invert_xaxis()
     plt.tight_layout()
     plt.savefig(output_file, dpi=300)
     plt.close()
@@ -658,10 +843,10 @@ def plot_distribution(
 
 def default_output_paths(dataset_name: str, args) -> Tuple[Path, Path]:
     output_file = args.output_file or (
-        f"result/{dataset_name}_{args.mode.lower()}_semantic_entropy_distribution.png"
+        f"result/{dataset_name}_{args.mode.lower()}_final_answer_logprob_uncertainty_distribution.png"
     )
     csv_file = args.csv_file or (
-        f"result/{dataset_name}_{args.mode.lower()}_semantic_entropy_distribution.csv"
+        f"result/{dataset_name}_{args.mode.lower()}_final_answer_logprob_uncertainty_distribution.csv"
     )
     return Path(output_file), Path(csv_file)
 
@@ -687,21 +872,6 @@ async def main():
     graph.gcn.eval()
     graph.mlp.eval()
 
-    judge = SemanticEntailmentJudge(
-        llm_name=args.semantic_judge_llm_name,
-        api_key=args.semantic_judge_api_key,
-        base_url=args.semantic_judge_base_url,
-        model_path=args.semantic_judge_model_path,
-        max_concurrency=args.semantic_judge_max_concurrency,
-    )
-    if not judge.is_configured:
-        raise RuntimeError(
-            "Semantic judge is not configured. Set OPENAI_API_KEY or pass "
-            "--semantic_judge_api_key; for local vLLM, pass "
-            "--semantic_judge_base_url http://localhost:8000/v1."
-        )
-    print(f"Semantic judge max concurrency: {judge.max_concurrency}")
-
     rows: List[Dict[str, Any]] = []
     correct_count = 0
     total_count = 0
@@ -718,27 +888,35 @@ async def main():
         )
         inference_seconds = time.time() - inference_start
 
-        entropy_start = time.time()
+        logprob_start = time.time()
         batch_rows = await asyncio.gather(
             *[
-                attach_semantic_entropy(inference_result, judge)
+                attach_final_answer_logprob_uncertainty(inference_result)
                 for inference_result in inference_results
             ]
         )
-        entropy_seconds = time.time() - entropy_start
+        logprob_seconds = time.time() - logprob_start
 
         rows.extend(batch_rows)
         correct_count += sum(int(row["is_correct"]) for row in batch_rows)
         total_count += len(batch_rows)
         print(f"Accuracy so far: {correct_count / total_count:.4f}")
         print(f"Inference time: {inference_seconds:.3f}s")
-        print(f"KHEAT uncertainty time: {entropy_seconds:.3f}s")
+        print(f"Logprob uncertainty time: {logprob_seconds:.3f}s")
 
     correct_values = [
-        row["average_agent_semantic_entropy"] for row in rows if row["is_correct"]
+        row["final_answer_logprob_uncertainty"]
+        for row in rows
+        if row["is_correct"]
+        and row["final_answer_logprob_uncertainty"] is not None
+        and math.isfinite(row["final_answer_logprob_uncertainty"])
     ]
     incorrect_values = [
-        row["average_agent_semantic_entropy"] for row in rows if not row["is_correct"]
+        row["final_answer_logprob_uncertainty"]
+        for row in rows
+        if not row["is_correct"]
+        and row["final_answer_logprob_uncertainty"] is not None
+        and math.isfinite(row["final_answer_logprob_uncertainty"])
     ]
 
     output_file, csv_file = default_output_paths(bundle.name, args)
@@ -755,6 +933,7 @@ async def main():
     print(f"Saved plot: {output_file}")
     print(f"Correct samples: {len(correct_values)}")
     print(f"Incorrect samples: {len(incorrect_values)}")
+    print(f"Rows with answer logprobs: {len(correct_values) + len(incorrect_values)} / {len(rows)}")
 
 
 if __name__ == "__main__":

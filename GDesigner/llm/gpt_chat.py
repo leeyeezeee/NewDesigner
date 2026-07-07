@@ -1,4 +1,5 @@
 import aiohttp
+import math
 from typing import List, Union, Optional
 from tenacity import retry, wait_random_exponential, stop_after_attempt
 from typing import Dict, Any
@@ -8,7 +9,7 @@ from openai import AsyncOpenAI, OpenAI
 
 from GDesigner.llm.format import Message
 from GDesigner.llm.price import cost_count
-from GDesigner.llm.llm import LLM
+from GDesigner.llm.llm import LLM, LLMGeneration, TokenLogProb
 from GDesigner.llm.llm_registry import LLMRegistry
 
 
@@ -62,7 +63,12 @@ def _chat_completion_extra_body(model: str) -> Dict[str, Any]:
 @retry(wait=wait_random_exponential(max=100), stop=stop_after_attempt(3))
 async def custom_achat(
     model: str,
-    msg: List[Dict],):
+    msg: List[Dict],
+    return_logprobs: bool = False,):
+    if return_logprobs:
+        raise NotImplementedError(
+            "Token logprobs are only implemented for OpenAI-compatible agent backends."
+        )
     request_url = _agent_base_url()
     authorization_key = _agent_api_key(request_url)
     headers = {
@@ -103,13 +109,58 @@ def _openai_client_kwargs(base_url: str) -> Dict[str, Any]:
     return client_kwargs
 
 
+def _get_attr_or_key(value: Any, name: str, default: Any = None) -> Any:
+    if isinstance(value, dict):
+        return value.get(name, default)
+    return getattr(value, name, default)
+
+
+def _probability_from_logprob(logprob: Optional[float]) -> Optional[float]:
+    if logprob is None:
+        return None
+    if logprob < -745:
+        return 0.0
+    return math.exp(logprob)
+
+
+def _choice_token_logprobs(choice: Any) -> List[TokenLogProb]:
+    logprobs = _get_attr_or_key(choice, "logprobs")
+    content = _get_attr_or_key(logprobs, "content", []) if logprobs else []
+    if not content:
+        return []
+
+    token_logprobs = []
+    for token_info in content:
+        token = _get_attr_or_key(token_info, "token", "")
+        logprob = _get_attr_or_key(token_info, "logprob")
+        token_bytes = _get_attr_or_key(token_info, "bytes")
+        if logprob is not None:
+            logprob = float(logprob)
+        token_logprobs.append(
+            TokenLogProb(
+                token=str(token),
+                logprob=logprob,
+                probability=_probability_from_logprob(logprob),
+                bytes=token_bytes,
+            )
+        )
+    return token_logprobs
+
+
+def _choice_content(choice: Any) -> str:
+    message = _get_attr_or_key(choice, "message")
+    return _get_attr_or_key(message, "content", "") or ""
+
+
 async def openai_compatible_achat(
     model: str,
     msg: List[Dict],
     max_tokens: int,
     temperature: float,
     num_comps: int,
-) -> Union[List[str], str]:
+    return_logprobs: bool = False,
+    top_logprobs: Optional[int] = None,
+) -> Union[List[str], str, List[LLMGeneration], LLMGeneration]:
     base_url = _agent_base_url()
     request_kwargs = {
         "model": model,
@@ -118,16 +169,29 @@ async def openai_compatible_achat(
         "temperature": temperature,
         "n": num_comps,
     }
+    if return_logprobs:
+        request_kwargs["logprobs"] = True
+        if top_logprobs is not None:
+            request_kwargs["top_logprobs"] = top_logprobs
     extra_body = _chat_completion_extra_body(model)
     if extra_body:
         request_kwargs["extra_body"] = extra_body
     response = await AsyncOpenAI(**_openai_client_kwargs(base_url)).chat.completions.create(
         **request_kwargs,
     )
-    outputs = [choice.message.content or "" for choice in response.choices]
+    outputs = [_choice_content(choice) for choice in response.choices]
     prompt = "".join([item["content"] for item in msg])
     for output in outputs:
         cost_count(prompt, output, model)
+    if return_logprobs:
+        generations = [
+            LLMGeneration(
+                content=output,
+                token_logprobs=_choice_token_logprobs(choice),
+            )
+            for output, choice in zip(outputs, response.choices)
+        ]
+        return generations[0] if num_comps == 1 else generations
     return outputs[0] if num_comps == 1 else outputs
 
 
@@ -137,7 +201,9 @@ def openai_compatible_chat(
     max_tokens: int,
     temperature: float,
     num_comps: int,
-) -> Union[List[str], str]:
+    return_logprobs: bool = False,
+    top_logprobs: Optional[int] = None,
+) -> Union[List[str], str, List[LLMGeneration], LLMGeneration]:
     base_url = _agent_base_url()
     request_kwargs = {
         "model": model,
@@ -146,16 +212,29 @@ def openai_compatible_chat(
         "temperature": temperature,
         "n": num_comps,
     }
+    if return_logprobs:
+        request_kwargs["logprobs"] = True
+        if top_logprobs is not None:
+            request_kwargs["top_logprobs"] = top_logprobs
     extra_body = _chat_completion_extra_body(model)
     if extra_body:
         request_kwargs["extra_body"] = extra_body
     response = OpenAI(**_openai_client_kwargs(base_url)).chat.completions.create(
         **request_kwargs,
     )
-    outputs = [choice.message.content or "" for choice in response.choices]
+    outputs = [_choice_content(choice) for choice in response.choices]
     prompt = "".join([item["content"] for item in msg])
     for output in outputs:
         cost_count(prompt, output, model)
+    if return_logprobs:
+        generations = [
+            LLMGeneration(
+                content=output,
+                token_logprobs=_choice_token_logprobs(choice),
+            )
+            for output, choice in zip(outputs, response.choices)
+        ]
+        return generations[0] if num_comps == 1 else generations
     return outputs[0] if num_comps == 1 else outputs
 
 @LLMRegistry.register('GPTChat')
@@ -170,7 +249,9 @@ class GPTChat(LLM):
         max_tokens: Optional[int] = None,
         temperature: Optional[float] = None,
         num_comps: Optional[int] = None,
-        ) -> Union[List[str], str]:
+        return_logprobs: bool = False,
+        top_logprobs: Optional[int] = None,
+        ) -> Union[List[str], str, List[LLMGeneration], LLMGeneration]:
 
         if max_tokens is None:
             max_tokens = self.DEFAULT_MAX_TOKENS
@@ -182,8 +263,20 @@ class GPTChat(LLM):
         messages = _message_dicts(messages)
         base_url = _agent_base_url()
         if _is_openai_compatible(base_url):
-            return await openai_compatible_achat(self.model_name, messages, max_tokens, temperature, num_comps)
-        return await custom_achat(self.model_name,messages)
+            return await openai_compatible_achat(
+                self.model_name,
+                messages,
+                max_tokens,
+                temperature,
+                num_comps,
+                return_logprobs=return_logprobs,
+                top_logprobs=top_logprobs,
+            )
+        if return_logprobs:
+            raise NotImplementedError(
+                "Token logprobs are only implemented for OpenAI-compatible agent backends."
+            )
+        return await custom_achat(self.model_name, messages, return_logprobs=return_logprobs)
     
     def gen(
         self,
@@ -191,7 +284,9 @@ class GPTChat(LLM):
         max_tokens: Optional[int] = None,
         temperature: Optional[float] = None,
         num_comps: Optional[int] = None,
-    ) -> Union[List[str], str]:
+        return_logprobs: bool = False,
+        top_logprobs: Optional[int] = None,
+    ) -> Union[List[str], str, List[LLMGeneration], LLMGeneration]:
         if max_tokens is None:
             max_tokens = self.DEFAULT_MAX_TOKENS
         if temperature is None:
@@ -202,5 +297,13 @@ class GPTChat(LLM):
         messages = _message_dicts(messages)
         base_url = _agent_base_url()
         if _is_openai_compatible(base_url):
-            return openai_compatible_chat(self.model_name, messages, max_tokens, temperature, num_comps)
+            return openai_compatible_chat(
+                self.model_name,
+                messages,
+                max_tokens,
+                temperature,
+                num_comps,
+                return_logprobs=return_logprobs,
+                top_logprobs=top_logprobs,
+            )
         raise NotImplementedError("Synchronous generation is only implemented for OpenAI-compatible agent backends.")
