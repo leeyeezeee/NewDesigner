@@ -4,6 +4,8 @@ from abc import ABC, abstractmethod
 import warnings
 import asyncio
 
+from GDesigner.llm.llm import LLMGeneration
+
 
 class Node(ABC):
     """
@@ -61,9 +63,18 @@ class Node(ABC):
         self.inputs: List[Any] = []
         self.outputs: List[Any] = []
         self.entropy_samples: List[Any] = []
+        self.output_token_logprobs: List[Any] = []
+        self.entropy_samples_token_logprobs: List[Any] = []
         self.raw_inputs: List[Any] = []
         self.role = ""
-        self.last_memory: Dict[str,List[Any]] = {'inputs':[],'outputs':[],'raw_inputs':[],'entropy_samples':[]}
+        self.last_memory: Dict[str,List[Any]] = {
+            'inputs': [],
+            'outputs': [],
+            'raw_inputs': [],
+            'entropy_samples': [],
+            'output_token_logprobs': [],
+            'entropy_samples_token_logprobs': [],
+        }
         self.execution_history: List[Dict[str, Any]] = []
 
     @property
@@ -113,6 +124,8 @@ class Node(ABC):
         self.last_memory['outputs'] = self.outputs
         self.last_memory['raw_inputs'] = self.raw_inputs
         self.last_memory['entropy_samples'] = self.entropy_samples
+        self.last_memory['output_token_logprobs'] = self.output_token_logprobs
+        self.last_memory['entropy_samples_token_logprobs'] = self.entropy_samples_token_logprobs
 
     def get_spatial_info(self)->Dict[str,Dict]:
         """ Return a dict that maps id to info. """
@@ -159,8 +172,10 @@ class Node(ABC):
         self.execution_history.append({
             "round": round_idx,
             "outputs": list(self.outputs),
+            "output_token_logprobs": list(self.output_token_logprobs),
             "communication_outputs": list(self.outputs),
             "entropy_samples": list(self.entropy_samples),
+            "entropy_samples_token_logprobs": list(self.entropy_samples_token_logprobs),
             "spatial_predecessors": list(spatial_info.keys()),
             "temporal_predecessors": list(temporal_info.keys()),
             "spatial_info": spatial_info_snapshot,
@@ -168,19 +183,41 @@ class Node(ABC):
         })
 
     @staticmethod
-    def _as_output_list(result: Any) -> List[Any]:
+    def _as_output_and_logprob_lists(result: Any) -> tuple[List[Any], List[Any]]:
         if isinstance(result, list):
-            return result
-        return [result]
+            results = result
+        else:
+            results = [result]
+
+        outputs = []
+        token_logprobs = []
+        for item in results:
+            if isinstance(item, LLMGeneration):
+                outputs.append(item.content)
+                token_logprobs.append(list(item.token_logprobs))
+            else:
+                outputs.append(item)
+                token_logprobs.append([])
+        return outputs, token_logprobs
 
     def _set_execution_outputs(self, results: List[Any]):
-        output_groups = [self._as_output_list(result) for result in results]
+        split_results = [self._as_output_and_logprob_lists(result) for result in results]
+        output_groups = [outputs for outputs, _token_logprobs in split_results]
+        token_logprob_groups = [
+            token_logprobs for _outputs, token_logprobs in split_results
+        ]
         self.entropy_samples = [
             output
             for output_group in output_groups
             for output in output_group
         ]
+        self.entropy_samples_token_logprobs = [
+            token_logprobs
+            for token_logprob_group in token_logprob_groups
+            for token_logprobs in token_logprob_group
+        ]
         self.outputs = output_groups[0] if output_groups else []
+        self.output_token_logprobs = token_logprob_groups[0] if token_logprob_groups else []
 
     def execute(self, input:Any, **kwargs):
         round_idx = kwargs.pop("round_idx", None)

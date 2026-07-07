@@ -3,6 +3,7 @@ import re
 
 from GDesigner.graph.node import Node
 from GDesigner.agents.agent_registry import AgentRegistry
+from GDesigner.llm.llm import LLMGeneration
 from GDesigner.llm.llm_registry import LLMRegistry
 from GDesigner.prompt.prompt_set_registry import PromptSetRegistry
 from GDesigner.tools.search.wiki import search_wiki_main
@@ -48,7 +49,11 @@ class AnalyzeAgent(Node):
   
         system_prompt, user_prompt = self._process_inputs(input, spatial_info, temporal_info)
         message = [{'role':'system','content':system_prompt},{'role':'user','content':user_prompt}]
-        response = self.llm.gen(message)
+        response = self.llm.gen(
+            message,
+            return_logprobs=kwargs.get("return_logprobs", False),
+            top_logprobs=kwargs.get("top_logprobs"),
+        )
         return response
 
     async def _async_execute(self, input:Dict[str,str],  spatial_info:Dict[str,Dict], temporal_info:Dict[str,Dict],**kwargs):
@@ -56,8 +61,18 @@ class AnalyzeAgent(Node):
         """ Use the processed input to get the result """
         system_prompt, user_prompt = await self._process_inputs(input, spatial_info, temporal_info)
         message = [{'role':'system','content':system_prompt},{'role':'user','content':user_prompt}]
-        response = await self.llm.agen(message)
+        response = await self.llm.agen(
+            message,
+            return_logprobs=kwargs.get("return_logprobs", False),
+            top_logprobs=kwargs.get("top_logprobs"),
+        )
         if self.wiki_summary != "":
-            response += f"\n\n{self.wiki_summary}"
+            if isinstance(response, LLMGeneration):
+                response = LLMGeneration(
+                    content=f"{response.content}\n\n{self.wiki_summary}",
+                    token_logprobs=response.token_logprobs,
+                )
+            else:
+                response += f"\n\n{self.wiki_summary}"
             self.wiki_summary = ""
         return response

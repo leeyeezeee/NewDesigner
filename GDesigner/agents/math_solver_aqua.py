@@ -2,6 +2,7 @@ from typing import List,Any,Dict
 
 from GDesigner.graph.node import Node
 from GDesigner.agents.agent_registry import AgentRegistry
+from GDesigner.llm.llm import LLMGeneration
 from GDesigner.llm.llm_registry import LLMRegistry
 from GDesigner.prompt.prompt_set_registry import PromptSetRegistry
 from GDesigner.tools.coding.python_executor import execute_code_get_return
@@ -60,7 +61,11 @@ class MathSolver_aqua(Node):
         """ Use the processed input to get the result """
         system_prompt, user_prompt = self._process_inputs(input, spatial_info, temporal_info)
         message = [{'role':'system','content':system_prompt},{'role':'user','content':user_prompt}]
-        response = self.llm.gen(message)
+        response = self.llm.gen(
+            message,
+            return_logprobs=kwargs.get("return_logprobs", False),
+            top_logprobs=kwargs.get("top_logprobs"),
+        )
         return response
 
     async def _async_execute(self, input:Dict[str,str],  spatial_info:Dict[str,Any], temporal_info:Dict[str,Any],**kwargs):
@@ -69,8 +74,20 @@ class MathSolver_aqua(Node):
         """ The input type of this node is Dict """
         system_prompt, user_prompt = self._process_inputs(input, spatial_info, temporal_info)
         message = [{'role':'system','content':system_prompt},{'role':'user','content':user_prompt}]
-        response = await self.llm.agen(message)
+        response = await self.llm.agen(
+            message,
+            return_logprobs=kwargs.get("return_logprobs", False),
+            top_logprobs=kwargs.get("top_logprobs"),
+        )
         if self.role == "Programming Expert":
-            answer = execute_code_get_return(response.lstrip("```python\n").rstrip("\n```"))
-            response += f"\nthe answer is {answer}"
+            response_text = response.content if isinstance(response, LLMGeneration) else response
+            answer = execute_code_get_return(response_text.lstrip("```python\n").rstrip("\n```"))
+            response_text += f"\nthe answer is {answer}"
+            if isinstance(response, LLMGeneration):
+                response = LLMGeneration(
+                    content=response_text,
+                    token_logprobs=response.token_logprobs,
+                )
+            else:
+                response = response_text
         return response

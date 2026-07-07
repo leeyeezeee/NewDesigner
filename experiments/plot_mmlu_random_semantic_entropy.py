@@ -7,7 +7,6 @@ import random
 import re
 import sys
 import time
-from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -34,11 +33,6 @@ from datasets.gsm8k_dataset import (
     svamp_data_process,
 )
 from datasets.mmlu_dataset import MMLUDataset
-from GDesigner.utils.uncertainty import (
-    SemanticEntailmentJudge,
-    semantic_entropy,
-    semantic_uncertainty,
-)
 
 
 RecordToInput = Callable[[Any], Dict[str, Any]]
@@ -73,21 +67,16 @@ class DatasetBundle:
 
 
 @dataclass
-class GraphSampleResult:
-    raw_final_answer: str
-    predicted_answer: str
-
-
-@dataclass
 class InferenceResult:
     dataset: str
     index: int
     input_dict: Dict[str, Any]
-    raw_final_answers: List[str]
-    predicted_answers: List[str]
+    raw_final_answer: str
+    predicted_answer: str
     target_answer: str
-    modal_predicted_answer: str
     is_correct: bool
+    mean_agent_topk_token_entropy: Optional[float]
+    agent_topk_token_entropy_details: List[Dict[str, Any]]
 
 
 @dataclass(frozen=True)
@@ -152,8 +141,8 @@ DATASET_DEFAULTS: Dict[str, DatasetDefaults] = {
 def parse_args():
     parser = argparse.ArgumentParser(
         description=(
-            "Plot the distribution of final aggregated-answer semantic entropy "
-            "estimated by repeatedly resampling random communication graphs per task."
+            "Plot the distribution of mean agent uncertainty from top-k token "
+            "entropy over the first generated tokens in one sampled graph per task."
         )
     )
     parser.add_argument(
@@ -197,21 +186,17 @@ def parse_args():
         help="Override dataset-specific default communication rounds.",
     )
     parser.add_argument(
-        "--num_entropy_samples",
+        "--topk",
         type=int,
         default=5,
-        help=(
-            "Fresh graph+agent executions per task used to estimate final-answer "
-            "semantic entropy."
-        ),
+        help="Number of top token candidates used to compute each token entropy.",
     )
-    # KLE temporarily disabled; keep this hyperparameter ready for future re-enable.
-    # parser.add_argument(
-    #     "--kle_heat_t",
-    #     type=float,
-    #     default=0.3,
-    #     help="Heat-kernel lengthscale for KHEAT uncertainty.",
-    # )
+    parser.add_argument(
+        "--k",
+        type=int,
+        default=16,
+        help="Number of leading generated tokens used for each agent output.",
+    )
     parser.add_argument("--llm_name", type=str, default="gpt-4o")
     parser.add_argument(
         "--domain",
@@ -222,36 +207,6 @@ def parse_args():
     parser.add_argument("--decision_method", type=str, default=None)
     parser.add_argument("--agent_names", nargs="+", type=str, default=None)
     parser.add_argument("--agent_nums", nargs="+", type=int, default=None)
-    parser.add_argument(
-        "--semantic_judge_llm_name",
-        type=str,
-        default="",
-        help="OpenAI-compatible semantic judge model name. Uses env defaults when omitted.",
-    )
-    parser.add_argument(
-        "--semantic_judge_api_key",
-        type=str,
-        default="",
-        help="API key for the semantic judge. Uses SEMANTIC_JUDGE_API_KEY or OPENAI_API_KEY when omitted.",
-    )
-    parser.add_argument(
-        "--semantic_judge_base_url",
-        type=str,
-        default="",
-        help="Base URL for the semantic judge API, e.g. a local vLLM OpenAI-compatible endpoint.",
-    )
-    parser.add_argument(
-        "--semantic_judge_model_path",
-        type=str,
-        default="",
-        help="Optional local judge model path/name override.",
-    )
-    parser.add_argument(
-        "--semantic_judge_max_concurrency",
-        type=int,
-        default=None,
-        help="Maximum concurrent semantic judge requests.",
-    )
     parser.add_argument("--humaneval_timeout", type=int, default=100)
     parser.add_argument("--bins", type=int, default=25)
     parser.add_argument("--seed", type=int, default=888)
@@ -270,8 +225,10 @@ def parse_args():
         parser.error("--agent_names and --agent_nums must be provided together.")
     if args.num_rounds is not None and args.num_rounds < 1:
         parser.error("--num_rounds must be at least 1 when provided.")
-    if args.num_entropy_samples < 1:
-        parser.error("--num_entropy_samples must be at least 1.")
+    if args.topk < 1:
+        parser.error("--topk must be at least 1.")
+    if args.k < 1:
+        parser.error("--k must be at least 1.")
     return args
 
 
@@ -770,41 +727,96 @@ def build_graph(bundle: DatasetBundle, args, agent_names: List[str]) -> Graph:
     return graph
 
 
-async def run_graph_sample(
-    bundle: DatasetBundle,
-    input_dict: Dict[str, Any],
-    args,
-    agent_names: List[str],
-) -> GraphSampleResult:
-    realized_graph = build_graph(bundle, args, agent_names)
-    raw_answer, _log_prob = await realized_graph.arun(
-        input_dict,
-        bundle.num_rounds,
-        num_entropy_samples=1,
-        record_execution_history=False,
-        track_grad=False,
-        record_decision_logprobs=False,
+def top_logprob_entropy(token_info: Any, topk: int) -> Optional[float]:
+    top_entries = attr_or_key(token_info, "top_logprobs", []) or []
+    logprobs: List[float] = []
+    for entry in top_entries[:topk]:
+        logprob = attr_or_key(entry, "logprob")
+        if logprob is None:
+            continue
+        logprob = float(logprob)
+        if math.isfinite(logprob):
+            logprobs.append(logprob)
+
+    if not logprobs:
+        return None
+
+    max_logprob = max(logprobs)
+    exp_values = [math.exp(logprob - max_logprob) for logprob in logprobs]
+    normalizer = sum(exp_values)
+    if normalizer <= 0:
+        return None
+
+    probabilities = [value / normalizer for value in exp_values]
+    return float(
+        -sum(probability * math.log(probability) for probability in probabilities if probability > 0)
     )
 
-    raw_final_answer = first_answer(raw_answer)
-    predicted_answer = bundle.parse_prediction(raw_answer)
-    return GraphSampleResult(
-        raw_final_answer=raw_final_answer,
-        predicted_answer=predicted_answer,
-    )
+
+def output_topk_token_entropy(
+    token_logprobs: Sequence[Any],
+    k_tokens: int,
+    topk: int,
+) -> Dict[str, Any]:
+    token_entropies = []
+    for token_info in token_logprobs[:k_tokens]:
+        entropy = top_logprob_entropy(token_info, topk)
+        if entropy is not None and math.isfinite(entropy):
+            token_entropies.append(entropy)
+
+    if not token_entropies:
+        return {
+            "entropy": None,
+            "tokens_used": 0,
+            "token_entropies": [],
+        }
+
+    return {
+        "entropy": float(np.mean(token_entropies)),
+        "tokens_used": len(token_entropies),
+        "token_entropies": token_entropies,
+    }
 
 
-def modal_answer(answers: Sequence[str]) -> str:
-    valid_answers = [str(answer) for answer in answers if str(answer).strip()]
-    if not valid_answers:
-        return ""
+def collect_agent_topk_token_entropy(
+    graph: Graph,
+    k_tokens: int,
+    topk: int,
+) -> Tuple[Optional[float], List[Dict[str, Any]]]:
+    details = []
+    for node in graph.nodes.values():
+        histories = node.execution_history or [
+            {
+                "round": "",
+                "output_token_logprobs": getattr(node, "output_token_logprobs", []),
+            }
+        ]
+        for history in histories:
+            for output_index, token_logprobs in enumerate(
+                history.get("output_token_logprobs", [])
+            ):
+                stats = output_topk_token_entropy(token_logprobs, k_tokens, topk)
+                details.append(
+                    {
+                        "node_id": node.id,
+                        "agent_name": node.agent_name,
+                        "role": node.role,
+                        "round": history.get("round", ""),
+                        "output_index": output_index,
+                        "entropy": stats["entropy"],
+                        "tokens_used": stats["tokens_used"],
+                        "token_entropies": stats["token_entropies"],
+                    }
+                )
 
-    counts = Counter(valid_answers)
-    best_answer = valid_answers[0]
-    for answer in valid_answers[1:]:
-        if counts[answer] > counts[best_answer]:
-            best_answer = answer
-    return best_answer
+    valid_entropies = [
+        detail["entropy"]
+        for detail in details
+        if detail["entropy"] is not None and math.isfinite(detail["entropy"])
+    ]
+    if not valid_entropies:
+        return None, details
+    return float(np.mean(valid_entropies)), details
 
 
 async def run_record_inference(
@@ -815,81 +827,52 @@ async def run_record_inference(
     agent_names: List[str],
 ) -> InferenceResult:
     input_dict = bundle.record_to_input(record)
-    sample_results = await asyncio.gather(
-        *[
-            run_graph_sample(bundle, input_dict, args, agent_names)
-            for _sample_idx in range(args.num_entropy_samples)
-        ]
+    realized_graph = build_graph(bundle, args, agent_names)
+    raw_answer, _log_prob = await realized_graph.arun(
+        input_dict,
+        bundle.num_rounds,
+        num_entropy_samples=1,
+        record_execution_history=True,
+        track_grad=False,
+        record_node_logprobs=True,
+        node_top_logprobs=args.topk,
+        record_decision_logprobs=False,
     )
 
-    raw_final_answers = [sample.raw_final_answer for sample in sample_results]
-    predicted_answers = [sample.predicted_answer for sample in sample_results]
+    raw_final_answer = first_answer(raw_answer)
+    predicted_answer = bundle.parse_prediction(raw_answer)
     target_answer = bundle.record_to_target(record)
-    modal_predicted_answer = modal_answer(predicted_answers)
-    is_correct = await compute_correctness(bundle, modal_predicted_answer, target_answer)
+    is_correct = await compute_correctness(bundle, predicted_answer, target_answer)
+    mean_entropy, entropy_details = collect_agent_topk_token_entropy(
+        realized_graph,
+        args.k,
+        args.topk,
+    )
     return InferenceResult(
         dataset=bundle.name,
         index=record_index,
         input_dict=input_dict,
-        raw_final_answers=raw_final_answers,
-        predicted_answers=predicted_answers,
+        raw_final_answer=raw_final_answer,
+        predicted_answer=predicted_answer,
         target_answer=target_answer,
-        modal_predicted_answer=modal_predicted_answer,
         is_correct=is_correct,
+        mean_agent_topk_token_entropy=mean_entropy,
+        agent_topk_token_entropy_details=entropy_details,
     )
 
 
-def exact_answer_semantic_entropy(outputs: Iterable[Any]) -> Tuple[float, Dict[str, Any]]:
-    valid_outputs = [str(output).strip() for output in outputs if str(output).strip()]
-    if len(valid_outputs) <= 1:
-        return 0.0, {
-            "method": "exact_answer_entropy",
-            "outputs": valid_outputs,
-            "labels": ["cluster_0"] if valid_outputs else [],
-        }
-
-    label_by_answer: Dict[str, str] = {}
-    labels: List[str] = []
-    for output in valid_outputs:
-        normalized = " ".join(output.lower().split())
-        if normalized not in label_by_answer:
-            label_by_answer[normalized] = f"cluster_{len(label_by_answer)}"
-        labels.append(label_by_answer[normalized])
-
-    return semantic_entropy(labels), {
-        "method": "exact_answer_entropy",
-        "outputs": valid_outputs,
-        "labels": labels,
-    }
-
-
-async def attach_final_answer_semantic_entropy(
+async def attach_agent_topk_token_uncertainty(
     result: InferenceResult,
-    judge: Optional[SemanticEntailmentJudge],
 ) -> Dict[str, Any]:
-    question = str(result.input_dict.get("task", result.input_dict))
-    if judge is not None and judge.is_configured:
-        entropy, details = await semantic_uncertainty(
-            question,
-            result.predicted_answers,
-            judge,
-        )
-    else:
-        entropy, details = exact_answer_semantic_entropy(result.predicted_answers)
-
     return {
         "dataset": result.dataset,
         "index": result.index,
+        "raw_final_answer": result.raw_final_answer,
+        "predicted_answer": result.predicted_answer,
         "target_answer": result.target_answer,
-        "modal_predicted_answer": result.modal_predicted_answer,
         "is_correct": result.is_correct,
-        "num_graph_samples": len(result.predicted_answers),
-        "semantic_entropy": entropy,
-        "semantic_method": details.get("method", "semantic_entropy"),
-        "semantic_labels": details.get("labels", []),
-        "semantic_outputs": details.get("outputs", []),
-        "predicted_answers": result.predicted_answers,
-        "raw_final_answers": result.raw_final_answers,
+        "mean_agent_topk_token_entropy": result.mean_agent_topk_token_entropy,
+        "agent_topk_token_entropy_details": result.agent_topk_token_entropy_details,
     }
 
 
@@ -901,16 +884,12 @@ def save_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
             fieldnames=[
                 "dataset",
                 "index",
+                "raw_final_answer",
+                "predicted_answer",
                 "target_answer",
-                "modal_predicted_answer",
                 "is_correct",
-                "num_graph_samples",
-                "semantic_entropy",
-                "semantic_method",
-                "semantic_labels",
-                "semantic_outputs",
-                "predicted_answers",
-                "raw_final_answers",
+                "mean_agent_topk_token_entropy",
+                "agent_topk_token_entropy_details",
             ],
         )
         writer.writeheader()
@@ -918,10 +897,9 @@ def save_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
             writer.writerow(
                 {
                     **row,
-                    "semantic_labels": repr(row["semantic_labels"]),
-                    "semantic_outputs": repr(row["semantic_outputs"]),
-                    "predicted_answers": repr(row["predicted_answers"]),
-                    "raw_final_answers": repr(row["raw_final_answers"]),
+                    "agent_topk_token_entropy_details": repr(
+                        row["agent_topk_token_entropy_details"]
+                    ),
                 }
             )
 
@@ -964,7 +942,7 @@ def plot_distribution(
         color="#FF5252",
         label="Incorrect",
     )
-    plt.xlabel("Final Aggregated Answer Semantic Entropy (Random Graph Resampling)")
+    plt.xlabel("Mean Agent Top-k Token Entropy (First K Tokens)")
     plt.ylabel("Probability")
     plt.title(f"{dataset_name} {mode_name} Graph")
     plt.legend()
@@ -976,10 +954,10 @@ def plot_distribution(
 
 def default_output_paths(dataset_name: str, args) -> Tuple[Path, Path]:
     output_file = args.output_file or (
-        f"result/{dataset_name}_{args.mode.lower()}_semantic_entropy_distribution.png"
+        f"result/{dataset_name}_{args.mode.lower()}_agent_topk_token_entropy_distribution.png"
     )
     csv_file = args.csv_file or (
-        f"result/{dataset_name}_{args.mode.lower()}_semantic_entropy_distribution.csv"
+        f"result/{dataset_name}_{args.mode.lower()}_agent_topk_token_entropy_distribution.csv"
     )
     return Path(output_file), Path(csv_file)
 
@@ -992,15 +970,6 @@ async def main():
     agent_names = [
         name for name, num in zip(bundle.agent_names, bundle.agent_nums) for _ in range(num)
     ]
-    semantic_judge = SemanticEntailmentJudge(
-        llm_name=args.semantic_judge_llm_name,
-        api_key=args.semantic_judge_api_key,
-        base_url=args.semantic_judge_base_url,
-        model_path=args.semantic_judge_model_path,
-        max_concurrency=args.semantic_judge_max_concurrency,
-    )
-    if not semantic_judge.is_configured:
-        print("Semantic judge is not configured; falling back to exact extracted-answer entropy.")
 
     rows: List[Dict[str, Any]] = []
     correct_count = 0
@@ -1018,35 +987,35 @@ async def main():
         )
         inference_seconds = time.time() - inference_start
 
-        entropy_start = time.time()
+        uncertainty_start = time.time()
         batch_rows = await asyncio.gather(
             *[
-                attach_final_answer_semantic_entropy(inference_result, semantic_judge)
+                attach_agent_topk_token_uncertainty(inference_result)
                 for inference_result in inference_results
             ]
         )
-        entropy_seconds = time.time() - entropy_start
+        uncertainty_seconds = time.time() - uncertainty_start
 
         rows.extend(batch_rows)
         correct_count += sum(int(row["is_correct"]) for row in batch_rows)
         total_count += len(batch_rows)
         print(f"Accuracy so far: {correct_count / total_count:.4f}")
         print(f"Inference time: {inference_seconds:.3f}s")
-        print(f"Semantic entropy time: {entropy_seconds:.3f}s")
+        print(f"Top-k token entropy time: {uncertainty_seconds:.3f}s")
 
     correct_values = [
-        row["semantic_entropy"]
+        row["mean_agent_topk_token_entropy"]
         for row in rows
         if row["is_correct"]
-        and row["semantic_entropy"] is not None
-        and math.isfinite(row["semantic_entropy"])
+        and row["mean_agent_topk_token_entropy"] is not None
+        and math.isfinite(row["mean_agent_topk_token_entropy"])
     ]
     incorrect_values = [
-        row["semantic_entropy"]
+        row["mean_agent_topk_token_entropy"]
         for row in rows
         if not row["is_correct"]
-        and row["semantic_entropy"] is not None
-        and math.isfinite(row["semantic_entropy"])
+        and row["mean_agent_topk_token_entropy"] is not None
+        and math.isfinite(row["mean_agent_topk_token_entropy"])
     ]
 
     output_file, csv_file = default_output_paths(bundle.name, args)
@@ -1063,7 +1032,7 @@ async def main():
     print(f"Saved plot: {output_file}")
     print(f"Correct samples: {len(correct_values)}")
     print(f"Incorrect samples: {len(incorrect_values)}")
-    print(f"Rows with semantic entropy: {len(correct_values) + len(incorrect_values)} / {len(rows)}")
+    print(f"Rows with top-k token entropy: {len(correct_values) + len(incorrect_values)} / {len(rows)}")
 
 
 if __name__ == "__main__":

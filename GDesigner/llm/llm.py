@@ -1,6 +1,6 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import List, Union, Optional
+from typing import Any, Dict, List, Union, Optional
 
 from GDesigner.llm.format import Message
 
@@ -11,6 +11,7 @@ class TokenLogProb:
     logprob: Optional[float]
     probability: Optional[float] = None
     bytes: Optional[List[int]] = None
+    top_logprobs: Optional[List[Dict[str, Any]]] = None
 
 
 @dataclass(frozen=True)

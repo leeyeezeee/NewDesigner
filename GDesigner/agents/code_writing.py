@@ -65,7 +65,11 @@ class CodeWriting(Node):
         self.internal_tests = self.extract_example(input)
         system_prompt, user_prompt = self._process_inputs(input, spatial_info, temporal_info)
         message = [{'role':'system','content':system_prompt},{'role':'user','content':user_prompt}]
-        response = self.llm.gen(message)
+        response = self.llm.gen(
+            message,
+            return_logprobs=kwargs.get("return_logprobs", False),
+            top_logprobs=kwargs.get("top_logprobs"),
+        )
         return response
 
     async def _async_execute(self, input:Dict[str,str],  spatial_info:Dict[str,Any], temporal_info:Dict[str,Any],**kwargs):
@@ -78,5 +82,9 @@ class CodeWriting(Node):
         if system_prompt == "is_solved":
             return user_prompt
         message = [{'role':'system','content':system_prompt},{'role':'user','content':user_prompt}]
-        response = await self.llm.agen(message)
+        response = await self.llm.agen(
+            message,
+            return_logprobs=kwargs.get("return_logprobs", False),
+            top_logprobs=kwargs.get("top_logprobs"),
+        )
         return response
