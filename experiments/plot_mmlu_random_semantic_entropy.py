@@ -48,6 +48,7 @@ class DatasetDefaults:
     graph_domain: str
     agent_names: List[str]
     agent_nums: List[int]
+    num_rounds: int
     decision_method: str
 
 
@@ -58,6 +59,7 @@ class DatasetBundle:
     graph_domain: str
     agent_names: List[str]
     agent_nums: List[int]
+    num_rounds: int
     decision_method: str
     record_to_input: RecordToInput
     record_to_target: RecordToTarget
@@ -90,35 +92,40 @@ DATASET_DEFAULTS: Dict[str, DatasetDefaults] = {
         dataset_json=None,
         graph_domain="mmlu",
         agent_names=["AnalyzeAgent"],
-        agent_nums=[5],
+        agent_nums=[6],
+        num_rounds=1,
         decision_method="FinalRefer",
     ),
     "gsm8k": DatasetDefaults(
         dataset_json="datasets/gsm8k/gsm8k.jsonl",
         graph_domain="gsm8k",
         agent_names=["MathSolver"],
-        agent_nums=[4],
+        agent_nums=[5],
+        num_rounds=1,
         decision_method="FinalRefer",
     ),
     "aqua": DatasetDefaults(
         dataset_json="datasets/AQuA/AQuA.jsonl",
         graph_domain="aqua",
         agent_names=["MathSolver_aqua"],
-        agent_nums=[4],
+        agent_nums=[5],
+        num_rounds=1,
         decision_method="FinalRefer",
     ),
     "svamp": DatasetDefaults(
         dataset_json="datasets/SVAMP/SVAMP.json",
         graph_domain="gsm8k",
         agent_names=["MathSolver"],
-        agent_nums=[4],
+        agent_nums=[5],
+        num_rounds=1,
         decision_method="FinalRefer",
     ),
     "multiarith": DatasetDefaults(
         dataset_json="datasets/MultiArith/MultiArith.json",
         graph_domain="gsm8k",
         agent_names=["MathSolver"],
-        agent_nums=[4],
+        agent_nums=[5],
+        num_rounds=1,
         decision_method="FinalRefer",
     ),
     "humaneval": DatasetDefaults(
@@ -126,6 +133,7 @@ DATASET_DEFAULTS: Dict[str, DatasetDefaults] = {
         graph_domain="humaneval",
         agent_names=["CodeWriting"],
         agent_nums=[5],
+        num_rounds=2,
         decision_method="FinalWriteCode",
     ),
 }
@@ -172,7 +180,12 @@ def parse_args():
         choices=["DirectAnswer", "FullConnected", "Random", "Chain", "Debate", "Layered", "Star"],
         help="Communication graph topology. Use Random for the requested random graph setting.",
     )
-    parser.add_argument("--num_rounds", type=int, default=2)
+    parser.add_argument(
+        "--num_rounds",
+        type=int,
+        default=None,
+        help="Override dataset-specific default communication rounds.",
+    )
     parser.add_argument(
         "--num_entropy_samples",
         type=int,
@@ -222,6 +235,8 @@ def parse_args():
             parser.error("The number of agent names must match the number of agent counts.")
     elif args.agent_names is not None or args.agent_nums is not None:
         parser.error("--agent_names and --agent_nums must be provided together.")
+    if args.num_rounds is not None and args.num_rounds < 1:
+        parser.error("--num_rounds must be at least 1 when provided.")
     if args.num_entropy_samples < 1:
         parser.error("--num_entropy_samples must be at least 1.")
     return args
@@ -279,6 +294,7 @@ def resolve_dataset_bundle(args) -> DatasetBundle:
     graph_domain = args.domain or defaults.graph_domain
     agent_names = args.agent_names or defaults.agent_names
     agent_nums = args.agent_nums or defaults.agent_nums
+    num_rounds = args.num_rounds if args.num_rounds is not None else defaults.num_rounds
     decision_method = args.decision_method or defaults.decision_method
 
     if args.dataset == "mmlu":
@@ -291,6 +307,7 @@ def resolve_dataset_bundle(args) -> DatasetBundle:
             graph_domain=graph_domain,
             agent_names=agent_names,
             agent_nums=agent_nums,
+            num_rounds=num_rounds,
             decision_method=decision_method,
             record_to_input=dataset.record_to_input,
             record_to_target=dataset.record_to_target_answer,
@@ -306,6 +323,7 @@ def resolve_dataset_bundle(args) -> DatasetBundle:
             graph_domain,
             agent_names,
             agent_nums,
+            num_rounds,
             decision_method,
             gsm_get_predict,
             numeric_correct,
@@ -319,6 +337,7 @@ def resolve_dataset_bundle(args) -> DatasetBundle:
             graph_domain,
             agent_names,
             agent_nums,
+            num_rounds,
             decision_method,
             aqua_get_predict,
             choice_correct,
@@ -332,6 +351,7 @@ def resolve_dataset_bundle(args) -> DatasetBundle:
             graph_domain,
             agent_names,
             agent_nums,
+            num_rounds,
             decision_method,
             gsm_get_predict,
             numeric_correct,
@@ -345,6 +365,7 @@ def resolve_dataset_bundle(args) -> DatasetBundle:
             graph_domain,
             agent_names,
             agent_nums,
+            num_rounds,
             decision_method,
             gsm_get_predict,
             numeric_correct,
@@ -368,6 +389,7 @@ def resolve_dataset_bundle(args) -> DatasetBundle:
             graph_domain=graph_domain,
             agent_names=agent_names,
             agent_nums=agent_nums,
+            num_rounds=num_rounds,
             decision_method=decision_method,
             record_to_input=lambda record: {"task": record["prompt"]},
             record_to_target=lambda record: record["test"],
@@ -384,6 +406,7 @@ def math_dataset_bundle(
     graph_domain: str,
     agent_names: List[str],
     agent_nums: List[int],
+    num_rounds: int,
     decision_method: str,
     answer_parser: Callable[[str], str],
     correctness_fn: CorrectnessFn,
@@ -394,6 +417,7 @@ def math_dataset_bundle(
         graph_domain=graph_domain,
         agent_names=agent_names,
         agent_nums=agent_nums,
+        num_rounds=num_rounds,
         decision_method=decision_method,
         record_to_input=lambda record: {"task": record["task"]},
         record_to_target=lambda record: record["answer"],
@@ -712,7 +736,7 @@ async def run_record_inference(
     input_dict = bundle.record_to_input(record)
     raw_answer, _log_prob = await realized_graph.arun(
         input_dict,
-        args.num_rounds,
+        bundle.num_rounds,
         num_entropy_samples=args.num_entropy_samples,
         record_execution_history=False,
         track_grad=False,
