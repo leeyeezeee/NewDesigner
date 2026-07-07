@@ -62,3 +62,50 @@ def save_graph_checkpoint(
     torch.save(checkpoint, tmp_path)
     tmp_path.replace(output_path)
     print(f"Saved checkpoint: {output_path}")
+
+
+def _copy_parameter(target: torch.nn.Parameter, value: torch.Tensor, name: str) -> None:
+    if tuple(target.shape) != tuple(value.shape):
+        raise ValueError(
+            f"Checkpoint tensor {name!r} has shape {tuple(value.shape)}, "
+            f"but graph expects {tuple(target.shape)}."
+        )
+    with torch.no_grad():
+        target.copy_(value.to(device=target.device, dtype=target.dtype))
+
+
+def load_graph_checkpoint(
+    graph,
+    checkpoint_file: str,
+    *,
+    load_optimizer: Optional[torch.optim.Optimizer] = None,
+) -> Dict[str, Any]:
+    checkpoint_path = Path(checkpoint_file)
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    graph_state = checkpoint.get("graph", {})
+
+    if "edge_bias_scale" in graph_state:
+        graph.edge_bias_scale = float(graph_state["edge_bias_scale"])
+    if "gcn_state_dict" in graph_state:
+        graph.gcn.load_state_dict(graph_state["gcn_state_dict"])
+    if "mlp_state_dict" in graph_state:
+        graph.mlp.load_state_dict(graph_state["mlp_state_dict"])
+    if "refinement_weight" in graph_state:
+        _copy_parameter(graph.refinement_weight, graph_state["refinement_weight"], "refinement_weight")
+    if "spatial_edge_bias" in graph_state:
+        _copy_parameter(graph.spatial_edge_bias, graph_state["spatial_edge_bias"], "spatial_edge_bias")
+    if "temporal_logits" in graph_state:
+        _copy_parameter(graph.temporal_logits, graph_state["temporal_logits"], "temporal_logits")
+    if "spatial_masks" in graph_state:
+        _copy_parameter(graph.spatial_masks, graph_state["spatial_masks"], "spatial_masks")
+    if "temporal_masks" in graph_state:
+        _copy_parameter(graph.temporal_masks, graph_state["temporal_masks"], "temporal_masks")
+
+    if load_optimizer is not None and "optimizer_state_dict" in checkpoint:
+        load_optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+
+    print(f"Loaded checkpoint: {checkpoint_path}")
+    return checkpoint
