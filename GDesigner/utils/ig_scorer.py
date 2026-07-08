@@ -227,7 +227,6 @@ def _qwen_logprob_extra_body(model: str) -> Dict[str, Any]:
     if "qwen" not in model.lower():
         return {}
     return {
-        "enable_thinking": False,
         "chat_template_kwargs": {
             "enable_thinking": False,
         },

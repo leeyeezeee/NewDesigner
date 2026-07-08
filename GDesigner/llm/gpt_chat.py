@@ -53,7 +53,6 @@ def _chat_completion_extra_body(model: str) -> Dict[str, Any]:
     if enable_thinking is None:
         enable_thinking = False
     return {
-        "enable_thinking": enable_thinking,
         "chat_template_kwargs": {
             "enable_thinking": enable_thinking,
         }

@@ -147,11 +147,10 @@ def semantic_entropy(labels: Iterable[str]) -> float:
 
 
 def _semantic_judge_extra_body(model: str) -> Dict[str, Any]:
-    """Qwen backends (e.g. vveai) require enable_thinking=false for non-streaming judge calls."""
+    """Qwen backends require thinking to be disabled through chat-template kwargs."""
     if "qwen" not in model.lower():
         return {}
     return {
-        "enable_thinking": False,
         "chat_template_kwargs": {
             "enable_thinking": False,
         },
