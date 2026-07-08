@@ -790,21 +790,36 @@ class FinalAnswerScorer:
         response = await AsyncOpenAI(**_openai_client_kwargs(base_url)).completions.create(
             model=llm.model_name,
             prompt=prompt,
-            # Some vLLM versions reject or crash on max_tokens=0 for echo-only
-            # scoring. Generate one token and ignore it when slicing by offsets.
             max_tokens=1,
             temperature=0.0,
-            logprobs=1,
-            echo=True,
+            extra_body={"prompt_logprobs": 1},
         )
 
         choice = response.choices[0]
+        prompt_logprobs = (
+            _get_attr_or_key(choice, "prompt_logprobs")
+            or _get_attr_or_key(response, "prompt_logprobs")
+        )
+        if prompt_logprobs:
+            target_logprobs, target_tokens = self._target_prompt_logprobs(
+                prompt_logprobs,
+                target_answer,
+            )
+            if target_logprobs:
+                return sum(target_logprobs) / len(target_logprobs), {
+                    "method": "completion_prompt_logprobs_teacher_logprob",
+                    "request_max_tokens": 1,
+                    "ignored_generated_tokens": True,
+                    "num_target_tokens": len(target_logprobs),
+                    "target_tokens": target_tokens,
+                }
+
         logprobs = _get_attr_or_key(choice, "logprobs")
         tokens = list(_get_attr_or_key(logprobs, "tokens", []) or [])
         token_logprobs = list(_get_attr_or_key(logprobs, "token_logprobs", []) or [])
         text_offsets = list(_get_attr_or_key(logprobs, "text_offset", []) or [])
         if not tokens or not token_logprobs or not text_offsets:
-            raise RuntimeError("Completion echo response did not include prompt token logprobs.")
+            raise RuntimeError("Completion response did not include prompt token logprobs.")
 
         target_start = len(prompt_prefix)
         target_end = len(prompt)
@@ -829,6 +844,86 @@ class FinalAnswerScorer:
             "num_target_tokens": len(target_logprobs),
             "target_tokens": target_tokens,
         }
+
+    def _target_prompt_logprobs(
+        self,
+        prompt_logprobs: Sequence[Any],
+        target_answer: str,
+    ) -> tuple[List[float], List[str]]:
+        target_text = self._normalize_teacher_token_text(target_answer)
+        if not target_text:
+            return [], []
+
+        states: List[tuple[str, List[float], List[str]]] = [("", [], [])]
+        max_steps = max(8, min(64, len(str(target_answer)) * 4 + 8))
+        for step in reversed(list(prompt_logprobs)[-max_steps:]):
+            candidates = self._prompt_logprob_candidates(step)
+            if not candidates:
+                continue
+
+            next_states: List[tuple[str, List[float], List[str]]] = []
+            for token_text, token_logprob in candidates:
+                for suffix_text, suffix_logprobs, suffix_tokens in states:
+                    combined_text = f"{token_text}{suffix_text}"
+                    normalized = self._normalize_teacher_token_text(combined_text)
+                    if not normalized:
+                        continue
+                    if normalized == target_text:
+                        return (
+                            [float(token_logprob), *suffix_logprobs],
+                            [token_text, *suffix_tokens],
+                        )
+                    if target_text.endswith(normalized) or normalized.endswith(target_text):
+                        next_states.append(
+                            (
+                                combined_text,
+                                [float(token_logprob), *suffix_logprobs],
+                                [token_text, *suffix_tokens],
+                            )
+                        )
+
+            next_states.sort(
+                key=lambda item: (
+                    len(self._normalize_teacher_token_text(item[0])),
+                    sum(item[1]),
+                ),
+                reverse=True,
+            )
+            states = next_states[:16]
+            if not states:
+                break
+
+        return [], []
+
+    def _prompt_logprob_candidates(self, step: Any) -> List[tuple[str, float]]:
+        if not step:
+            return []
+        if isinstance(step, dict):
+            values = step.values()
+        else:
+            values = []
+
+        candidates: List[tuple[str, float]] = []
+        seen = set()
+        for value in values:
+            logprob = _get_attr_or_key(value, "logprob")
+            if logprob is None:
+                continue
+            token = _get_attr_or_key(value, "decoded_token")
+            if token is None:
+                token = _get_attr_or_key(value, "token")
+            if token is None:
+                continue
+            token_text = str(token)
+            key = (token_text, float(logprob))
+            if key in seen:
+                continue
+            seen.add(key)
+            candidates.append((token_text, float(logprob)))
+        return candidates
+
+    def _normalize_teacher_token_text(self, text: Any) -> str:
+        return re.sub(r"\s+", " ", str(text)).strip()
 
     async def _generated_target_logprob(
         self,
