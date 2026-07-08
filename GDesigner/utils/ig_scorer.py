@@ -790,7 +790,9 @@ class FinalAnswerScorer:
         response = await AsyncOpenAI(**_openai_client_kwargs(base_url)).completions.create(
             model=llm.model_name,
             prompt=prompt,
-            max_tokens=0,
+            # Some vLLM versions reject or crash on max_tokens=0 for echo-only
+            # scoring. Generate one token and ignore it when slicing by offsets.
+            max_tokens=1,
             temperature=0.0,
             logprobs=1,
             echo=True,
@@ -822,6 +824,8 @@ class FinalAnswerScorer:
 
         return sum(target_logprobs) / len(target_logprobs), {
             "method": "completion_echo_teacher_logprob",
+            "request_max_tokens": 1,
+            "ignored_generated_tokens": True,
             "num_target_tokens": len(target_logprobs),
             "target_tokens": target_tokens,
         }
