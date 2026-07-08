@@ -39,13 +39,13 @@ def parse_args():
     parser.add_argument('--imp_per_iterations', type=int, default=5,
                         help="Prune temporal edges every few iterations when --optimized_temporal is set.")
     parser.add_argument('--num_rounds',type=int,default=2,
-                        help="Number of optimization/inference rounds for one query. Use at least 2 to measure KHEAT uncertainty reduction after communication.")
+                        help="Number of optimization/inference rounds for one query.")
     parser.add_argument('--pruning_rate', type=float, default=0.25,
                         help="Rate for temporal edge pruning when --optimized_temporal is set.")
     parser.add_argument('--use_edge_selector', action='store_true',
-                        help="Enable KHEAT uncertainty selector training and selector pruning during evaluation.")
-    parser.add_argument('--num_entropy_samples', type=int, default=5,
-                        help="Samples per agent before and after communication for KHEAT. Automatically raised to 2 when --use_edge_selector is set.")
+                        help="Enable final-agent teacher-logprob/execution IG selector training and selector pruning during evaluation.")
+    parser.add_argument('--num_entropy_samples', type=int, default=1,
+                        help="Deprecated for final-agent teacher-logprob IG; non-HumanEval IG scores final-agent teacher answers directly.")
     # KLE temporarily disabled; keep this hyperparameter ready for future re-enable.
     # parser.add_argument('--kle_heat_t', type=float, default=0.3,
     #                     help="Heat-kernel lengthscale for KHEAT uncertainty.")
@@ -60,7 +60,7 @@ def parse_args():
     parser.add_argument('--semantic_judge_max_concurrency', type=int, default=None,
                         help="Maximum concurrent semantic judge API requests. Defaults to SEMANTIC_JUDGE_MAX_CONCURRENCY or 64.")
     parser.add_argument('--negative_edge_reward_scale', type=float, default=1.0,
-                        help="Scale for negative edge rewards when an edge increases KHEAT uncertainty.")
+                        help="Scale for negative edge rewards when an edge has negative IG gain.")
     parser.add_argument('--nonpositive_edge_penalty', type=float, default=0.01,
                         help="Deprecated compatibility option; normalized edge rewards do not add a zero-gain penalty.")
     parser.add_argument('--selector_buffer_size', type=int, default=512,

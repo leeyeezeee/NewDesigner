@@ -1,5 +1,6 @@
 import ast
 import asyncio
+import inspect
 import math
 import re
 from dataclasses import dataclass
@@ -57,6 +58,12 @@ def _logsumexp(values: Sequence[float]) -> float:
     if not math.isfinite(max_value):
         return max_value
     return max_value + math.log(sum(math.exp(value - max_value) for value in values))
+
+
+def _get_attr_or_key(value: Any, name: str, default: Any = None) -> Any:
+    if isinstance(value, dict):
+        return value.get(name, default)
+    return getattr(value, name, default)
 
 
 def _normalize_label(label: str) -> str:
@@ -347,6 +354,246 @@ class FinalAnswerScorer:
             },
         )
 
+    async def teacher_answer_logprob(
+        self,
+        node,
+        input_data: Dict[str, Any],
+        spatial_info: Dict[str, Any],
+        temporal_info: Dict[str, Any],
+        target_spec: TargetSpec,
+    ) -> ScoreResult:
+        target_answer = self._teacher_answer_text(target_spec)
+        if not target_answer:
+            return ScoreResult(
+                score=float(_LOGPROB_FLOOR),
+                mode="teacher_logprob",
+                details={"target_answer": target_answer, "error": "empty target answer"},
+            )
+
+        processed = node._process_inputs(input_data, spatial_info, temporal_info)
+        if inspect.isawaitable(processed):
+            processed = await processed
+        system_prompt, user_prompt = processed
+        messages = self._teacher_messages(system_prompt, user_prompt)
+
+        try:
+            score, details = await self._completion_target_logprob(
+                node.llm,
+                messages,
+                target_answer,
+            )
+        except Exception as exc:
+            score, details = await self._generated_target_logprob(
+                node.llm,
+                messages,
+                target_answer,
+                str(exc),
+            )
+
+        details["target_answer"] = target_answer
+        return ScoreResult(
+            score=float(score),
+            mode="teacher_logprob",
+            details=details,
+        )
+
+    async def final_agent_teacher_answer_logprob(
+        self,
+        decision_node,
+        input_data: Dict[str, Any],
+        outputs: Iterable[Any],
+        target_spec: TargetSpec,
+        cluster_labels: Optional[Sequence[str]] = None,
+        base_spatial_info: Optional[Dict[str, Any]] = None,
+        candidate_id: str = "candidate",
+        candidate_role: str = "Candidate",
+    ) -> ScoreResult:
+        output_list, labels = _valid_outputs_and_labels(outputs, cluster_labels)
+        if not output_list:
+            return ScoreResult(
+                score=float(_LOGPROB_FLOOR),
+                mode="final_agent_teacher_logprob",
+                details={"num_outputs": 0, "error": "empty candidate outputs"},
+            )
+
+        representatives, aggregation = _cluster_representatives(output_list, labels)
+        scores = await asyncio.gather(*[
+            self._final_agent_single_output_teacher_logprob(
+                decision_node,
+                input_data,
+                representative.output,
+                target_spec,
+                base_spatial_info=base_spatial_info,
+                candidate_id=candidate_id,
+                candidate_role=candidate_role,
+            )
+            for representative in representatives
+        ])
+        weighted_score = sum(
+            representative.weight * float(score.score)
+            for representative, score in zip(representatives, scores)
+        )
+        return ScoreResult(
+            score=float(weighted_score),
+            mode="final_agent_teacher_logprob",
+            details={
+                "aggregation": aggregation,
+                "num_outputs": len(output_list),
+                "num_clusters": len(representatives),
+                "teacher_forcing_agent": "final_agent",
+                "clusters": [
+                    {
+                        "label": representative.label,
+                        "count": representative.count,
+                        "weight": representative.weight,
+                        "score": float(score.score),
+                        "details": score.details,
+                    }
+                    for representative, score in zip(representatives, scores)
+                ],
+            },
+        )
+
+    async def _final_agent_single_output_teacher_logprob(
+        self,
+        decision_node,
+        input_data: Dict[str, Any],
+        output: Any,
+        target_spec: TargetSpec,
+        base_spatial_info: Optional[Dict[str, Any]] = None,
+        candidate_id: str = "candidate",
+        candidate_role: str = "Candidate",
+    ) -> ScoreResult:
+        spatial_info = {
+            node_id: dict(info)
+            for node_id, info in (base_spatial_info or {}).items()
+        }
+        spatial_info[candidate_id] = {
+            "role": candidate_role,
+            "output": str(output),
+        }
+        result = await self.teacher_answer_logprob(
+            decision_node,
+            input_data,
+            spatial_info,
+            {},
+            target_spec,
+        )
+        result.details["teacher_forcing_agent"] = "final_agent"
+        result.details["candidate_id"] = candidate_id
+        result.details["candidate_role"] = candidate_role
+        result.details["candidate_output"] = str(output)
+        return result
+
+    async def final_agent_execution_score(
+        self,
+        decision_node,
+        input_data: Dict[str, Any],
+        outputs: Iterable[Any],
+        target_spec: TargetSpec,
+        cluster_labels: Optional[Sequence[str]] = None,
+        base_spatial_info: Optional[Dict[str, Any]] = None,
+        candidate_id: str = "candidate",
+        candidate_role: str = "Candidate",
+    ) -> ScoreResult:
+        output_list, labels = _valid_outputs_and_labels(outputs, cluster_labels)
+        if not output_list:
+            return ScoreResult(
+                score=0.0,
+                mode="final_agent_execution",
+                details={"num_outputs": 0, "error": "empty candidate outputs"},
+            )
+
+        representatives, aggregation = _cluster_representatives(output_list, labels)
+        scores = await asyncio.gather(*[
+            self._final_agent_single_output_execution_score(
+                decision_node,
+                input_data,
+                representative.output,
+                target_spec,
+                base_spatial_info=base_spatial_info,
+                candidate_id=candidate_id,
+                candidate_role=candidate_role,
+            )
+            for representative in representatives
+        ])
+        weighted_score = sum(
+            representative.weight * float(score.score)
+            for representative, score in zip(representatives, scores)
+        )
+        return ScoreResult(
+            score=float(weighted_score),
+            mode="final_agent_execution",
+            details={
+                "aggregation": aggregation,
+                "num_outputs": len(output_list),
+                "num_clusters": len(representatives),
+                "scoring_agent": "final_agent",
+                "clusters": [
+                    {
+                        "label": representative.label,
+                        "count": representative.count,
+                        "weight": representative.weight,
+                        "score": float(score.score),
+                        "details": score.details,
+                    }
+                    for representative, score in zip(representatives, scores)
+                ],
+            },
+        )
+
+    async def _final_agent_single_output_execution_score(
+        self,
+        decision_node,
+        input_data: Dict[str, Any],
+        output: Any,
+        target_spec: TargetSpec,
+        base_spatial_info: Optional[Dict[str, Any]] = None,
+        candidate_id: str = "candidate",
+        candidate_role: str = "Candidate",
+    ) -> ScoreResult:
+        spatial_info = {
+            node_id: dict(info)
+            for node_id, info in (base_spatial_info or {}).items()
+        }
+        spatial_info[candidate_id] = {
+            "role": candidate_role,
+            "output": str(output),
+        }
+        generated = decision_node._async_execute(input_data, spatial_info, {})
+        if inspect.isawaitable(generated):
+            generated = await generated
+        score = await asyncio.to_thread(self._execution_score, generated, target_spec)
+        return ScoreResult(
+            score=float(score),
+            mode="final_agent_execution",
+            details={
+                "scoring_agent": "final_agent",
+                "candidate_id": candidate_id,
+                "candidate_role": candidate_role,
+                "candidate_output": str(output),
+                "final_agent_output": str(generated),
+            },
+        )
+
+    def _teacher_answer_text(self, target_spec: TargetSpec) -> str:
+        return str(target_spec.correct).strip()
+
+    def _teacher_messages(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+    ) -> List[Dict[str, str]]:
+        user_prompt = (
+            f"{user_prompt}\n\n"
+            "Return only the final answer. Do not include reasoning, explanation, "
+            "units unless required by the answer, or any extra text."
+        )
+        return [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+
     def _execution_score(self, output: Any, target_spec: TargetSpec) -> float:
         from GDesigner.tools.coding.python_executor import PyExecutor
 
@@ -510,3 +757,105 @@ class FinalAnswerScorer:
             )
         target_logprob = label_logprobs.get(normalized_target, _LOGPROB_FLOOR)
         return target_logprob - _logsumexp(list(label_logprobs.values()))
+
+    def _completion_prompt_prefix(self, messages: List[Dict[str, str]]) -> str:
+        parts = []
+        for message in messages:
+            role = str(message.get("role", "user"))
+            content = str(message.get("content", ""))
+            parts.append(f"<|im_start|>{role}\n{content}<|im_end|>\n")
+        parts.append("<|im_start|>assistant\n")
+        return "".join(parts)
+
+    async def _completion_target_logprob(
+        self,
+        llm,
+        messages: List[Dict[str, str]],
+        target_answer: str,
+    ) -> tuple[float, Dict[str, Any]]:
+        from openai import AsyncOpenAI
+
+        from GDesigner.llm.gpt_chat import (
+            _agent_base_url,
+            _is_openai_compatible,
+            _openai_client_kwargs,
+        )
+
+        base_url = _agent_base_url()
+        if not _is_openai_compatible(base_url):
+            raise RuntimeError("Teacher-forcing IG requires an OpenAI-compatible agent backend.")
+
+        prompt_prefix = self._completion_prompt_prefix(messages)
+        prompt = prompt_prefix + target_answer
+        response = await AsyncOpenAI(**_openai_client_kwargs(base_url)).completions.create(
+            model=llm.model_name,
+            prompt=prompt,
+            max_tokens=0,
+            temperature=0.0,
+            logprobs=1,
+            echo=True,
+        )
+
+        choice = response.choices[0]
+        logprobs = _get_attr_or_key(choice, "logprobs")
+        tokens = list(_get_attr_or_key(logprobs, "tokens", []) or [])
+        token_logprobs = list(_get_attr_or_key(logprobs, "token_logprobs", []) or [])
+        text_offsets = list(_get_attr_or_key(logprobs, "text_offset", []) or [])
+        if not tokens or not token_logprobs or not text_offsets:
+            raise RuntimeError("Completion echo response did not include prompt token logprobs.")
+
+        target_start = len(prompt_prefix)
+        target_end = len(prompt)
+        target_logprobs = []
+        target_tokens = []
+        for idx, (token, logprob, offset) in enumerate(zip(tokens, token_logprobs, text_offsets)):
+            if logprob is None:
+                continue
+            next_offset = text_offsets[idx + 1] if idx + 1 < len(text_offsets) else len(prompt)
+            if next_offset <= target_start or int(offset) >= target_end:
+                continue
+            target_logprobs.append(float(logprob))
+            target_tokens.append(str(token))
+
+        if not target_logprobs:
+            raise RuntimeError("No target-answer token logprobs were found in completion echo response.")
+
+        return sum(target_logprobs) / len(target_logprobs), {
+            "method": "completion_echo_teacher_logprob",
+            "num_target_tokens": len(target_logprobs),
+            "target_tokens": target_tokens,
+        }
+
+    async def _generated_target_logprob(
+        self,
+        llm,
+        messages: List[Dict[str, str]],
+        target_answer: str,
+        fallback_reason: str,
+    ) -> tuple[float, Dict[str, Any]]:
+        max_tokens = max(4, len(str(target_answer).split()) + 8)
+        generation = await llm.agen(
+            messages,
+            max_tokens=max_tokens,
+            temperature=0.0,
+            num_comps=1,
+            return_logprobs=True,
+        )
+        content = generation.content if hasattr(generation, "content") else str(generation)
+        token_logprobs = list(getattr(generation, "token_logprobs", []) or [])
+        logprobs = [
+            float(item.logprob)
+            for item in token_logprobs
+            if getattr(item, "logprob", None) is not None
+        ]
+        score = sum(logprobs) / len(logprobs) if logprobs else float(_LOGPROB_FLOOR)
+        return score, {
+            "method": "generated_answer_logprob_fallback",
+            "fallback_reason": fallback_reason,
+            "generated_answer": content,
+            "target_match": self._answers_match(content, target_answer),
+            "num_generated_tokens": len(logprobs),
+        }
+
+    def _answers_match(self, generated: Any, target: Any) -> bool:
+        return str(generated).strip().lower() == str(target).strip().lower()

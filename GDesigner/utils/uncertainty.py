@@ -434,6 +434,23 @@ async def _sample_node_outputs(
     return _flatten_outputs(await asyncio.gather(*tasks, return_exceptions=False))
 
 
+def _current_graph_output_info(graph) -> Dict[str, Dict[str, Any]]:
+    output_info: Dict[str, Dict[str, Any]] = {}
+    for node_id, node in graph.nodes.items():
+        node_outputs = getattr(node, "outputs", [])
+        if isinstance(node_outputs, list):
+            if not node_outputs:
+                continue
+            node_output = node_outputs[-1]
+        else:
+            node_output = node_outputs
+        output_info[node_id] = {
+            "role": getattr(node, "role", ""),
+            "output": node_output,
+        }
+    return output_info
+
+
 def _edge_reward_from_delta(
     uncertainty_delta: float,
     negative_reward_scale: float,
@@ -454,17 +471,22 @@ def _normalize_edge_rewards(
     if not details:
         return {}
 
-    uncertainty_deltas = [
-        float(detail.get("uncertainty_delta", detail.get("entropy_delta", 0.0)))
+    reward_key = (
+        "ig_gain"
+        if any("ig_gain" in detail for detail in details.values())
+        else "uncertainty_delta"
+    )
+    reward_values = [
+        float(detail.get(reward_key, detail.get("entropy_delta", 0.0)))
         for detail in details.values()
     ]
-    max_abs_delta = max(abs(delta) for delta in uncertainty_deltas)
+    max_abs_delta = max(abs(value) for value in reward_values)
 
     rewards: Dict[str, float] = {}
     for key, detail in details.items():
-        uncertainty_delta = float(detail.get("uncertainty_delta", detail.get("entropy_delta", 0.0)))
+        reward_value = float(detail.get(reward_key, detail.get("entropy_delta", 0.0)))
         normalized_delta = (
-            uncertainty_delta / max_abs_delta
+            reward_value / max_abs_delta
             if max_abs_delta > 0
             else 0.0
         )
@@ -473,6 +495,8 @@ def _normalize_edge_rewards(
             negative_reward_scale=negative_reward_scale,
             nonpositive_penalty=nonpositive_penalty,
         )
+        if reward_key == "ig_gain":
+            detail["normalized_ig_gain"] = normalized_delta
         detail["normalized_uncertainty_delta"] = normalized_delta
         detail["normalized_entropy_delta"] = normalized_delta
         detail["reward"] = reward
@@ -493,9 +517,10 @@ async def edge_entropy_rewards(
     ig_scorer: Optional[FinalAnswerScorer] = None,
     compute_rewards: bool = True,
 ) -> Tuple[Dict[str, float], Dict[str, Dict[str, Any]]]:
-    """Measure each selected edge by removing it and comparing the receiver state."""
-    if not graph.edge_log_probs or num_entropy_samples <= 1:
+    """Measure each selected edge by removing it and scoring receiver outputs."""
+    if not graph.edge_log_probs:
         return {}, {}
+    sample_count = max(1, int(num_entropy_samples))
 
     histories: Dict[Tuple[str, int], Dict[str, Any]] = {}
     for node_id, node in graph.nodes.items():
@@ -507,6 +532,11 @@ async def edge_entropy_rewards(
     after_outputs_cache: Dict[Tuple[str, int], List[Any]] = {}
     after_score_cache: Dict[Tuple[str, int], Any] = {}
     scorer = ig_scorer or (FinalAnswerScorer() if target_spec is not None else None)
+    final_spatial_info = (
+        _current_graph_output_info(graph)
+        if target_spec is not None
+        else None
+    )
 
     for edge_info in graph.edge_log_probs:
         target_id = edge_info["target"]
@@ -547,7 +577,7 @@ async def edge_entropy_rewards(
             input_data,
             before_spatial_info,
             before_temporal_info,
-            num_entropy_samples,
+            sample_count,
         )
         if not before_outputs:
             continue
@@ -560,7 +590,6 @@ async def edge_entropy_rewards(
             if not after_outputs:
                 continue
             after_outputs_cache[after_cache_key] = list(after_outputs)
-            history_item["entropy_samples"] = []
 
         if judge is None:
             before_uncertainty = 0.0
@@ -597,26 +626,57 @@ async def edge_entropy_rewards(
         before_answer_score = None
         after_answer_score = None
         if target_spec is not None and scorer is not None:
-            before_score_task = scorer.score_outputs(
-                graph.decision_node,
-                input_data,
-                before_uncertainty_details.get("outputs", before_outputs),
-                target_spec,
-                cluster_labels=before_uncertainty_details.get("labels"),
-            )
+            if target_spec.mode != "execution":
+                before_score_task = scorer.final_agent_teacher_answer_logprob(
+                    graph.decision_node,
+                    input_data,
+                    before_outputs,
+                    target_spec,
+                    cluster_labels=None,
+                    base_spatial_info=final_spatial_info,
+                    candidate_id=target_id,
+                    candidate_role=getattr(target_node, "role", "Candidate"),
+                )
+            else:
+                before_score_task = scorer.final_agent_execution_score(
+                    graph.decision_node,
+                    input_data,
+                    before_outputs,
+                    target_spec,
+                    cluster_labels=None,
+                    base_spatial_info=final_spatial_info,
+                    candidate_id=target_id,
+                    candidate_role=getattr(target_node, "role", "Candidate"),
+                )
             if after_cache_key in after_score_cache:
                 before_score = await before_score_task
                 after_score = after_score_cache[after_cache_key]
             else:
-                before_score, after_score = await asyncio.gather(
-                    before_score_task,
-                    scorer.score_outputs(
+                if target_spec.mode != "execution":
+                    after_score_task = scorer.final_agent_teacher_answer_logprob(
                         graph.decision_node,
                         input_data,
-                        after_uncertainty_details.get("outputs", after_outputs),
+                        after_outputs,
                         target_spec,
-                        cluster_labels=after_uncertainty_details.get("labels"),
-                    ),
+                        cluster_labels=None,
+                        base_spatial_info=final_spatial_info,
+                        candidate_id=target_id,
+                        candidate_role=getattr(target_node, "role", "Candidate"),
+                    )
+                else:
+                    after_score_task = scorer.final_agent_execution_score(
+                        graph.decision_node,
+                        input_data,
+                        after_outputs,
+                        target_spec,
+                        cluster_labels=None,
+                        base_spatial_info=final_spatial_info,
+                        candidate_id=target_id,
+                        candidate_role=getattr(target_node, "role", "Candidate"),
+                    )
+                before_score, after_score = await asyncio.gather(
+                    before_score_task,
+                    after_score_task,
                 )
                 after_score_cache[after_cache_key] = after_score
             before_answer_score = before_score.score
@@ -644,9 +704,23 @@ async def edge_entropy_rewards(
             details[key]["ig_gain"] = float(ig_gain)
             details[key]["before_answer_score"] = float(before_answer_score)
             details[key]["after_answer_score"] = float(after_answer_score)
+            if target_spec.mode != "execution":
+                details[key]["before_teacher_logprob"] = float(before_answer_score)
+                details[key]["after_teacher_logprob"] = float(after_answer_score)
+                details[key]["uncertainty_method"] = "final_agent_teacher_logprob_diff"
+                details[key]["teacher_forcing_agent"] = "final_agent"
+                details[key]["teacher_forcing_candidate_role"] = getattr(target_node, "role", "")
+            else:
+                details[key]["uncertainty_method"] = "final_agent_execution_score_diff"
+                details[key]["scoring_agent"] = "final_agent"
+                details[key]["execution_candidate_role"] = getattr(target_node, "role", "")
             details[key]["before_answer_details"] = before_score.details
             details[key]["after_answer_details"] = after_score.details
-            details[key]["ig_mode"] = target_spec.mode
+            details[key]["ig_mode"] = (
+                "final_agent_teacher_logprob_diff"
+                if target_spec.mode != "execution"
+                else "final_agent_execution_score_diff"
+            )
 
     rewards = (
         _normalize_edge_rewards(

@@ -6,13 +6,30 @@ from GDesigner.utils.ig_scorer import FinalAnswerScorer, ScoreResult, TargetSpec
 from GDesigner.utils.uncertainty import edge_key
 
 
+def _graph_output_info(graph) -> Dict[str, Dict[str, Any]]:
+    output_info: Dict[str, Dict[str, Any]] = {}
+    for node_id, node in graph.nodes.items():
+        node_outputs = getattr(node, "outputs", [])
+        if isinstance(node_outputs, list):
+            if not node_outputs:
+                continue
+            node_output = node_outputs[-1]
+        else:
+            node_output = node_outputs
+        output_info[node_id] = {
+            "role": getattr(node, "role", ""),
+            "output": node_output,
+        }
+    return output_info
+
+
 def add_teacher_forcing_reward_args(parser) -> None:
     parser.add_argument(
         "--use_graph_tf_reward",
         action="store_true",
         help=(
             "Use multi-sampled graph teacher-forcing scores as graph-level "
-            "weights and semantic-cluster weighted IG gains as per-edge update weights."
+            "weights and final-agent teacher-answer logprob IG gains as per-edge update weights."
         ),
     )
     parser.add_argument(
@@ -31,7 +48,7 @@ def add_teacher_forcing_reward_args(parser) -> None:
         "--edge_tanh_temperature",
         type=float,
         default=1.0,
-        help="Temperature for tanh normalization of edge semantic-cluster weighted IG gains.",
+        help="Temperature for tanh normalization of final-agent edge teacher-answer logprob IG gains.",
     )
 
 
@@ -42,6 +59,15 @@ async def graph_teacher_forcing_score(
     outputs: Iterable[Any],
     target_spec: TargetSpec,
 ) -> ScoreResult:
+    if target_spec.mode != "execution":
+        return await scorer.teacher_answer_logprob(
+            graph.decision_node,
+            input_data,
+            _graph_output_info(graph),
+            {},
+            target_spec,
+        )
+
     return await scorer.score_outputs(
         graph.decision_node,
         input_data,

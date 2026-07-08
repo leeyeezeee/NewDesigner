@@ -19,7 +19,6 @@ from GDesigner.utils.edge_selector import (
     train_edge_selector,
 )
 from GDesigner.utils.uncertainty import (
-    SemanticEntailmentJudge,
     edge_entropy_rewards,
 )
 from GDesigner.utils.ig_scorer import FinalAnswerScorer, make_target_spec
@@ -80,22 +79,10 @@ async def train(graph:Graph,
                     yield record
     
     loader = infinite_data_loader()
-    effective_num_entropy_samples = (
-        max(2, int(num_entropy_samples))
-        if (use_edge_selector or use_graph_tf_reward)
-        else max(1, int(num_entropy_samples))
-    )
-    use_semantic_edges = (use_edge_selector or use_graph_tf_reward) and effective_num_entropy_samples > 1
-    batch_entropy_samples = effective_num_entropy_samples if use_semantic_edges else 1
+    effective_num_entropy_samples = 1
+    use_semantic_edges = use_edge_selector or use_graph_tf_reward
+    batch_entropy_samples = 1
     semantic_judge = None
-    if use_semantic_edges:
-        semantic_judge = SemanticEntailmentJudge(
-            llm_name=semantic_judge_llm_name,
-            api_key=semantic_judge_api_key,
-            base_url=semantic_judge_base_url,
-            model_path=semantic_judge_model_path,
-            max_concurrency=semantic_judge_max_concurrency,
-        )
     edge_selector = None
     selector_buffer = None
     selector_optimizer = None

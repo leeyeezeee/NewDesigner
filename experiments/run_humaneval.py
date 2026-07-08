@@ -25,7 +25,6 @@ from GDesigner.utils.edge_selector import (
     train_edge_selector,
 )
 from GDesigner.utils.uncertainty import (
-    SemanticEntailmentJudge,
     edge_entropy_rewards,
 )
 from GDesigner.utils.ig_scorer import FinalAnswerScorer, make_target_spec
@@ -60,9 +59,9 @@ def parse_args():
     parser.add_argument('--imp_per_iterations', type=int, default=5,
                         help="Prune temporal edges every few iterations when --optimized_temporal is set.")
     parser.add_argument('--use_edge_selector', action='store_true',
-                        help="Enable KHEAT uncertainty selector training and selector pruning during evaluation.")
-    parser.add_argument('--num_entropy_samples', type=int, default=5,
-                        help="Samples per agent before and after communication for KHEAT. Automatically raised to 2 when --use_edge_selector is set.")
+                        help="Enable final-agent teacher-logprob/execution IG selector training and selector pruning during evaluation.")
+    parser.add_argument('--num_entropy_samples', type=int, default=1,
+                        help="Deprecated for final-agent teacher-logprob IG; non-HumanEval IG scores final-agent teacher answers directly.")
     # KLE temporarily disabled; keep this hyperparameter ready for future re-enable.
     # parser.add_argument('--kle_heat_t', type=float, default=0.3,
     #                     help="Heat-kernel lengthscale for KHEAT uncertainty.")
@@ -77,7 +76,7 @@ def parse_args():
     parser.add_argument('--semantic_judge_max_concurrency', type=int, default=None,
                         help="Maximum concurrent semantic judge API requests. Defaults to SEMANTIC_JUDGE_MAX_CONCURRENCY or 64.")
     parser.add_argument('--negative_edge_reward_scale', type=float, default=1.0,
-                        help="Scale for negative edge rewards when an edge increases KHEAT uncertainty.")
+                        help="Scale for negative edge rewards when an edge has negative IG gain.")
     parser.add_argument('--nonpositive_edge_penalty', type=float, default=0.01,
                         help="Deprecated compatibility option; normalized edge rewards do not add a zero-gain penalty.")
     parser.add_argument('--selector_buffer_size', type=int, default=512,
@@ -143,26 +142,13 @@ async def main():
         optimizer_params.append(graph.temporal_logits)
     optimizer = torch.optim.Adam(optimizer_params, lr=args.lr)
     use_graph_tf_reward = bool(getattr(args, "use_graph_tf_reward", False))
-    effective_num_entropy_samples = (
-        max(2, int(args.num_entropy_samples))
-        if (args.use_edge_selector or use_graph_tf_reward)
-        else max(1, int(args.num_entropy_samples))
-    )
+    effective_num_entropy_samples = 1
     optimize_enabled = args.optimized_spatial or args.optimized_temporal
     use_semantic_edges_for_analysis = (
         optimize_enabled
         and (args.use_edge_selector or use_graph_tf_reward)
-        and effective_num_entropy_samples > 1
     )
     semantic_judge = None
-    if use_semantic_edges_for_analysis:
-        semantic_judge = SemanticEntailmentJudge(
-            llm_name=args.semantic_judge_llm_name,
-            api_key=args.semantic_judge_api_key,
-            base_url=args.semantic_judge_base_url,
-            model_path=args.semantic_judge_model_path,
-            max_concurrency=args.semantic_judge_max_concurrency,
-        )
     edge_selector = None
     selector_buffer = None
     selector_optimizer = None
@@ -180,7 +166,7 @@ async def main():
     for i_batch in range(num_batches):
         train_updates_enabled = optimize_enabled and i_batch < args.num_iterations
         use_semantic_edges = use_semantic_edges_for_analysis and train_updates_enabled
-        batch_entropy_samples = effective_num_entropy_samples if use_semantic_edges else 1
+        batch_entropy_samples = 1
         batch_edge_selector = edge_selector if (selector_trained and not train_updates_enabled) else None
         print(f"Batch {i_batch}",80*'-')
         start_ts = time.time()

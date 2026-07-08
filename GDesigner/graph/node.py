@@ -22,7 +22,7 @@ class Node(ABC):
         spatial_successors (List[Node]): Nodes that succeed this node in the graph.
         inputs (List[Any]): Inputs to be processed by the node.
         outputs (List[Any]): Communication outputs produced after node execution.
-        entropy_samples (List[Any]): Same-context samples used only for KHEAT uncertainty estimation.
+        entropy_samples (List[Any]): Same-context outputs recorded for edge IG estimation.
         raw_inputs (List[Any]): The original input contains the question or math problem.
         last_memory (Dict[str,List[Any]]): Input and output of the previous timestamp.
         

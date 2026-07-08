@@ -40,8 +40,9 @@ def parse_args():
     parser.add_argument("--checkpoint_file", type=str, default="result/checkpoints/aqua.pt",
                         help="Path to overwrite with the trained graph checkpoint.")
     parser.add_argument("--use_edge_selector", action="store_true",
-                        help="Enable KHEAT uncertainty selector training and selector pruning during evaluation.")
-    parser.add_argument("--num_entropy_samples", type=int, default=5)
+                        help="Enable final-agent teacher-logprob/execution IG selector training and selector pruning during evaluation.")
+    parser.add_argument("--num_entropy_samples", type=int, default=1,
+                        help="Deprecated for final-agent teacher-logprob IG; non-HumanEval IG scores final-agent teacher answers directly.")
     # KLE temporarily disabled; keep this hyperparameter ready for future re-enable.
     # parser.add_argument("--kle_heat_t", type=float, default=0.3,
     #                     help="Heat-kernel lengthscale for KHEAT uncertainty.")

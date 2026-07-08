@@ -17,7 +17,6 @@ from GDesigner.utils.edge_selector import (
     train_edge_selector,
 )
 from GDesigner.utils.uncertainty import (
-    SemanticEntailmentJudge,
     edge_entropy_rewards,
 )
 from GDesigner.utils.ig_scorer import FinalAnswerScorer, make_target_spec
@@ -85,26 +84,13 @@ async def run_math_dataset(
     optimizer = torch.optim.Adam(optimizer_params, lr=args.lr)
 
     use_graph_tf_reward = bool(getattr(args, "use_graph_tf_reward", False))
-    effective_num_entropy_samples = (
-        max(2, int(args.num_entropy_samples))
-        if (args.use_edge_selector or use_graph_tf_reward)
-        else max(1, int(args.num_entropy_samples))
-    )
+    effective_num_entropy_samples = 1
     optimize_enabled = args.optimized_spatial or args.optimized_temporal
     use_semantic_edges_for_analysis = (
         optimize_enabled
         and (args.use_edge_selector or use_graph_tf_reward)
-        and effective_num_entropy_samples > 1
     )
     semantic_judge = None
-    if use_semantic_edges_for_analysis:
-        semantic_judge = SemanticEntailmentJudge(
-            llm_name=args.semantic_judge_llm_name,
-            api_key=args.semantic_judge_api_key,
-            base_url=args.semantic_judge_base_url,
-            model_path=args.semantic_judge_model_path,
-            max_concurrency=args.semantic_judge_max_concurrency,
-        )
     edge_selector = None
     selector_buffer = None
     selector_optimizer = None
@@ -123,7 +109,7 @@ async def run_math_dataset(
     for i_batch in range(num_batches):
         train_updates_enabled = optimize_enabled and i_batch < args.num_iterations
         use_semantic_edges = use_semantic_edges_for_analysis and train_updates_enabled
-        batch_entropy_samples = effective_num_entropy_samples if use_semantic_edges else 1
+        batch_entropy_samples = 1
         batch_edge_selector = edge_selector if (selector_trained and not train_updates_enabled) else None
         print(f"Batch {i_batch}", 80 * "-")
         start_ts = time.time()

@@ -24,6 +24,8 @@ sys.stdout.reconfigure(encoding="utf-8")
 from GDesigner.graph.graph import Graph
 from GDesigner.tools.coding.python_executor import PyExecutor
 from GDesigner.tools.reader.readers import JSONLReader, JSONReader
+from GDesigner.utils.ig_scorer import FinalAnswerScorer, make_target_spec
+from GDesigner.utils.uncertainty import edge_entropy_rewards
 from datasets.MMLU.download import download as download_mmlu
 from datasets.aqua_dataset import aqua_data_process, aqua_get_predict
 from datasets.gsm8k_dataset import (
@@ -75,9 +77,9 @@ class InferenceResult:
     predicted_answer: str
     target_answer: str
     is_correct: bool
-    mean_agent_token_logprob: Optional[float]
-    mean_agent_token_probability: Optional[float]
-    agent_token_logprob_details: List[Dict[str, Any]]
+    graph_edge_ig_sum: float
+    graph_edge_ig_count: int
+    edge_ig_details: List[Dict[str, Any]]
 
 
 @dataclass(frozen=True)
@@ -142,8 +144,8 @@ DATASET_DEFAULTS: Dict[str, DatasetDefaults] = {
 def parse_args():
     parser = argparse.ArgumentParser(
         description=(
-            "Plot the distribution of mean agent token probability from generated "
-            "token logprobs over the first tokens in one sampled graph per task."
+            "Plot the relationship between the graph edge information-gain sum "
+            "and final-answer correctness in one sampled graph per task."
         )
     )
     parser.add_argument(
@@ -190,7 +192,7 @@ def parse_args():
         "--k",
         type=int,
         default=16,
-        help="Number of leading generated tokens used for each agent output.",
+        help="Deprecated; edge IG no longer uses generated token prefixes.",
     )
     parser.add_argument("--llm_name", type=str, default="gpt-4o")
     parser.add_argument(
@@ -820,6 +822,99 @@ def collect_agent_token_logprob_probability(
     return mean_logprob, mean_probability, details
 
 
+def target_spec_for_bundle(bundle: DatasetBundle, target_answer: str):
+    if bundle.name == "humaneval":
+        return make_target_spec(bundle.name, tests=[target_answer])
+    return make_target_spec(bundle.name, target_answer)
+
+
+def observed_edge_infos_from_history(graph: Graph) -> List[Dict[str, Any]]:
+    edge_infos: List[Dict[str, Any]] = []
+    seen = set()
+    for target_id, node in graph.nodes.items():
+        for history in node.execution_history:
+            round_idx = history.get("round")
+            if round_idx is None:
+                continue
+            for edge_type, info_key in (
+                ("spatial", "spatial_info"),
+                ("temporal", "temporal_info"),
+            ):
+                for source_id in history.get(info_key, {}).keys():
+                    key = f"{edge_type}:{round_idx}:{source_id}->{target_id}"
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    edge_infos.append(
+                        {
+                            "type": edge_type,
+                            "round": round_idx,
+                            "source": source_id,
+                            "target": target_id,
+                            "edge_key": key,
+                        }
+                    )
+    return edge_infos
+
+
+def edge_details_to_rows(edge_details: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
+    rows = []
+    for key, detail in sorted(edge_details.items()):
+        ig_gain = detail.get("ig_gain")
+        rows.append(
+            {
+                "edge_key": key,
+                "type": detail.get("type"),
+                "round": detail.get("round"),
+                "source": detail.get("source"),
+                "target": detail.get("target"),
+                "ig_gain": float(ig_gain) if ig_gain is not None else None,
+                "ig_mode": detail.get("ig_mode"),
+                "uncertainty_method": detail.get("uncertainty_method"),
+                "teacher_forcing_agent": detail.get("teacher_forcing_agent"),
+                "teacher_forcing_candidate_role": detail.get("teacher_forcing_candidate_role"),
+                "scoring_agent": detail.get("scoring_agent"),
+                "execution_candidate_role": detail.get("execution_candidate_role"),
+                "before_teacher_logprob": detail.get("before_teacher_logprob"),
+                "after_teacher_logprob": detail.get("after_teacher_logprob"),
+                "before_answer_score": detail.get("before_answer_score"),
+                "after_answer_score": detail.get("after_answer_score"),
+            }
+        )
+    return rows
+
+
+async def compute_graph_edge_ig_sum(
+    graph: Graph,
+    bundle: DatasetBundle,
+    input_dict: Dict[str, Any],
+    target_answer: str,
+    scorer: FinalAnswerScorer,
+) -> Tuple[float, int, List[Dict[str, Any]]]:
+    graph.edge_log_probs = observed_edge_infos_from_history(graph)
+    if not graph.edge_log_probs:
+        return 0.0, 0, []
+
+    # Edge IG replaces the receiver output, then scores the final agent context.
+    _edge_rewards, edge_details = await edge_entropy_rewards(
+        graph,
+        input_dict.get("task", str(input_dict)),
+        input_dict,
+        judge=None,
+        num_entropy_samples=1,
+        target_spec=target_spec_for_bundle(bundle, target_answer),
+        ig_scorer=scorer,
+        compute_rewards=False,
+    )
+    detail_rows = edge_details_to_rows(edge_details)
+    gains = [
+        row["ig_gain"]
+        for row in detail_rows
+        if row["ig_gain"] is not None and math.isfinite(row["ig_gain"])
+    ]
+    return float(sum(gains)), len(gains), detail_rows
+
+
 async def run_record_inference(
     bundle: DatasetBundle,
     record_index: int,
@@ -829,14 +924,15 @@ async def run_record_inference(
 ) -> InferenceResult:
     input_dict = bundle.record_to_input(record)
     realized_graph = build_graph(bundle, args, agent_names)
+    scorer = FinalAnswerScorer()
     raw_answer, _log_prob = await realized_graph.arun(
         input_dict,
         bundle.num_rounds,
         num_entropy_samples=1,
         record_execution_history=True,
         track_grad=False,
-        record_node_logprobs=True,
-        node_logprob_token_limit=args.k,
+        record_node_logprobs=False,
+        node_logprob_token_limit=None,
         record_decision_logprobs=False,
     )
 
@@ -844,9 +940,12 @@ async def run_record_inference(
     predicted_answer = bundle.parse_prediction(raw_answer)
     target_answer = bundle.record_to_target(record)
     is_correct = await compute_correctness(bundle, predicted_answer, target_answer)
-    mean_logprob, mean_probability, logprob_details = collect_agent_token_logprob_probability(
+    edge_ig_sum, edge_ig_count, edge_ig_details = await compute_graph_edge_ig_sum(
         realized_graph,
-        args.k,
+        bundle,
+        input_dict,
+        target_answer,
+        scorer,
     )
     return InferenceResult(
         dataset=bundle.name,
@@ -856,13 +955,13 @@ async def run_record_inference(
         predicted_answer=predicted_answer,
         target_answer=target_answer,
         is_correct=is_correct,
-        mean_agent_token_logprob=mean_logprob,
-        mean_agent_token_probability=mean_probability,
-        agent_token_logprob_details=logprob_details,
+        graph_edge_ig_sum=edge_ig_sum,
+        graph_edge_ig_count=edge_ig_count,
+        edge_ig_details=edge_ig_details,
     )
 
 
-async def attach_agent_token_logprob_probability(
+async def attach_edge_ig_summary(
     result: InferenceResult,
 ) -> Dict[str, Any]:
     return {
@@ -872,9 +971,9 @@ async def attach_agent_token_logprob_probability(
         "predicted_answer": result.predicted_answer,
         "target_answer": result.target_answer,
         "is_correct": result.is_correct,
-        "mean_agent_token_logprob": result.mean_agent_token_logprob,
-        "mean_agent_token_probability": result.mean_agent_token_probability,
-        "agent_token_logprob_details": result.agent_token_logprob_details,
+        "graph_edge_ig_sum": result.graph_edge_ig_sum,
+        "graph_edge_ig_count": result.graph_edge_ig_count,
+        "edge_ig_details": result.edge_ig_details,
     }
 
 
@@ -890,9 +989,9 @@ def save_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
                 "predicted_answer",
                 "target_answer",
                 "is_correct",
-                "mean_agent_token_logprob",
-                "mean_agent_token_probability",
-                "agent_token_logprob_details",
+                "graph_edge_ig_sum",
+                "graph_edge_ig_count",
+                "edge_ig_details",
             ],
         )
         writer.writeheader()
@@ -900,56 +999,94 @@ def save_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
             writer.writerow(
                 {
                     **row,
-                    "agent_token_logprob_details": repr(
-                        row["agent_token_logprob_details"]
-                    ),
+                    "edge_ig_details": repr(row["edge_ig_details"]),
                 }
             )
 
 
-def probability_weights(values: List[float]) -> np.ndarray:
-    if not values:
-        return np.array([])
-    return np.ones(len(values), dtype=float) / len(values)
-
-
-def plot_distribution(
+def plot_edge_ig_correctness_relationship(
     output_file: Path,
     dataset_name: str,
     mode_name: str,
-    correct_values: List[float],
-    incorrect_values: List[float],
+    rows: List[Dict[str, Any]],
     bins: int,
 ) -> None:
     output_file.parent.mkdir(parents=True, exist_ok=True)
-    all_values = correct_values + incorrect_values
-    max_value = max(all_values) if all_values else 1.0
-    if max_value <= 0:
-        max_value = 1.0
-    bin_edges = np.linspace(0.0, max_value, bins + 1)
+    valid_rows = [
+        row
+        for row in rows
+        if row["graph_edge_ig_sum"] is not None
+        and math.isfinite(float(row["graph_edge_ig_sum"]))
+    ]
+    correct_values = [
+        float(row["graph_edge_ig_sum"])
+        for row in valid_rows
+        if row["is_correct"]
+    ]
+    incorrect_values = [
+        float(row["graph_edge_ig_sum"])
+        for row in valid_rows
+        if not row["is_correct"]
+    ]
 
     plt.figure(figsize=(7.0, 4.4))
-    plt.hist(
-        correct_values,
-        bins=bin_edges,
-        weights=probability_weights(correct_values),
-        alpha=0.72,
-        color="#4CAF50",
-        label="Correct",
-    )
-    plt.hist(
-        incorrect_values,
-        bins=bin_edges,
-        weights=probability_weights(incorrect_values),
-        alpha=0.72,
-        color="#FF5252",
-        label="Incorrect",
-    )
-    plt.xlabel("Mean Agent Token Probability (First K Tokens)")
-    plt.ylabel("Probability")
+    if correct_values:
+        plt.scatter(
+            correct_values,
+            [1.0] * len(correct_values),
+            alpha=0.72,
+            color="#4CAF50",
+            label="Correct",
+        )
+    if incorrect_values:
+        plt.scatter(
+            incorrect_values,
+            [0.0] * len(incorrect_values),
+            alpha=0.72,
+            color="#FF5252",
+            label="Incorrect",
+        )
+
+    all_values = correct_values + incorrect_values
+    if len(set(all_values)) > 1:
+        bin_count = max(1, min(int(bins), len(set(all_values))))
+        bin_edges = np.linspace(min(all_values), max(all_values), bin_count + 1)
+        bin_centers = []
+        bin_accuracies = []
+        for left, right in zip(bin_edges[:-1], bin_edges[1:]):
+            in_bin = [
+                row
+                for row in valid_rows
+                if float(row["graph_edge_ig_sum"]) >= left
+                and (
+                    float(row["graph_edge_ig_sum"]) < right
+                    or right == bin_edges[-1]
+                    and float(row["graph_edge_ig_sum"]) <= right
+                )
+            ]
+            if not in_bin:
+                continue
+            bin_centers.append((left + right) / 2.0)
+            bin_accuracies.append(
+                sum(1.0 for row in in_bin if row["is_correct"]) / len(in_bin)
+            )
+        if bin_centers:
+            plt.plot(
+                bin_centers,
+                bin_accuracies,
+                color="#1F77B4",
+                linewidth=1.8,
+                marker="o",
+                markersize=3.2,
+                label="Binned Accuracy",
+            )
+
+    plt.xlabel("图的边信息增益加和")
+    plt.ylabel("Correctness")
+    plt.yticks([0, 1], ["Incorrect", "Correct"])
     plt.title(f"{dataset_name} {mode_name} Graph")
     plt.legend()
-    plt.grid(axis="y", alpha=0.2)
+    plt.grid(axis="both", alpha=0.2)
     plt.tight_layout()
     plt.savefig(output_file, dpi=300)
     plt.close()
@@ -957,10 +1094,10 @@ def plot_distribution(
 
 def default_output_paths(dataset_name: str, args) -> Tuple[Path, Path]:
     output_file = args.output_file or (
-        f"result/{dataset_name}_{args.mode.lower()}_agent_token_probability_distribution.png"
+        f"result/{dataset_name}_{args.mode.lower()}_edge_ig_sum_correctness.png"
     )
     csv_file = args.csv_file or (
-        f"result/{dataset_name}_{args.mode.lower()}_agent_token_probability_distribution.csv"
+        f"result/{dataset_name}_{args.mode.lower()}_edge_ig_sum_correctness.csv"
     )
     return Path(output_file), Path(csv_file)
 
@@ -993,7 +1130,7 @@ async def main():
         uncertainty_start = time.time()
         batch_rows = await asyncio.gather(
             *[
-                attach_agent_token_logprob_probability(inference_result)
+                attach_edge_ig_summary(inference_result)
                 for inference_result in inference_results
             ]
         )
@@ -1004,38 +1141,31 @@ async def main():
         total_count += len(batch_rows)
         print(f"Accuracy so far: {correct_count / total_count:.4f}")
         print(f"Inference time: {inference_seconds:.3f}s")
-        print(f"Token logprob probability time: {uncertainty_seconds:.3f}s")
-
-    correct_values = [
-        row["mean_agent_token_probability"]
-        for row in rows
-        if row["is_correct"]
-        and row["mean_agent_token_probability"] is not None
-        and math.isfinite(row["mean_agent_token_probability"])
-    ]
-    incorrect_values = [
-        row["mean_agent_token_probability"]
-        for row in rows
-        if not row["is_correct"]
-        and row["mean_agent_token_probability"] is not None
-        and math.isfinite(row["mean_agent_token_probability"])
-    ]
+        print(f"Edge IG time: {uncertainty_seconds:.3f}s")
 
     output_file, csv_file = default_output_paths(bundle.name, args)
     save_csv(csv_file, rows)
-    plot_distribution(
+    plot_edge_ig_correctness_relationship(
         output_file,
         bundle.name,
         args.mode,
-        correct_values,
-        incorrect_values,
+        rows,
         args.bins,
     )
+    rows_with_edge_ig = [
+        row
+        for row in rows
+        if row["graph_edge_ig_count"] > 0
+        and row["graph_edge_ig_sum"] is not None
+        and math.isfinite(row["graph_edge_ig_sum"])
+    ]
+    correct_values = [row["graph_edge_ig_sum"] for row in rows_with_edge_ig if row["is_correct"]]
+    incorrect_values = [row["graph_edge_ig_sum"] for row in rows_with_edge_ig if not row["is_correct"]]
     print(f"Saved CSV: {csv_file}")
     print(f"Saved plot: {output_file}")
     print(f"Correct samples: {len(correct_values)}")
     print(f"Incorrect samples: {len(incorrect_values)}")
-    print(f"Rows with token probability: {len(correct_values) + len(incorrect_values)} / {len(rows)}")
+    print(f"Rows with edge IG: {len(rows_with_edge_ig)} / {len(rows)}")
 
 
 if __name__ == "__main__":
