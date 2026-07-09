@@ -531,12 +531,6 @@ async def edge_entropy_rewards(
     after_outputs_cache: Dict[Tuple[str, int], List[Any]] = {}
     after_score_cache: Dict[Tuple[str, int], Any] = {}
     scorer = ig_scorer or (FinalAnswerScorer() if target_spec is not None else None)
-    final_spatial_info = (
-        _current_graph_output_info(graph)
-        if target_spec is not None
-        else None
-    )
-
     for edge_info in graph.edge_log_probs:
         target_id = edge_info["target"]
         source_id = edge_info["source"]
@@ -632,7 +626,7 @@ async def edge_entropy_rewards(
                     before_outputs,
                     target_spec,
                     cluster_labels=None,
-                    base_spatial_info=final_spatial_info,
+                    base_spatial_info=None,
                     candidate_id=target_id,
                     candidate_role=getattr(target_node, "role", "Candidate"),
                 )
@@ -643,7 +637,7 @@ async def edge_entropy_rewards(
                     before_outputs,
                     target_spec,
                     cluster_labels=None,
-                    base_spatial_info=final_spatial_info,
+                    base_spatial_info=None,
                     candidate_id=target_id,
                     candidate_role=getattr(target_node, "role", "Candidate"),
                 )
@@ -658,7 +652,7 @@ async def edge_entropy_rewards(
                         after_outputs,
                         target_spec,
                         cluster_labels=None,
-                        base_spatial_info=final_spatial_info,
+                        base_spatial_info=None,
                         candidate_id=target_id,
                         candidate_role=getattr(target_node, "role", "Candidate"),
                     )
@@ -669,7 +663,7 @@ async def edge_entropy_rewards(
                         after_outputs,
                         target_spec,
                         cluster_labels=None,
-                        base_spatial_info=final_spatial_info,
+                        base_spatial_info=None,
                         candidate_id=target_id,
                         candidate_role=getattr(target_node, "role", "Candidate"),
                     )
@@ -708,10 +702,12 @@ async def edge_entropy_rewards(
                 details[key]["after_teacher_logprob"] = float(after_answer_score)
                 details[key]["uncertainty_method"] = "final_agent_teacher_logprob_diff"
                 details[key]["teacher_forcing_agent"] = "final_agent"
+                details[key]["teacher_forcing_context"] = "local_candidate_output"
                 details[key]["teacher_forcing_candidate_role"] = getattr(target_node, "role", "")
             else:
                 details[key]["uncertainty_method"] = "final_agent_execution_score_diff"
                 details[key]["scoring_agent"] = "final_agent"
+                details[key]["scoring_context"] = "local_candidate_output"
                 details[key]["execution_candidate_role"] = getattr(target_node, "role", "")
             details[key]["before_answer_details"] = before_score.details
             details[key]["after_answer_details"] = after_score.details
