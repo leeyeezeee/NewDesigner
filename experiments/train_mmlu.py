@@ -24,8 +24,8 @@ from GDesigner.utils.uncertainty import (
 from GDesigner.utils.ig_scorer import FinalAnswerScorer, make_target_spec
 from experiments.refinement_loss import refinement_regularization_loss
 from experiments.teacher_forcing_reward import (
-    graph_teacher_forcing_score,
-    teacher_forcing_edge_loss,
+    edge_information_gain_loss,
+    graph_correctness_advantage_edge_loss,
 )
 
 _GRAPH_TF_RECORD_FILE = "mmlu_graph_tf_records.jsonl"
@@ -66,9 +66,12 @@ async def train(graph:Graph,
             sparsity_reg_weight: float = 1.0,
             edge_bias_l2_weight: float = 1e-2,
             use_graph_tf_reward: bool = False,
+            use_graph_correctness_advantage: bool = False,
             graph_sample_count: int = 5,
             graph_softmax_temperature: float = 1.0,
             edge_tanh_temperature: float = 1.0,
+            edge_ig_reward_lambda: float = None,
+            graph_advantage_epsilon: float = 1e-6,
           ):
     
     def infinite_data_loader() -> Iterator[pd.DataFrame]:
@@ -80,7 +83,16 @@ async def train(graph:Graph,
     
     loader = infinite_data_loader()
     effective_num_entropy_samples = 1
-    use_semantic_edges = use_edge_selector or use_graph_tf_reward
+    resolved_edge_ig_reward_lambda = (
+        0.0
+        if edge_ig_reward_lambda is None
+        else float(edge_ig_reward_lambda)
+    )
+    use_multi_graph_reward = use_graph_tf_reward or use_graph_correctness_advantage
+    use_semantic_edges = (
+        use_edge_selector
+        or resolved_edge_ig_reward_lambda != 0.0
+    )
     batch_entropy_samples = 1
     semantic_judge = None
     edge_selector = None
@@ -91,8 +103,12 @@ async def train(graph:Graph,
         edge_selector = EdgeSelector(graph.features.size(1))
         selector_buffer = SelectorReplayBuffer(selector_buffer_size)
         selector_optimizer = torch.optim.Adam(edge_selector.parameters(), lr=1e-3)
-    tf_scorer = FinalAnswerScorer() if use_graph_tf_reward else None
-    if use_graph_tf_reward:
+    tf_scorer = (
+        FinalAnswerScorer()
+        if (use_edge_selector or resolved_edge_ig_reward_lambda != 0.0)
+        else None
+    )
+    if use_multi_graph_reward:
         _reset_jsonl(_GRAPH_TF_RECORD_FILE)
     
     optimizer_params = list(graph.gcn.parameters()) + list(graph.mlp.parameters()) + graph.refinement_parameters()
@@ -115,7 +131,7 @@ async def train(graph:Graph,
             input_dict = dataset.record_to_input(record)
             record_input_dicts.append(input_dict)
             group_indices = []
-            sample_count = max(1, int(graph_sample_count)) if use_graph_tf_reward else 1
+            sample_count = max(1, int(graph_sample_count)) if use_multi_graph_reward else 1
             for _ in range(sample_count):
                 realized_graph = copy.deepcopy(graph)
                 realized_graph.gcn = graph.gcn
@@ -143,14 +159,13 @@ async def train(graph:Graph,
         raw_answers, log_probs = zip(*raw_results)
         loss_list: List[torch.Tensor] = []
         utilities: List[dict] = []
-        graph_tf_scores: List[float] = []
         graph_tf_corrects: List[float] = []
         graph_tf_edge_counts: List[float] = []
         answers: List[str] = []
         
-        if use_graph_tf_reward:
+        if use_multi_graph_reward:
             graph_groups = []
-            score_groups = []
+            correctness_groups = []
             edge_detail_groups = []
             for record_idx, (correct_answer, group_indices, input_dict) in enumerate(zip(
                 correct_answers,
@@ -161,37 +176,36 @@ async def train(graph:Graph,
                         f"String expected but got {correct_answer} of type {type(correct_answer)} (1)"
                 target_spec = make_target_spec("mmlu", correct_answer)
                 graph_group = []
-                score_group = []
+                correctness_group = []
                 edge_detail_group = []
                 for sample_pos, graph_idx in enumerate(group_indices):
                     raw_answer = raw_answers[graph_idx]
                     realized_graph = realized_graphs[graph_idx]
-                    graph_score = await graph_teacher_forcing_score(
-                        tf_scorer,
-                        realized_graph,
-                        input_dict,
-                        raw_answer,
-                        target_spec,
-                    )
                     record_answer = dataset.postprocess_answer(raw_answer)
                     record_accuracy = Accuracy()
                     record_accuracy.update(record_answer, correct_answer)
-                    graph_tf_scores.append(float(graph_score.score))
                     graph_tf_corrects.append(float(record_accuracy.get()))
                     graph_tf_edge_counts.append(float(sum(realized_graph.realized_edge_counts)))
-                    _edge_rewards, edge_details = await edge_entropy_rewards(
-                        realized_graph,
-                        input_dict["task"],
-                        input_dict,
-                        semantic_judge,
-                        effective_num_entropy_samples,
-                        negative_reward_scale=negative_edge_reward_scale,
-                        nonpositive_penalty=nonpositive_edge_penalty,
-                        kle_heat_t=kle_heat_t,
-                        target_spec=target_spec,
-                        ig_scorer=tf_scorer,
-                        compute_rewards=False,
+                    needs_edge_details = (
+                        resolved_edge_ig_reward_lambda != 0.0
+                        or selector_buffer is not None
                     )
+                    if needs_edge_details:
+                        _edge_rewards, edge_details = await edge_entropy_rewards(
+                            realized_graph,
+                            input_dict["task"],
+                            input_dict,
+                            semantic_judge,
+                            effective_num_entropy_samples,
+                            negative_reward_scale=negative_edge_reward_scale,
+                            nonpositive_penalty=nonpositive_edge_penalty,
+                            kle_heat_t=kle_heat_t,
+                            target_spec=target_spec,
+                            ig_scorer=tf_scorer,
+                            compute_rewards=False,
+                        )
+                    else:
+                        edge_details = {}
                     if selector_buffer is not None:
                         selector_buffer.add_many(build_edge_selector_examples(
                             realized_graph,
@@ -207,38 +221,52 @@ async def train(graph:Graph,
                         correctness_reward = accuracy.get()
                         utilities.append({
                             "correctness": correctness_reward,
-                            "graph_tf_score": graph_score.score,
                         })
                     graph_group.append(realized_graph)
-                    score_group.append(graph_score.score)
+                    correctness_group.append(float(record_accuracy.get()))
                     edge_detail_group.append(edge_details)
                     realized_graph.clear_execution_history()
                 graph_groups.append(graph_group)
-                score_groups.append(score_group)
+                correctness_groups.append(correctness_group)
                 edge_detail_groups.append(edge_detail_group)
             reference_loss = torch.mean(torch.stack(list(log_probs)))
-            utility_loss, tf_summaries = teacher_forcing_edge_loss(
+            utility_loss, tf_summaries = graph_correctness_advantage_edge_loss(
                 graph_groups,
-                score_groups,
+                correctness_groups,
                 edge_detail_groups,
                 reference_loss,
-                graph_softmax_temperature=graph_softmax_temperature,
                 edge_tanh_temperature=edge_tanh_temperature,
+                edge_ig_reward_lambda=resolved_edge_ig_reward_lambda,
+                advantage_epsilon=graph_advantage_epsilon,
             )
-            if graph_tf_scores:
+            if graph_tf_corrects:
+                avg_adv_variance = (
+                    sum(summary["correctness_variance"] for summary in tf_summaries)
+                    / len(tf_summaries)
+                    if tf_summaries
+                    else 0.0
+                )
+                avg_adv_std = (
+                    sum(summary["correctness_std"] for summary in tf_summaries)
+                    / len(tf_summaries)
+                    if tf_summaries
+                    else 0.0
+                )
                 graph_tf_summary = {
                     "iteration": i_iter,
-                    "num_graphs": len(graph_tf_scores),
-                    "avg_graph_tf_score": sum(graph_tf_scores) / len(graph_tf_scores),
+                    "num_graphs": len(graph_tf_corrects),
                     "accuracy": sum(graph_tf_corrects) / len(graph_tf_corrects),
                     "avg_edges": sum(graph_tf_edge_counts) / len(graph_tf_edge_counts),
+                    "avg_adv_variance": avg_adv_variance,
+                    "avg_adv_std": avg_adv_std,
                 }
                 _append_jsonl(_GRAPH_TF_RECORD_FILE, graph_tf_summary)
                 print(
-                    "graph tf metrics: "
-                    f"avg_score={graph_tf_summary['avg_graph_tf_score']:.6f}, "
+                    "graph correctness metrics: "
                     f"accuracy={graph_tf_summary['accuracy']:.6f}, "
                     f"avg_edges={graph_tf_summary['avg_edges']:.6f}, "
+                    f"avg_adv_variance={avg_adv_variance:.6f}, "
+                    f"avg_adv_std={avg_adv_std:.6f}, "
                     f"num_graphs={graph_tf_summary['num_graphs']}"
                 )
         else:
@@ -252,7 +280,10 @@ async def train(graph:Graph,
                 correctness_reward = accuracy.get()
                 edge_rewards = {}
                 edge_details = {}
-                if correctness_reward > 0 and use_semantic_edges:
+                if (
+                    use_semantic_edges
+                    and (correctness_reward > 0 or resolved_edge_ig_reward_lambda != 0.0)
+                ):
                     edge_rewards, edge_details = await edge_entropy_rewards(
                         realized_graph,
                         input_dict["task"],
@@ -263,8 +294,9 @@ async def train(graph:Graph,
                         nonpositive_penalty=nonpositive_edge_penalty,
                         kle_heat_t=kle_heat_t,
                         target_spec=make_target_spec("mmlu", correct_answer),
+                        ig_scorer=tf_scorer,
                     )
-                    if selector_buffer is not None:
+                    if selector_buffer is not None and correctness_reward > 0:
                         selector_buffer.add_many(build_edge_selector_examples(
                             realized_graph,
                             input_dict["task"],
@@ -278,6 +310,16 @@ async def train(graph:Graph,
                 }
                 utilities.append(utility)
                 single_loss = -log_prob * correctness_reward
+                if resolved_edge_ig_reward_lambda != 0.0:
+                    edge_ig_loss, edge_ig_summary = edge_information_gain_loss(
+                        realized_graph,
+                        edge_details,
+                        log_prob,
+                        edge_tanh_temperature=edge_tanh_temperature,
+                        edge_ig_reward_lambda=resolved_edge_ig_reward_lambda,
+                    )
+                    single_loss = single_loss + edge_ig_loss
+                    utility["edge_ig_loss_summary"] = edge_ig_summary
                 loss_list.append(single_loss)
                 print(f"correct answer:{correct_answer}")
                 print(f"edge entropy rewards:{edge_rewards}")
@@ -309,7 +351,7 @@ async def train(graph:Graph,
 
         print("answers:",answers)
         print(f"Batch time {time.time() - start_ts:.3f}")
-        if not use_graph_tf_reward:
+        if not use_multi_graph_reward:
             print("utilities:", utilities) # [0.0, 0.0, 0.0, 1.0]
         print("utility loss:", utility_loss.item())
         print("anchor loss:", anchor_loss.item())

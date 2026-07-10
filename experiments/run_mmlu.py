@@ -139,9 +139,12 @@ async def main():
                     sparsity_reg_weight=args.sparsity_reg_weight,
                     edge_bias_l2_weight=args.edge_bias_l2_weight,
                     use_graph_tf_reward=args.use_graph_tf_reward,
+                    use_graph_correctness_advantage=args.use_graph_correctness_advantage,
                     graph_sample_count=args.graph_sample_count,
                     graph_softmax_temperature=args.graph_softmax_temperature,
-                    edge_tanh_temperature=args.edge_tanh_temperature)
+                    edge_tanh_temperature=args.edge_tanh_temperature,
+                    edge_ig_reward_lambda=args.edge_ig_reward_lambda,
+                    graph_advantage_epsilon=args.graph_advantage_epsilon)
         save_graph_checkpoint(
             graph,
             args.checkpoint_file,
