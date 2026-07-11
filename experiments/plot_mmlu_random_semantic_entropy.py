@@ -35,6 +35,7 @@ from datasets.gsm8k_dataset import (
     svamp_data_process,
 )
 from datasets.mmlu_dataset import MMLUDataset
+from experiments.agent_backend import add_agent_backend_args, apply_agent_backend_args
 from experiments.graph_concurrency import limited_graph_arun, make_graph_semaphore
 
 
@@ -196,6 +197,7 @@ def parse_args():
         help="Deprecated; edge IG no longer uses generated token prefixes.",
     )
     parser.add_argument("--llm_name", type=str, default="gpt-4o")
+    add_agent_backend_args(parser)
     parser.add_argument(
         "--domain",
         type=str,
@@ -1117,6 +1119,7 @@ def default_output_paths(dataset_name: str, args) -> Tuple[Path, Path]:
 
 async def main():
     args = parse_args()
+    apply_agent_backend_args(args)
     seed_everything(args.seed)
     bundle = resolve_dataset_bundle(args)
 

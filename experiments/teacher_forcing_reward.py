@@ -3,6 +3,7 @@ from typing import Any, Dict, Iterable, List, Sequence, Tuple
 
 import torch
 
+from experiments.agent_backend import add_agent_backend_args
 from GDesigner.utils.ig_scorer import FinalAnswerScorer, ScoreResult, TargetSpec
 from GDesigner.utils.uncertainty import edge_key
 
@@ -28,6 +29,7 @@ def _graph_output_info(graph) -> Dict[str, Dict[str, Any]]:
 
 
 def add_teacher_forcing_reward_args(parser) -> None:
+    add_agent_backend_args(parser)
     parser.add_argument(
         "--use_graph_tf_reward",
         action="store_true",

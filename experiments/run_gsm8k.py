@@ -17,6 +17,7 @@ from GDesigner.tools.reader.readers import JSONLReader
 from GDesigner.utils.globals import Time
 from GDesigner.utils.globals import Cost, PromptTokens, CompletionTokens
 from GDesigner.utils.metrics import reset_usage_counters, write_metrics_record
+from experiments.agent_backend import apply_agent_backend_args
 from GDesigner.utils.edge_selector import (
     EdgeSelector,
     SelectorReplayBuffer,
@@ -119,6 +120,7 @@ def parse_args():
 
 async def main():
     args = parse_args()
+    apply_agent_backend_args(args)
     dataset = JSONLReader.parse_file(args.dataset_json)
     dataset = gsm_data_process(dataset)
     current_time = Time.instance().value or time.strftime("%Y-%m-%d-%H-%M-%S", time.localtime())

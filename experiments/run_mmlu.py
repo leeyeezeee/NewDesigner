@@ -14,6 +14,7 @@ from experiments.train_mmlu import train
 from experiments.evaluate_mmlu import evaluate
 from GDesigner.utils.const import GDesigner_ROOT
 from GDesigner.utils.metrics import reset_usage_counters, write_metrics_record
+from experiments.agent_backend import apply_agent_backend_args
 from experiments.checkpoint import save_graph_checkpoint
 from experiments.teacher_forcing_reward import add_teacher_forcing_reward_args
 
@@ -100,7 +101,8 @@ def parse_args():
 
 async def main():
     args = parse_args()
-    
+    apply_agent_backend_args(args)
+
     mode = args.mode
     decision_method = args.decision_method
     agent_names = [name for name,num in zip(args.agent_names,args.agent_nums) for _ in range(num)]

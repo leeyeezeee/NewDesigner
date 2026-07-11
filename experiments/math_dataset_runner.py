@@ -10,6 +10,7 @@ import torch
 from GDesigner.graph.graph import Graph
 from GDesigner.utils.globals import CompletionTokens, Cost, PromptTokens, Time
 from GDesigner.utils.metrics import reset_usage_counters, write_metrics_record
+from experiments.agent_backend import apply_agent_backend_args
 from GDesigner.utils.edge_selector import (
     EdgeSelector,
     SelectorReplayBuffer,
@@ -57,6 +58,7 @@ async def run_math_dataset(
     answer_parser: AnswerParser,
     correctness_fn: CorrectnessFn,
 ) -> None:
+    apply_agent_backend_args(args)
     current_time = Time.instance().value or time.strftime("%Y-%m-%d-%H-%M-%S", time.localtime())
     Time.instance().value = current_time
 

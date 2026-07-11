@@ -13,6 +13,7 @@ import torch
 from GDesigner.graph.graph import Graph
 from GDesigner.utils.globals import CompletionTokens, Cost, PromptTokens, Time
 from GDesigner.utils.metrics import reset_usage_counters, write_metrics_record
+from experiments.agent_backend import add_agent_backend_args, apply_agent_backend_args
 from experiments.checkpoint import load_graph_checkpoint, save_graph_checkpoint
 from experiments.graph_concurrency import (
     limited_async_call,
@@ -580,6 +581,7 @@ async def run_unsup_stage(
     answer_parser: AnswerParser,
     correctness_fn: CorrectnessFn,
 ) -> None:
+    apply_agent_backend_args(args)
     current_time = Time.instance().value or time.strftime("%Y-%m-%d-%H-%M-%S", time.localtime())
     Time.instance().value = current_time
 
@@ -649,6 +651,7 @@ async def run_unsup_stage(
 
 
 def add_common_unsup_args(parser, *, dataset_name: str, unsup_data: str, stage1_checkpoint: str, checkpoint_file: str, metrics_file: str) -> None:
+    add_agent_backend_args(parser)
     parser.add_argument("--unsup_data", type=str, default=unsup_data)
     parser.add_argument("--unsup_limit", type=int, default=128)
     parser.add_argument("--unsup_epochs", type=int, default=1)
