@@ -29,6 +29,7 @@ from GDesigner.utils.uncertainty import (
 from GDesigner.utils.ig_scorer import FinalAnswerScorer, make_target_spec
 from datasets.gsm8k_dataset import gsm_data_process,gsm_get_predict
 from experiments.checkpoint import save_graph_checkpoint
+from experiments.graph_concurrency import limited_graph_arun, make_graph_semaphore
 from experiments.refinement_loss import refinement_regularization_loss
 from experiments.teacher_forcing_reward import (
     add_teacher_forcing_reward_args,
@@ -175,6 +176,7 @@ async def main():
         if (args.use_edge_selector or edge_ig_reward_lambda != 0.0)
         else None
     )
+    graph_semaphore = make_graph_semaphore(args.max_concurrent_graphs)
 
     num_batches = int(len(dataset)/args.batch_size)
     total_solved, total_executed = (0, 0)
@@ -224,7 +226,9 @@ async def main():
                 realized_graphs.append(realized_graph)
                 input_dicts.append(input_dict)
                 answer_log_probs.append(asyncio.create_task(
-                    realized_graph.arun(
+                    limited_graph_arun(
+                        graph_semaphore,
+                        realized_graph,
                         input_dict,
                         args.num_rounds,
                         num_entropy_samples=batch_entropy_samples,

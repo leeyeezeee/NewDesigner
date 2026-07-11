@@ -50,6 +50,15 @@ def add_teacher_forcing_reward_args(parser) -> None:
         help="Number of communication graphs sampled per training example.",
     )
     parser.add_argument(
+        "--max_concurrent_graphs",
+        type=int,
+        default=10,
+        help=(
+            "Maximum number of realized graphs to execute concurrently per batch. "
+            "Use 0 or a negative value for unlimited concurrency."
+        ),
+    )
+    parser.add_argument(
         "--graph_softmax_temperature",
         type=float,
         default=1.0,

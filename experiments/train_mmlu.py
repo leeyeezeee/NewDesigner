@@ -23,6 +23,7 @@ from GDesigner.utils.uncertainty import (
 )
 from GDesigner.utils.ig_scorer import FinalAnswerScorer, make_target_spec
 from experiments.refinement_loss import refinement_regularization_loss
+from experiments.graph_concurrency import limited_graph_arun, make_graph_semaphore
 from experiments.teacher_forcing_reward import (
     edge_information_gain_loss,
     graph_correctness_advantage_edge_loss,
@@ -72,6 +73,7 @@ async def train(graph:Graph,
             edge_tanh_temperature: float = 1.0,
             edge_ig_reward_lambda: float = None,
             graph_advantage_epsilon: float = 1e-6,
+            max_concurrent_graphs: int = 10,
           ):
     
     def infinite_data_loader() -> Iterator[pd.DataFrame]:
@@ -110,6 +112,7 @@ async def train(graph:Graph,
     )
     if use_multi_graph_reward:
         _reset_jsonl(_GRAPH_TF_RECORD_FILE)
+    graph_semaphore = make_graph_semaphore(max_concurrent_graphs)
     
     optimizer_params = list(graph.gcn.parameters()) + list(graph.mlp.parameters()) + graph.refinement_parameters()
     if graph.optimized_temporal:
@@ -144,7 +147,9 @@ async def train(graph:Graph,
                 realized_graphs.append(realized_graph)
                 input_dicts.append(input_dict)
                 answer_log_probs.append(asyncio.create_task(
-                    realized_graph.arun(
+                    limited_graph_arun(
+                        graph_semaphore,
+                        realized_graph,
                         input_dict,
                         num_rounds,
                         num_entropy_samples=batch_entropy_samples,

@@ -9,6 +9,7 @@ import copy
 
 from GDesigner.graph.graph import Graph
 from experiments.accuracy import Accuracy
+from experiments.graph_concurrency import limited_graph_arun, make_graph_semaphore
 from GDesigner.utils.globals import Cost, PromptTokens, CompletionTokens
 
 async def evaluate(
@@ -18,6 +19,7 @@ async def evaluate(
         limit_questions: Optional[int] = None,
         eval_batch_size: int = 4,
         edge_selector = None,
+        max_concurrent_graphs: int = 10,
         ) -> Dict[str, Any]:
 
     print(f"Evaluating gdesigner on {dataset.__class__.__name__} split {dataset.split}")
@@ -27,6 +29,7 @@ async def evaluate(
     accuracy = Accuracy()
     total_edges = 0
     edge_samples = 0
+    graph_semaphore = make_graph_semaphore(max_concurrent_graphs)
     def eval_loader(batch_size: int) -> Iterator[List[Any]]:
         records = []
         for i_record, record in enumerate(dataset):
@@ -59,7 +62,9 @@ async def evaluate(
             input_dict = dataset.record_to_input(record)
             # print(input_dict)
             answer_log_probs.append(asyncio.create_task(
-                realized_graph.arun(
+                limited_graph_arun(
+                    graph_semaphore,
+                    realized_graph,
                     input_dict,
                     num_rounds,
                     num_entropy_samples=1,

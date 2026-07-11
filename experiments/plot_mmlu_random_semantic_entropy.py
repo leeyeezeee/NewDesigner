@@ -35,6 +35,7 @@ from datasets.gsm8k_dataset import (
     svamp_data_process,
 )
 from datasets.mmlu_dataset import MMLUDataset
+from experiments.graph_concurrency import limited_graph_arun, make_graph_semaphore
 
 
 RecordToInput = Callable[[Any], Dict[str, Any]]
@@ -205,6 +206,15 @@ def parse_args():
     parser.add_argument("--agent_names", nargs="+", type=str, default=None)
     parser.add_argument("--agent_nums", nargs="+", type=int, default=None)
     parser.add_argument("--humaneval_timeout", type=int, default=100)
+    parser.add_argument(
+        "--max_concurrent_graphs",
+        type=int,
+        default=10,
+        help=(
+            "Maximum number of realized graphs to execute concurrently per batch. "
+            "Use 0 or a negative value for unlimited concurrency."
+        ),
+    )
     parser.add_argument("--bins", type=int, default=25)
     parser.add_argument("--seed", type=int, default=888)
     parser.add_argument(
@@ -921,11 +931,14 @@ async def run_record_inference(
     record,
     args,
     agent_names: List[str],
+    graph_semaphore: asyncio.Semaphore | None,
 ) -> InferenceResult:
     input_dict = bundle.record_to_input(record)
     realized_graph = build_graph(bundle, args, agent_names)
     scorer = FinalAnswerScorer()
-    raw_answer, _log_prob = await realized_graph.arun(
+    raw_answer, _log_prob = await limited_graph_arun(
+        graph_semaphore,
+        realized_graph,
         input_dict,
         bundle.num_rounds,
         num_entropy_samples=1,
@@ -1114,6 +1127,7 @@ async def main():
     rows: List[Dict[str, Any]] = []
     correct_count = 0
     total_count = 0
+    graph_semaphore = make_graph_semaphore(args.max_concurrent_graphs)
     for batch_id, batch in enumerate(
         iter_batches(bundle.records, args.batch_size, args.limit_questions)
     ):
@@ -1121,7 +1135,7 @@ async def main():
         inference_start = time.time()
         inference_results = await asyncio.gather(
             *[
-                run_record_inference(bundle, record_index, record, args, agent_names)
+                run_record_inference(bundle, record_index, record, args, agent_names, graph_semaphore)
                 for record_index, record in batch
             ]
         )

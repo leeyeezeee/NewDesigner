@@ -144,7 +144,8 @@ async def main():
                     graph_softmax_temperature=args.graph_softmax_temperature,
                     edge_tanh_temperature=args.edge_tanh_temperature,
                     edge_ig_reward_lambda=args.edge_ig_reward_lambda,
-                    graph_advantage_epsilon=args.graph_advantage_epsilon)
+                    graph_advantage_epsilon=args.graph_advantage_epsilon,
+                    max_concurrent_graphs=args.max_concurrent_graphs)
         save_graph_checkpoint(
             graph,
             args.checkpoint_file,
@@ -156,7 +157,7 @@ async def main():
         edge_selector = None
 
     reset_usage_counters()
-    eval_metrics = await evaluate(graph=graph,dataset=dataset_val,num_rounds=args.num_rounds,limit_questions=limit_questions,eval_batch_size=args.batch_size,edge_selector=edge_selector)
+    eval_metrics = await evaluate(graph=graph,dataset=dataset_val,num_rounds=args.num_rounds,limit_questions=limit_questions,eval_batch_size=args.batch_size,edge_selector=edge_selector,max_concurrent_graphs=args.max_concurrent_graphs)
     score = eval_metrics["accuracy"]
     print(f"Final Eval Accuracy: {score}")
     print(f"Final Avg Edges: {eval_metrics['avg_edges']}")

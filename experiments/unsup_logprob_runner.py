@@ -14,6 +14,11 @@ from GDesigner.graph.graph import Graph
 from GDesigner.utils.globals import CompletionTokens, Cost, PromptTokens, Time
 from GDesigner.utils.metrics import reset_usage_counters, write_metrics_record
 from experiments.checkpoint import load_graph_checkpoint, save_graph_checkpoint
+from experiments.graph_concurrency import (
+    limited_async_call,
+    limited_graph_arun,
+    make_graph_semaphore,
+)
 from experiments.plot_mmlu_random_semantic_entropy import (
     final_answer_logprob_stats,
     first_answer,
@@ -384,6 +389,7 @@ async def train_unsup_logprob(
 
     parameters = configure_train_scope(graph, args.train_scope)
     optimizer = torch.optim.Adam(parameters, lr=args.lr)
+    graph_semaphore = make_graph_semaphore(args.max_concurrent_graphs)
 
     total_groups = 0
     total_valid_samples = 0
@@ -406,7 +412,9 @@ async def train_unsup_logprob(
                 input_dict = unlabeled_record_to_input(dataset_name, record)
                 group_tasks.append([
                     asyncio.create_task(
-                        run_unsup_sample(
+                        limited_async_call(
+                            graph_semaphore,
+                            run_unsup_sample,
                             graph,
                             reference_graph,
                             input_dict,
@@ -505,6 +513,7 @@ async def evaluate_records(
     total_executed = 0
     total_edges = 0
     edge_samples = 0
+    graph_semaphore = make_graph_semaphore(args.max_concurrent_graphs)
     eval_records = list(records)
     if args.eval_skip:
         eval_records = eval_records[args.eval_skip:]
@@ -521,7 +530,9 @@ async def evaluate_records(
             share_trainable_graph_state(realized_graph, graph)
             realized_graphs.append(realized_graph)
             tasks.append(asyncio.create_task(
-                realized_graph.arun(
+                limited_graph_arun(
+                    graph_semaphore,
+                    realized_graph,
                     record_to_input(record),
                     args.num_rounds,
                     num_entropy_samples=1,
@@ -642,6 +653,15 @@ def add_common_unsup_args(parser, *, dataset_name: str, unsup_data: str, stage1_
     parser.add_argument("--unsup_limit", type=int, default=128)
     parser.add_argument("--unsup_epochs", type=int, default=1)
     parser.add_argument("--graph_sample_count", type=int, default=4)
+    parser.add_argument(
+        "--max_concurrent_graphs",
+        type=int,
+        default=10,
+        help=(
+            "Maximum number of realized graphs to execute concurrently per batch. "
+            "Use 0 or a negative value for unlimited concurrency."
+        ),
+    )
     parser.add_argument("--reference_kl_weight", type=float, default=0.05)
     parser.add_argument(
         "--train_scope",
