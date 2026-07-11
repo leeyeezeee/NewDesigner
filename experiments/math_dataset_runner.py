@@ -157,6 +157,7 @@ async def run_math_dataset(
                 realized_graph = copy.deepcopy(graph)
                 realized_graph.gcn = graph.gcn
                 realized_graph.mlp = graph.mlp
+                realized_graph.spatial_affinity_weight = graph.spatial_affinity_weight
                 realized_graph.refinement_weight = graph.refinement_weight
                 realized_graph.spatial_edge_bias = graph.spatial_edge_bias
                 realized_graph.temporal_logits = graph.temporal_logits

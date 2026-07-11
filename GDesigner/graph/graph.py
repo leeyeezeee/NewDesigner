@@ -4,6 +4,7 @@ from abc import ABC
 import numpy as np
 import torch
 import asyncio
+import traceback
 
 import GDesigner.agents
 import GDesigner.prompt
@@ -16,6 +17,10 @@ from torch_geometric.utils import dense_to_sparse
 
 _DECISION_NODE_MAX_TRIES = 5
 _DECISION_NODE_TIMEOUT_SECONDS = 1200
+
+
+def _format_exception(exc: Exception) -> str:
+    return "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
 
 
 class Graph(ABC):
@@ -89,6 +94,7 @@ class Graph(ABC):
         self.refinement_sparse_loss = torch.tensor(0.0)
         self.edge_bias_l2_loss = torch.tensor(0.0)
         self.spatial_edge_probabilities = None
+        self.edge_embedding_dim = 16
         
         self.init_nodes() # add nodes to the self.nodes
         self.node_id_to_index = {node_id: idx for idx, node_id in enumerate(self.nodes)}
@@ -102,7 +108,11 @@ class Graph(ABC):
         self.role_adj_matrix = self.construct_adj_matrix()
         self.features = self.construct_features()
         self.gcn = GCN(self.features.size(1)*2,16,self.features.size(1))
-        self.mlp = MLP(384,16,16)
+        self.mlp = MLP(self.features.size(1),16,self.edge_embedding_dim)
+        self.spatial_affinity_weight = torch.nn.Parameter(
+            torch.eye(self.edge_embedding_dim),
+            requires_grad=optimized_spatial,
+        )
 
         init_spatial_logit = torch.log(torch.tensor(initial_spatial_probability / (1 - initial_spatial_probability))) if optimized_spatial else 10.0
         # self.spatial_logits = torch.nn.Parameter(torch.ones(len(self.potential_spatial_edges), requires_grad=optimized_spatial) * init_spatial_logit,
@@ -120,6 +130,8 @@ class Graph(ABC):
             parameters.append(self.refinement_weight)
         if self.spatial_edge_bias.requires_grad:
             parameters.append(self.spatial_edge_bias)
+        if self.spatial_affinity_weight.requires_grad:
+            parameters.append(self.spatial_affinity_weight)
         return parameters
     
     def construct_adj_matrix(self):
@@ -223,8 +235,13 @@ class Graph(ABC):
         def _compute_spatial_logits() -> None:
             new_features = self.construct_new_features(task)
             logits = self.gcn(new_features,self.role_adj_matrix)
-            logits = self.mlp(logits)
-            raw_spatial_logits = min_max_norm(torch.flatten(logits @ logits.t()))
+            edge_embeddings = self.mlp(logits)
+            affinity_weight = self.spatial_affinity_weight.to(
+                device=edge_embeddings.device,
+                dtype=edge_embeddings.dtype,
+            )
+            affinity_scores = edge_embeddings @ affinity_weight @ edge_embeddings.t()
+            raw_spatial_logits = min_max_norm(torch.flatten(affinity_scores))
             self.spatial_logits = self._refine_spatial_logits(raw_spatial_logits)
 
         if track_grad:
@@ -544,7 +561,13 @@ class Graph(ABC):
                         ) # output is saved in the node.outputs
                         break
                     except Exception as e:
-                        print(f"Error during execution of node {current_node_id}: {e}")
+                        node = self.nodes[current_node_id]
+                        print(
+                            "Error during execution of node "
+                            f"{current_node_id} ({node.role}) "
+                            f"round={round} try={tries + 1}/{max_tries}: "
+                            f"{type(e).__name__}: {e!r}\n{_format_exception(e)}"
+                        )
                     tries += 1
                 for successor in self.nodes[current_node_id].spatial_successors:
                     if successor.id not in self.nodes.keys():
@@ -565,7 +588,11 @@ class Graph(ABC):
                 )
                 break
             except Exception as e:
-                print(f"Error during execution of decision node: {e}")
+                print(
+                    "Error during execution of decision node "
+                    f"try={tries + 1}/{_DECISION_NODE_MAX_TRIES}: "
+                    f"{type(e).__name__}: {e!r}\n{_format_exception(e)}"
+                )
                 tries += 1
         final_answers = self.decision_node.outputs
         if len(final_answers) == 0:
@@ -617,7 +644,13 @@ class Graph(ABC):
                         ) # output is saved in the node.outputs
                         break
                     except Exception as e:
-                        print(f"Error during execution of node {current_node_id}: {e}")
+                        node = self.nodes[current_node_id]
+                        print(
+                            "Error during execution of node "
+                            f"{current_node_id} ({node.role}) "
+                            f"round={round} try={tries + 1}/{max_tries}: "
+                            f"{type(e).__name__}: {e!r}\n{_format_exception(e)}"
+                        )
                     tries += 1
                 for successor in self.nodes[current_node_id].spatial_successors:
                     if successor.id not in self.nodes.keys():
@@ -641,7 +674,11 @@ class Graph(ABC):
                 )
                 break
             except Exception as e:
-                print(f"Error during execution of decision node: {e}")
+                print(
+                    "Error during execution of decision node "
+                    f"try={tries + 1}/{_DECISION_NODE_MAX_TRIES}: "
+                    f"{type(e).__name__}: {e!r}\n{_format_exception(e)}"
+                )
                 tries += 1
         final_answers = self.decision_node.outputs
         if len(final_answers) == 0:

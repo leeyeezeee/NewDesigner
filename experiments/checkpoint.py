@@ -45,6 +45,7 @@ def save_graph_checkpoint(
             "edge_bias_scale": float(getattr(graph, "edge_bias_scale", 0.0)),
             "gcn_state_dict": graph.gcn.state_dict(),
             "mlp_state_dict": graph.mlp.state_dict(),
+            "spatial_affinity_weight": graph.spatial_affinity_weight.detach().cpu(),
             "refinement_weight": graph.refinement_weight.detach().cpu(),
             "spatial_edge_bias": graph.spatial_edge_bias.detach().cpu(),
             "spatial_masks": graph.spatial_masks.detach().cpu(),
@@ -93,6 +94,12 @@ def load_graph_checkpoint(
         graph.gcn.load_state_dict(graph_state["gcn_state_dict"])
     if "mlp_state_dict" in graph_state:
         graph.mlp.load_state_dict(graph_state["mlp_state_dict"])
+    if "spatial_affinity_weight" in graph_state:
+        _copy_parameter(
+            graph.spatial_affinity_weight,
+            graph_state["spatial_affinity_weight"],
+            "spatial_affinity_weight",
+        )
     if "refinement_weight" in graph_state:
         _copy_parameter(graph.refinement_weight, graph_state["refinement_weight"], "refinement_weight")
     if "spatial_edge_bias" in graph_state:

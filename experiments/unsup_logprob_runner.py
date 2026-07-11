@@ -233,6 +233,7 @@ def build_graph(args, graph_domain: str) -> Graph:
 def share_trainable_graph_state(realized_graph: Graph, graph: Graph) -> None:
     realized_graph.gcn = graph.gcn
     realized_graph.mlp = graph.mlp
+    realized_graph.spatial_affinity_weight = graph.spatial_affinity_weight
     realized_graph.refinement_weight = graph.refinement_weight
     realized_graph.spatial_edge_bias = graph.spatial_edge_bias
     realized_graph.temporal_logits = graph.temporal_logits
@@ -247,6 +248,7 @@ def configure_train_scope(graph: Graph, train_scope: str) -> List[torch.nn.Param
         parameter.requires_grad = train_gnn
     for parameter in graph.mlp.parameters():
         parameter.requires_grad = train_gnn
+    graph.spatial_affinity_weight.requires_grad = train_refinement
     graph.refinement_weight.requires_grad = train_refinement
     graph.spatial_edge_bias.requires_grad = train_bias
     graph.temporal_logits.requires_grad = graph.optimized_temporal and train_scope == "all"
@@ -256,6 +258,7 @@ def configure_train_scope(graph: Graph, train_scope: str) -> List[torch.nn.Param
         parameters.extend(graph.gcn.parameters())
         parameters.extend(graph.mlp.parameters())
     if train_refinement:
+        parameters.append(graph.spatial_affinity_weight)
         parameters.append(graph.refinement_weight)
     if train_bias:
         parameters.append(graph.spatial_edge_bias)
@@ -582,6 +585,7 @@ async def run_unsup_stage(
     for parameter in reference_graph.mlp.parameters():
         parameter.requires_grad = False
     reference_graph.refinement_weight.requires_grad = False
+    reference_graph.spatial_affinity_weight.requires_grad = False
     reference_graph.spatial_edge_bias.requires_grad = False
     reference_graph.temporal_logits.requires_grad = False
 
