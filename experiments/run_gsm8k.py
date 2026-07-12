@@ -528,4 +528,5 @@ def get_kwargs(mode:Union[Literal['DirectAnswer'],Literal['FullConnected'],Liter
             "node_kwargs":node_kwargs}    
 
 if __name__ == '__main__':
-    asyncio.run(main())
+    from experiments.crash_logging import run_async_with_crash_logging
+    run_async_with_crash_logging(main)
