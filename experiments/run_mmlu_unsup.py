@@ -35,7 +35,6 @@ def parse_args():
     parser.add_argument("--agent_nums", nargs="+", type=int, default=[6])
     parser.add_argument("--decision_method", type=str, default="FinalRefer")
     parser.add_argument("--refine_rank", type=int, default=4)
-    parser.add_argument("--edge_bias_scale", type=float, default=0.5)
     parser.add_argument("--download", action="store_true")
     add_common_unsup_args(
         parser,

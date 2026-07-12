@@ -74,10 +74,6 @@ def parse_args():
                         help="Weight for G-Designer refined adjacency anchor regularization.")
     parser.add_argument('--sparsity_reg_weight', type=float, default=1.0,
                         help="Weight for G-Designer refined adjacency nuclear-norm sparsity regularization.")
-    parser.add_argument('--edge_bias_scale', type=float, default=0.5,
-                        help="Scale for the trainable per-edge spatial bias residual.")
-    parser.add_argument('--edge_bias_l2_weight', type=float, default=1e-2,
-                        help="L2 regularization weight for the trainable per-edge spatial bias.")
     add_teacher_forcing_reward_args(parser)
     parser.add_argument('--llm_name', type=str, default="gpt-4o",
                         help="Model name, None runs the default ChatGPT4")
@@ -116,7 +112,6 @@ async def main():
                   optimized_spatial=args.optimized_spatial,
                   optimized_temporal=args.optimized_temporal,
                   refine_rank=args.refine_rank,
-                  edge_bias_scale=args.edge_bias_scale,
                   **kwargs)
     download()
     dataset_train = MMLUDataset('dev')
@@ -139,7 +134,6 @@ async def main():
                     selector_ig_tau=args.selector_ig_tau,
                     anchor_reg_weight=args.anchor_reg_weight,
                     sparsity_reg_weight=args.sparsity_reg_weight,
-                    edge_bias_l2_weight=args.edge_bias_l2_weight,
                     use_graph_tf_reward=args.use_graph_tf_reward,
                     use_graph_correctness_advantage=args.use_graph_correctness_advantage,
                     graph_sample_count=args.graph_sample_count,

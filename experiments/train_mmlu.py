@@ -65,7 +65,6 @@ async def train(graph:Graph,
             selector_ig_tau: float = 0.0,
             anchor_reg_weight: float = 1.0,
             sparsity_reg_weight: float = 1.0,
-            edge_bias_l2_weight: float = 1e-2,
             use_graph_tf_reward: bool = False,
             use_graph_correctness_advantage: bool = False,
             graph_sample_count: int = 5,
@@ -141,7 +140,6 @@ async def train(graph:Graph,
                 realized_graph.mlp = graph.mlp
                 realized_graph.spatial_affinity_weight = graph.spatial_affinity_weight
                 realized_graph.refinement_weight = graph.refinement_weight
-                realized_graph.spatial_edge_bias = graph.spatial_edge_bias
                 realized_graph.temporal_logits = graph.temporal_logits
                 group_indices.append(len(realized_graphs))
                 realized_graphs.append(realized_graph)
@@ -336,7 +334,6 @@ async def train(graph:Graph,
             utility_loss,
             anchor_reg_weight=anchor_reg_weight,
             sparsity_reg_weight=sparsity_reg_weight,
-            edge_bias_l2_weight=edge_bias_l2_weight,
         )
         total_loss = utility_loss + reg_loss
         optimizer.zero_grad()

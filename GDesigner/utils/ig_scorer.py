@@ -603,12 +603,10 @@ class FinalAnswerScorer:
         messages: List[Dict[str, str]],
         target_answer: str,
     ) -> tuple[float, Dict[str, Any]]:
-        from openai import AsyncOpenAI
-
         from GDesigner.llm.gpt_chat import (
             _agent_base_url,
+            _get_async_openai_client,
             _is_openai_compatible,
-            _openai_client_kwargs,
         )
 
         base_url = _agent_base_url()
@@ -617,7 +615,7 @@ class FinalAnswerScorer:
 
         prompt_prefix = self._completion_prompt_prefix(messages)
         prompt = prompt_prefix + target_answer
-        response = await AsyncOpenAI(**_openai_client_kwargs(base_url)).completions.create(
+        response = await _get_async_openai_client(base_url).completions.create(
             model=llm.model_name,
             prompt=prompt,
             max_tokens=1,

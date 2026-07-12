@@ -36,7 +36,6 @@ def parse_args():
     parser.add_argument("--agent_nums", nargs="+", type=int, default=[5])
     parser.add_argument("--decision_method", type=str, default="FinalWriteCode")
     parser.add_argument("--refine_rank", type=int, default=4)
-    parser.add_argument("--edge_bias_scale", type=float, default=0.5)
     parser.add_argument("--humaneval_timeout", type=int, default=100)
     add_common_unsup_args(
         parser,

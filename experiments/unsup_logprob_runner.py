@@ -231,7 +231,6 @@ def build_graph(args, graph_domain: str) -> Graph:
         optimized_spatial=args.optimized_spatial,
         optimized_temporal=args.optimized_temporal,
         refine_rank=args.refine_rank,
-        edge_bias_scale=args.edge_bias_scale,
         **kwargs,
     )
 
@@ -241,14 +240,12 @@ def share_trainable_graph_state(realized_graph: Graph, graph: Graph) -> None:
     realized_graph.mlp = graph.mlp
     realized_graph.spatial_affinity_weight = graph.spatial_affinity_weight
     realized_graph.refinement_weight = graph.refinement_weight
-    realized_graph.spatial_edge_bias = graph.spatial_edge_bias
     realized_graph.temporal_logits = graph.temporal_logits
 
 
 def configure_train_scope(graph: Graph, train_scope: str) -> List[torch.nn.Parameter]:
     train_gnn = train_scope == "all"
-    train_refinement = train_scope in {"bias_refinement", "all"}
-    train_bias = train_scope in {"bias", "bias_refinement", "all"}
+    train_refinement = train_scope in {"refinement", "all"}
 
     for parameter in graph.gcn.parameters():
         parameter.requires_grad = train_gnn
@@ -256,7 +253,6 @@ def configure_train_scope(graph: Graph, train_scope: str) -> List[torch.nn.Param
         parameter.requires_grad = train_gnn
     graph.spatial_affinity_weight.requires_grad = train_refinement
     graph.refinement_weight.requires_grad = train_refinement
-    graph.spatial_edge_bias.requires_grad = train_bias
     graph.temporal_logits.requires_grad = graph.optimized_temporal and train_scope == "all"
 
     parameters: List[torch.nn.Parameter] = []
@@ -266,8 +262,6 @@ def configure_train_scope(graph: Graph, train_scope: str) -> List[torch.nn.Param
     if train_refinement:
         parameters.append(graph.spatial_affinity_weight)
         parameters.append(graph.refinement_weight)
-    if train_bias:
-        parameters.append(graph.spatial_edge_bias)
     if graph.temporal_logits.requires_grad:
         parameters.append(graph.temporal_logits)
     if not parameters:
@@ -599,7 +593,6 @@ async def run_unsup_stage(
         parameter.requires_grad = False
     reference_graph.refinement_weight.requires_grad = False
     reference_graph.spatial_affinity_weight.requires_grad = False
-    reference_graph.spatial_edge_bias.requires_grad = False
     reference_graph.temporal_logits.requires_grad = False
 
     train_metrics = await train_unsup_logprob(
@@ -669,8 +662,8 @@ def add_common_unsup_args(parser, *, dataset_name: str, unsup_data: str, stage1_
     parser.add_argument(
         "--train_scope",
         type=str,
-        default="bias_refinement",
-        choices=["bias", "bias_refinement", "all"],
+        default="refinement",
+        choices=["refinement", "all"],
     )
     parser.add_argument("--stage1_checkpoint", type=str, default=stage1_checkpoint)
     parser.add_argument("--checkpoint_file", type=str, default=checkpoint_file)

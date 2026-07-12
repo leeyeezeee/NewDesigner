@@ -61,10 +61,6 @@ def parse_args():
                         help="Weight for G-Designer refined adjacency anchor regularization.")
     parser.add_argument("--sparsity_reg_weight", type=float, default=1.0,
                         help="Weight for G-Designer refined adjacency nuclear-norm sparsity regularization.")
-    parser.add_argument("--edge_bias_scale", type=float, default=0.5,
-                        help="Scale for the trainable per-edge spatial bias residual.")
-    parser.add_argument("--edge_bias_l2_weight", type=float, default=1e-2,
-                        help="L2 regularization weight for the trainable per-edge spatial bias.")
     add_teacher_forcing_reward_args(parser)
     parser.add_argument("--optimized_spatial", action="store_true")
     parser.add_argument("--optimized_temporal", action="store_true")

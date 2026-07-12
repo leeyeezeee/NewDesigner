@@ -1,4 +1,5 @@
 import aiohttp
+import httpx
 import math
 from typing import List, Union, Optional
 from tenacity import retry, wait_random_exponential, stop_after_attempt
@@ -16,6 +17,10 @@ from GDesigner.llm.llm_registry import LLMRegistry
 OPENAI_API_KEYS = ['']
 BASE_URL = ''
 _OPENAI_COMPATIBLE_TIMEOUT_SECONDS = 1200.0
+_OPENAI_CONNECT_TIMEOUT_SECONDS = 20.0
+_OPENAI_POOL_TIMEOUT_SECONDS = 20.0
+_OPENAI_WRITE_TIMEOUT_SECONDS = 120.0
+_ASYNC_OPENAI_CLIENTS: Dict[tuple[str, str], AsyncOpenAI] = {}
 
 load_dotenv()
 
@@ -108,6 +113,42 @@ def _openai_client_kwargs(base_url: str) -> Dict[str, Any]:
     return client_kwargs
 
 
+def _get_async_openai_client(base_url: str) -> AsyncOpenAI:
+    """Reuse one bounded keep-alive pool per OpenAI-compatible backend."""
+    api_key = _agent_api_key(base_url)
+    cache_key = (base_url, api_key)
+    client = _ASYNC_OPENAI_CLIENTS.get(cache_key)
+    if client is not None:
+        return client
+
+    timeout = httpx.Timeout(
+        timeout=_OPENAI_COMPATIBLE_TIMEOUT_SECONDS,
+        connect=_OPENAI_CONNECT_TIMEOUT_SECONDS,
+        pool=_OPENAI_POOL_TIMEOUT_SECONDS,
+        read=_OPENAI_COMPATIBLE_TIMEOUT_SECONDS,
+        write=_OPENAI_WRITE_TIMEOUT_SECONDS,
+    )
+    http_client = httpx.AsyncClient(
+        timeout=timeout,
+        limits=httpx.Limits(
+            max_connections=64,
+            max_keepalive_connections=32,
+            keepalive_expiry=60.0,
+        ),
+    )
+    client_kwargs: Dict[str, Any] = {
+        "api_key": api_key,
+        "timeout": timeout,
+        "max_retries": 1,
+        "http_client": http_client,
+    }
+    if base_url:
+        client_kwargs["base_url"] = base_url
+    client = AsyncOpenAI(**client_kwargs)
+    _ASYNC_OPENAI_CLIENTS[cache_key] = client
+    return client
+
+
 def _get_attr_or_key(value: Any, name: str, default: Any = None) -> Any:
     if isinstance(value, dict):
         return value.get(name, default)
@@ -175,7 +216,7 @@ async def openai_compatible_achat(
     extra_body = _chat_completion_extra_body(model)
     if extra_body:
         request_kwargs["extra_body"] = extra_body
-    response = await AsyncOpenAI(**_openai_client_kwargs(base_url)).chat.completions.create(
+    response = await _get_async_openai_client(base_url).chat.completions.create(
         **request_kwargs,
     )
     outputs = [_choice_content(choice) for choice in response.choices]
