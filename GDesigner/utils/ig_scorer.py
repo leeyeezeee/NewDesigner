@@ -316,41 +316,25 @@ class FinalAnswerScorer:
     ) -> ScoreResult:
         output_list, labels = _valid_outputs_and_labels(outputs, cluster_labels)
         if not output_list:
-            return ScoreResult(0.0, target_spec.mode, {"num_outputs": 0})
+            raise RuntimeError("Final-answer scoring received no candidate output.")
 
-        representatives, aggregation = _cluster_representatives(output_list, labels)
         if target_spec.mode == "execution":
-            scores = await asyncio.gather(*[
-                asyncio.to_thread(self._execution_score, representative.output, target_spec)
-                for representative in representatives
-            ])
-        else:
-            scores = await asyncio.gather(*[
-                self._logprob_score(decision_node, input_data, representative.output, target_spec)
-                for representative in representatives
-            ])
+            if len(output_list) != 1:
+                raise RuntimeError(
+                    "Execution scoring expects exactly one candidate output; "
+                    f"received {len(output_list)}."
+                )
+            score = await asyncio.to_thread(
+                self._execution_score, output_list[0], target_spec
+            )
+            return ScoreResult(float(score), target_spec.mode, {"num_outputs": 1})
 
-        weighted_score = sum(
-            representative.weight * float(score)
-            for representative, score in zip(representatives, scores)
-        )
-        return ScoreResult(
-            score=float(weighted_score),
-            mode=target_spec.mode,
-            details={
-                "aggregation": aggregation,
-                "num_outputs": len(output_list),
-                "num_clusters": len(representatives),
-                "clusters": [
-                    {
-                        "label": representative.label,
-                        "count": representative.count,
-                        "weight": representative.weight,
-                        "score": float(score),
-                    }
-                    for representative, score in zip(representatives, scores)
-                ],
-            },
+        return await self.final_agent_teacher_answer_logprob(
+            decision_node,
+            input_data,
+            output_list,
+            target_spec,
+            cluster_labels=labels,
         )
 
     async def teacher_answer_logprob(
@@ -363,10 +347,8 @@ class FinalAnswerScorer:
     ) -> ScoreResult:
         target_answer = self._teacher_answer_text(target_spec)
         if not target_answer:
-            return ScoreResult(
-                score=float(_LOGPROB_FLOOR),
-                mode="teacher_logprob",
-                details={"target_answer": target_answer, "error": "empty target answer"},
+            raise RuntimeError(
+                "Teacher-forcing IG cannot score an empty reference answer."
             )
 
         processed = node._process_inputs(input_data, spatial_info, temporal_info)
@@ -375,19 +357,11 @@ class FinalAnswerScorer:
         system_prompt, user_prompt = processed
         messages = self._teacher_messages(system_prompt, user_prompt)
 
-        try:
-            score, details = await self._completion_target_logprob(
-                node.llm,
-                messages,
-                target_answer,
-            )
-        except Exception as exc:
-            score, details = await self._generated_target_logprob(
-                node.llm,
-                messages,
-                target_answer,
-                str(exc),
-            )
+        score, details = await self._completion_target_logprob(
+            node.llm,
+            messages,
+            target_answer,
+        )
 
         details["target_answer"] = target_answer
         return ScoreResult(
@@ -409,47 +383,32 @@ class FinalAnswerScorer:
     ) -> ScoreResult:
         output_list, labels = _valid_outputs_and_labels(outputs, cluster_labels)
         if not output_list:
-            return ScoreResult(
-                score=float(_LOGPROB_FLOOR),
-                mode="final_agent_teacher_logprob",
-                details={"num_outputs": 0, "error": "empty candidate outputs"},
+            raise RuntimeError(
+                "Teacher-forcing edge IG received no candidate output."
             )
 
-        representatives, aggregation = _cluster_representatives(output_list, labels)
-        scores = await asyncio.gather(*[
-            self._final_agent_single_output_teacher_logprob(
-                decision_node,
-                input_data,
-                representative.output,
-                target_spec,
-                base_spatial_info=base_spatial_info,
-                candidate_id=candidate_id,
-                candidate_role=candidate_role,
+        if len(output_list) != 1:
+            raise RuntimeError(
+                "Teacher-forcing edge IG expects exactly one candidate output; "
+                f"received {len(output_list)}. Disable before/after multi-sampling."
             )
-            for representative in representatives
-        ])
-        weighted_score = sum(
-            representative.weight * float(score.score)
-            for representative, score in zip(representatives, scores)
+        result = await self._final_agent_single_output_teacher_logprob(
+            decision_node,
+            input_data,
+            output_list[0],
+            target_spec,
+            base_spatial_info=base_spatial_info,
+            candidate_id=candidate_id,
+            candidate_role=candidate_role,
         )
         return ScoreResult(
-            score=float(weighted_score),
+            score=float(result.score),
             mode="final_agent_teacher_logprob",
             details={
-                "aggregation": aggregation,
-                "num_outputs": len(output_list),
-                "num_clusters": len(representatives),
+                "aggregation": "single_output",
+                "num_outputs": 1,
                 "teacher_forcing_agent": "final_agent",
-                "clusters": [
-                    {
-                        "label": representative.label,
-                        "count": representative.count,
-                        "weight": representative.weight,
-                        "score": float(score.score),
-                        "details": score.details,
-                    }
-                    for representative, score in zip(representatives, scores)
-                ],
+                "details": result.details,
             },
         )
 
@@ -629,134 +588,6 @@ class FinalAnswerScorer:
             raise RuntimeError("HumanEval IG scoring received an incomplete assertion result set.")
         return sum(1.0 for state in states if state) / len(per_assert_tests)
 
-    async def _logprob_score(
-        self,
-        decision_node,
-        input_data: Dict[str, Any],
-        output: Any,
-        target_spec: TargetSpec,
-    ) -> float:
-        if target_spec.mode == "choice_logprob":
-            labels = list(target_spec.choices or [])
-            target = target_spec.correct
-            messages = self._decision_messages(decision_node, input_data, output, labels)
-        elif target_spec.mode == "yesno_logprob":
-            labels = ["Yes", "No"]
-            target = "Yes"
-            messages = self._verifier_messages(decision_node, input_data, output, target_spec)
-        else:
-            return 0.0
-        return await self._conditional_label_logprob(decision_node.llm, messages, labels, target)
-
-    def _decision_messages(
-        self,
-        decision_node,
-        input_data: Dict[str, Any],
-        output: Any,
-        labels: Sequence[str],
-    ) -> List[Dict[str, str]]:
-        spatial_info = {
-            "candidate": {
-                "role": "Candidate",
-                "output": str(output),
-            }
-        }
-        system_prompt, user_prompt = decision_node._process_inputs(input_data, spatial_info, {})
-        label_text = ", ".join(str(label) for label in labels)
-        user_prompt = (
-            f"{user_prompt}\n\n"
-            f"Answer with exactly one option label from: {label_text}.\n"
-            "Your entire reply must be exactly one label token and nothing else."
-        )
-        return [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]
-
-    def _verifier_messages(
-        self,
-        decision_node,
-        input_data: Dict[str, Any],
-        output: Any,
-        target_spec: TargetSpec,
-    ) -> List[Dict[str, str]]:
-        role = decision_node.prompt_set.get_decision_role()
-        task = input_data.get("task", str(input_data))
-        system_prompt = (
-            f"{role}\n"
-            "You are a strict answer verifier. Reply with exactly one token: Yes or No."
-        )
-        if target_spec.choices:
-            label_text = ", ".join(str(label) for label in target_spec.choices)
-            user_prompt = (
-                f"Task:\n{task}\n\n"
-                f"Candidate response:\n{output}\n\n"
-                f"Valid option labels:\n{label_text}\n\n"
-                f"Reference correct option label:\n{target_spec.correct}\n\n"
-                "Does the candidate response choose or clearly imply the reference correct option label? "
-                "Reply with Yes or No only."
-            )
-            return [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]
-
-        user_prompt = (
-            f"Task:\n{task}\n\n"
-            f"Candidate response:\n{output}\n\n"
-            f"Reference final answer:\n{target_spec.correct}\n\n"
-            "Does the candidate response imply the same final answer as the reference? "
-            "Reply with Yes or No only."
-        )
-        return [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]
-
-    async def _conditional_label_logprob(
-        self,
-        llm,
-        messages: List[Dict[str, str]],
-        labels: Sequence[str],
-        target: str,
-    ) -> float:
-        from openai import AsyncOpenAI
-
-        from GDesigner.llm.gpt_chat import (
-            _agent_base_url,
-            _chat_completion_extra_body,
-            _is_openai_compatible,
-            _openai_client_kwargs,
-        )
-
-        base_url = _agent_base_url()
-        if not _is_openai_compatible(base_url):
-            raise RuntimeError("IG logprob scoring requires an OpenAI-compatible agent backend.")
-
-        request_kwargs = {
-            "model": llm.model_name,
-            "messages": messages,
-            "max_tokens": 1,
-            "temperature": 0.0,
-            "n": 1,
-            "logprobs": True,
-            "top_logprobs": self.top_logprobs,
-        }
-        extra_body = _merge_extra_body(
-            _chat_completion_extra_body(llm.model_name),
-            _qwen_logprob_extra_body(llm.model_name),
-        )
-        if extra_body:
-            request_kwargs["extra_body"] = extra_body
-        response = await AsyncOpenAI(**_openai_client_kwargs(base_url)).chat.completions.create(**request_kwargs)
-
-        label_logprobs = {_normalize_label(label): _LOGPROB_FLOOR for label in labels}
-        for logprob_item in _top_logprobs_from_response(response):
-            token, logprob = _completion_token_logprob(logprob_item)
-            normalized = _completion_label_from_token(token, labels)
-            if normalized in label_logprobs:
-                label_logprobs[normalized] = max(label_logprobs[normalized], logprob)
-
-        normalized_target = _normalize_label(target)
-        if normalized_target not in label_logprobs:
-            label_text = ", ".join(str(label) for label in labels)
-            raise ValueError(
-                f"Target label {target!r} is not one of the scoring labels: {label_text}."
-            )
-        target_logprob = label_logprobs.get(normalized_target, _LOGPROB_FLOOR)
-        return target_logprob - _logsumexp(list(label_logprobs.values()))
-
     def _completion_prompt_prefix(self, messages: List[Dict[str, str]]) -> str:
         parts = []
         for message in messages:
@@ -923,37 +754,3 @@ class FinalAnswerScorer:
 
     def _normalize_teacher_token_text(self, text: Any) -> str:
         return re.sub(r"\s+", " ", str(text)).strip()
-
-    async def _generated_target_logprob(
-        self,
-        llm,
-        messages: List[Dict[str, str]],
-        target_answer: str,
-        fallback_reason: str,
-    ) -> tuple[float, Dict[str, Any]]:
-        max_tokens = max(4, len(str(target_answer).split()) + 8)
-        generation = await llm.agen(
-            messages,
-            max_tokens=max_tokens,
-            temperature=0.0,
-            num_comps=1,
-            return_logprobs=True,
-        )
-        content = generation.content if hasattr(generation, "content") else str(generation)
-        token_logprobs = list(getattr(generation, "token_logprobs", []) or [])
-        logprobs = [
-            float(item.logprob)
-            for item in token_logprobs
-            if getattr(item, "logprob", None) is not None
-        ]
-        score = sum(logprobs) / len(logprobs) if logprobs else float(_LOGPROB_FLOOR)
-        return score, {
-            "method": "generated_answer_logprob_fallback",
-            "fallback_reason": fallback_reason,
-            "generated_answer": content,
-            "target_match": self._answers_match(content, target_answer),
-            "num_generated_tokens": len(logprobs),
-        }
-
-    def _answers_match(self, generated: Any, target: Any) -> bool:
-        return str(generated).strip().lower() == str(target).strip().lower()

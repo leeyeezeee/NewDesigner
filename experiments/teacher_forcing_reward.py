@@ -135,6 +135,37 @@ def _edge_ig_coefficient(
     return log_prob.new_tensor(float(edge_ig_reward_lambda)) * normalized_gain
 
 
+def _edge_ig_record(
+    edge_info: Dict[str, Any],
+    detail: Dict[str, Any],
+    log_prob: torch.Tensor,
+    coefficient: torch.Tensor,
+) -> Dict[str, Any]:
+    """Return the raw values needed to verify that edge IG reached the loss."""
+    ig_gain = float(detail["ig_gain"])
+    log_prob_value = float(log_prob.detach().cpu().item())
+    coefficient_value = float(coefficient.detach().cpu().item())
+    return {
+        "edge_key": edge_key(edge_info),
+        "before_score": detail.get(
+            "before_teacher_logprob", detail.get("before_answer_score")
+        ),
+        "after_score": detail.get(
+            "after_teacher_logprob", detail.get("after_answer_score")
+        ),
+        "ig_gain": ig_gain,
+        "log_prob": log_prob_value,
+        "ig_coefficient": coefficient_value,
+        "ig_loss_term": -(coefficient_value * log_prob_value),
+    }
+
+
+def _average_edge_ig_logprob_loss(records: Sequence[Dict[str, Any]]) -> float:
+    if not records:
+        return 0.0
+    return sum(float(record["ig_loss_term"]) for record in records) / len(records)
+
+
 def _correctness_advantages(
     correctness_scores: Sequence[float],
     *,
@@ -170,12 +201,22 @@ def edge_information_gain_loss(
 
     terms: List[torch.Tensor] = []
     coefficients: List[float] = []
+    records: List[Dict[str, Any]] = []
+    sampled_edges = len(getattr(graph, "edge_log_probs", []))
+    missing_log_prob = 0
+    missing_detail = 0
+    missing_ig_gain = 0
     for edge_info in getattr(graph, "edge_log_probs", []):
         log_prob = edge_info.get("log_prob")
         if not torch.is_tensor(log_prob):
+            missing_log_prob += 1
             continue
-        detail = edge_details.get(edge_key(edge_info), {})
+        detail = edge_details.get(edge_key(edge_info))
+        if detail is None:
+            missing_detail += 1
+            continue
         if "ig_gain" not in detail:
+            missing_ig_gain += 1
             continue
 
         coefficient = _edge_ig_coefficient(
@@ -186,11 +227,21 @@ def edge_information_gain_loss(
         )
         terms.append(-(coefficient * log_prob))
         coefficients.append(float(coefficient.detach().cpu().item()))
+        records.append(_edge_ig_record(edge_info, detail, log_prob, coefficient))
+
+    avg_edge_ig_logprob_loss = _average_edge_ig_logprob_loss(records)
+    print("average edge IG logprob loss:", avg_edge_ig_logprob_loss)
 
     return (
         torch.sum(torch.stack(terms)) if terms else zero,
         {
             "used_edges": len(terms),
+            "sampled_edges": sampled_edges,
+            "missing_log_prob": missing_log_prob,
+            "missing_detail": missing_detail,
+            "missing_ig_gain": missing_ig_gain,
+            "edge_ig_records": records,
+            "avg_edge_ig_logprob_loss": avg_edge_ig_logprob_loss,
             "avg_edge_ig_coefficient": (
                 sum(coefficients) / len(coefficients)
                 if coefficients
@@ -230,6 +281,11 @@ def graph_correctness_advantage_edge_loss(
         terms: List[torch.Tensor] = []
         coefficients: List[float] = []
         edge_ig_coefficients: List[float] = []
+        edge_ig_records: List[Dict[str, Any]] = []
+        sampled_edges = 0
+        missing_log_prob = 0
+        missing_detail = 0
+        missing_ig_gain = 0
         used_edges = 0
 
         for graph_advantage, graph, edge_details in zip(
@@ -238,12 +294,19 @@ def graph_correctness_advantage_edge_loss(
             edge_details_list,
         ):
             for edge_info in getattr(graph, "edge_log_probs", []):
+                sampled_edges += 1
                 log_prob = edge_info.get("log_prob")
                 if not torch.is_tensor(log_prob):
+                    missing_log_prob += 1
                     continue
 
                 coefficient = log_prob.new_tensor(float(graph_advantage))
-                detail = edge_details.get(edge_key(edge_info), {})
+                detail = edge_details.get(edge_key(edge_info))
+                if detail is None:
+                    missing_detail += 1
+                    detail = {}
+                elif "ig_gain" not in detail:
+                    missing_ig_gain += 1
                 if edge_ig_reward_lambda != 0.0 and "ig_gain" in detail:
                     edge_ig_coefficient = _edge_ig_coefficient(
                         log_prob,
@@ -255,10 +318,19 @@ def graph_correctness_advantage_edge_loss(
                     edge_ig_coefficients.append(
                         float(edge_ig_coefficient.detach().cpu().item())
                     )
+                    edge_ig_records.append(
+                        _edge_ig_record(
+                            edge_info, detail, log_prob, edge_ig_coefficient
+                        )
+                    )
 
                 terms.append(-(coefficient * log_prob))
                 coefficients.append(float(coefficient.detach().cpu().item()))
                 used_edges += 1
+
+        avg_edge_ig_logprob_loss = _average_edge_ig_logprob_loss(edge_ig_records)
+        if edge_ig_reward_lambda != 0.0:
+            print("average edge IG logprob loss:", avg_edge_ig_logprob_loss)
 
         group_losses.append(torch.sum(torch.stack(terms)) if terms else zero)
         summaries.append({
@@ -269,6 +341,12 @@ def graph_correctness_advantage_edge_loss(
             "standardized_graph_advantage": bool(std > float(advantage_epsilon)),
             "graph_advantages": [float(advantage) for advantage in advantages],
             "used_edges": used_edges,
+            "sampled_edges": sampled_edges,
+            "missing_log_prob": missing_log_prob,
+            "missing_detail": missing_detail,
+            "missing_ig_gain": missing_ig_gain,
+            "edge_ig_records": edge_ig_records,
+            "avg_edge_ig_logprob_loss": avg_edge_ig_logprob_loss,
             "avg_edge_coefficient": (
                 sum(coefficients) / len(coefficients)
                 if coefficients

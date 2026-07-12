@@ -422,15 +422,9 @@ async def _sample_node_outputs(
     input_data: Any,
     spatial_info: Dict[str, Any],
     temporal_info: Dict[str, Any],
-    num_samples: int,
 ) -> List[Any]:
-    import asyncio
-
-    tasks = [
-        asyncio.create_task(node._async_execute(input_data, spatial_info, temporal_info))
-        for _ in range(max(1, int(num_samples)))
-    ]
-    return _flatten_outputs(await asyncio.gather(*tasks, return_exceptions=False))
+    result = await node._async_execute(input_data, spatial_info, temporal_info)
+    return _flatten_outputs([result])
 
 
 def _current_graph_output_info(graph) -> Dict[str, Dict[str, Any]]:
@@ -519,8 +513,6 @@ async def edge_entropy_rewards(
     """Measure each selected edge by removing it and scoring receiver outputs."""
     if not graph.edge_log_probs:
         return {}, {}
-    sample_count = max(1, int(num_entropy_samples))
-
     histories: Dict[Tuple[str, int], Dict[str, Any]] = {}
     for node_id, node in graph.nodes.items():
         for history_item in node.execution_history:
@@ -570,7 +562,6 @@ async def edge_entropy_rewards(
             input_data,
             before_spatial_info,
             before_temporal_info,
-            sample_count,
         )
         if not before_outputs:
             continue
