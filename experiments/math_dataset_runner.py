@@ -267,7 +267,7 @@ async def run_math_dataset(
                 edge_ig_reward_lambda=edge_ig_reward_lambda,
                 edge_ig_discount_factor=getattr(args, "edge_ig_discount_factor", 0.0),
                 advantage_epsilon=getattr(args, "graph_advantage_epsilon", 1e-6),
-                graph_ib_beta=getattr(args, "graph_ib_beta", 0.2),
+                graph_ib_beta=getattr(args, "graph_ib_beta", 1.0),
                 graph_ib_prior_prob=getattr(args, "graph_ib_prior_prob", 0.45),
             )
             if graph_tf_corrects:

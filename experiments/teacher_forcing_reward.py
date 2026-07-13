@@ -100,9 +100,9 @@ def add_teacher_forcing_reward_args(parser) -> None:
     parser.add_argument(
         "--graph_ib_beta",
         type=float,
-        default=0.2,
+        default=1.0,
         help=(
-            "Per-edge coefficient for the full-graph Bernoulli information "
+            "Coefficient for the mean per-candidate-edge Bernoulli information "
             "bottleneck. Set to 0 to disable it."
         ),
     )
@@ -388,7 +388,7 @@ def graph_correctness_advantage_edge_loss(
     edge_ig_reward_lambda: float = 0.0,
     edge_ig_discount_factor: float = 0.0,
     advantage_epsilon: float = 1e-6,
-    graph_ib_beta: float = 0.2,
+    graph_ib_beta: float = 1.0,
     graph_ib_prior_prob: float = 0.45,
 ) -> Tuple[torch.Tensor, List[Dict[str, Any]]]:
     """Combine full-graph correctness, selected-edge IG, and graph IB losses."""
@@ -527,7 +527,7 @@ def graph_correctness_advantage_edge_loss(
                     ib_edges += 1
             graph_ib_loss = (
                 graph_log_prob.new_tensor(graph_ib_beta)
-                * torch.sum(torch.stack(graph_ib_terms))
+                * torch.mean(torch.stack(graph_ib_terms))
                 if graph_ib_terms
                 else zero
             )
