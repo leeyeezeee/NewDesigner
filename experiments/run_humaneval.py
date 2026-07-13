@@ -259,8 +259,11 @@ async def main():
                     graph_tf_corrects.append(float(is_solved))
                     graph_tf_edge_counts.append(float(sum(realized_graph.realized_edge_counts)))
                     needs_edge_details = (
-                        edge_ig_reward_lambda != 0.0
-                        or selector_buffer is not None
+                        bool(realized_graph.edge_log_probs)
+                        and (
+                            edge_ig_reward_lambda != 0.0
+                            or selector_buffer is not None
+                        )
                     )
                     if needs_edge_details:
                         _edge_rewards, edge_details = await edge_entropy_rewards(
@@ -356,6 +359,7 @@ async def main():
                 if (
                     use_semantic_edges
                     and (is_solved or edge_ig_reward_lambda != 0.0)
+                    and bool(realized_graph.edge_log_probs)
                 ):
                     edge_rewards, edge_details = await edge_entropy_rewards(
                         realized_graph,
@@ -400,8 +404,11 @@ async def main():
         total_loss = utility_loss
         if train_updates_enabled:
             optimizer.zero_grad()
-            total_loss.backward()
-            optimizer.step()
+            if total_loss.requires_grad:
+                total_loss.backward()
+                optimizer.step()
+            else:
+                print("Skipping graph optimizer step: no differentiable edge decisions.")
             if edge_selector is not None:
                 selector_trained = (
                     train_edge_selector(edge_selector, selector_optimizer, selector_buffer)

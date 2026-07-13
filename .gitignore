@@ -17,6 +17,7 @@ test.py
 token/
 attack/
 log/
+errors/
 result/
 ps_list/
 paper/

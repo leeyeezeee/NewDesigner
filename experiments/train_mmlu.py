@@ -191,8 +191,11 @@ async def train(graph:Graph,
                     graph_tf_corrects.append(float(record_accuracy.get()))
                     graph_tf_edge_counts.append(float(sum(realized_graph.realized_edge_counts)))
                     needs_edge_details = (
-                        resolved_edge_ig_reward_lambda != 0.0
-                        or selector_buffer is not None
+                        bool(realized_graph.edge_log_probs)
+                        and (
+                            resolved_edge_ig_reward_lambda != 0.0
+                            or selector_buffer is not None
+                        )
                     )
                     if needs_edge_details:
                         _edge_rewards, edge_details = await edge_entropy_rewards(
@@ -293,6 +296,7 @@ async def train(graph:Graph,
                 if (
                     use_semantic_edges
                     and (correctness_reward > 0 or resolved_edge_ig_reward_lambda != 0.0)
+                    and bool(realized_graph.edge_log_probs)
                 ):
                     edge_rewards, edge_details = await edge_entropy_rewards(
                         realized_graph,
@@ -338,8 +342,11 @@ async def train(graph:Graph,
             utility_loss = torch.mean(torch.stack(loss_list))
         total_loss = utility_loss
         optimizer.zero_grad()
-        total_loss.backward()
-        optimizer.step()
+        if total_loss.requires_grad:
+            total_loss.backward()
+            optimizer.step()
+        else:
+            print("Skipping graph optimizer step: no differentiable edge decisions.")
         if edge_selector is not None:
             selector_trained = (
                 train_edge_selector(edge_selector, selector_optimizer, selector_buffer)

@@ -302,6 +302,19 @@ def edge_information_gain_loss(
     edge_ig_reward_lambda = float(edge_ig_reward_lambda)
     if edge_ig_reward_lambda == 0.0:
         return zero, {"used_edges": 0, "avg_edge_ig_coefficient": 0.0}
+    sampled_edges = len(getattr(graph, "edge_log_probs", []))
+    if sampled_edges == 0:
+        return zero, {
+            "used_edges": 0,
+            "sampled_edges": 0,
+            "missing_log_prob": 0,
+            "missing_detail": 0,
+            "missing_ig_gain": 0,
+            "edge_ig_records": [],
+            "avg_edge_ig_logprob_loss": 0.0,
+            "edge_ig_discount_factor": float(edge_ig_discount_factor),
+            "avg_edge_ig_coefficient": 0.0,
+        }
     discounted_gains = discounted_edge_ig_gains(
         graph, edge_details, edge_ig_discount_factor
     )
@@ -309,7 +322,6 @@ def edge_information_gain_loss(
     terms: List[torch.Tensor] = []
     coefficients: List[float] = []
     records: List[Dict[str, Any]] = []
-    sampled_edges = len(getattr(graph, "edge_log_probs", []))
     missing_log_prob = 0
     missing_detail = 0
     missing_ig_gain = 0
@@ -528,7 +540,7 @@ def graph_correctness_advantage_edge_loss(
             graph_ib_loss_values.append(float(graph_ib_loss.detach().cpu().item()))
 
         avg_edge_ig_logprob_loss = _average_edge_ig_logprob_loss(edge_ig_records)
-        if edge_ig_reward_lambda != 0.0:
+        if edge_ig_records:
             print("average edge IG logprob loss:", avg_edge_ig_logprob_loss)
 
         group_losses.append(
