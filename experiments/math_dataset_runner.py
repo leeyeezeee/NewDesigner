@@ -362,11 +362,13 @@ async def run_math_dataset(
         total_loss = utility_loss
         if train_updates_enabled:
             optimizer.zero_grad()
-            if total_loss.requires_grad:
-                total_loss.backward()
-                optimizer.step()
-            else:
-                print("Skipping graph optimizer step: no differentiable edge decisions.")
+            if not total_loss.requires_grad:
+                raise RuntimeError(
+                    "Graph training loss is not differentiable. A zero-edge sample "
+                    "must still retain full-graph log-prob or IB gradients."
+                )
+            total_loss.backward()
+            optimizer.step()
             if edge_selector is not None:
                 selector_trained = (
                     train_edge_selector(edge_selector, selector_optimizer, selector_buffer)
