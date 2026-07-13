@@ -82,10 +82,29 @@ def add_teacher_forcing_reward_args(parser) -> None:
         ),
     )
     parser.add_argument(
+        "--edge_ig_discount_factor",
+        type=float,
+        default=0.0,
+        help=(
+            "Discount factor for propagating downstream edge IG rewards within "
+            "each realized spatial DAG round. Rewards reset between rounds; 0.0 "
+            "exactly preserves immediate-only IG."
+        ),
+    )
+    parser.add_argument(
         "--graph_advantage_epsilon",
         type=float,
         default=1e-6,
         help="Small constant used when normalizing graph advantages.",
+    )
+    parser.add_argument(
+        "--graph_edge_cost_alpha",
+        type=float,
+        default=0.2,
+        help=(
+            "Penalty coefficient for the mean per-round realized spatial-edge "
+            "ratio. The graph reward is correctness - alpha * edge_ratio."
+        ),
     )
 
 
@@ -124,13 +143,13 @@ def graph_softmax_weights(scores: Sequence[float], temperature: float) -> List[f
 
 def _edge_ig_coefficient(
     log_prob: torch.Tensor,
-    detail: Dict[str, Any],
+    ig_gain: float,
     *,
     edge_tanh_temperature: float,
     edge_ig_reward_lambda: float,
 ) -> torch.Tensor:
     normalized_gain = torch.tanh(
-        log_prob.new_tensor(float(detail["ig_gain"]) / edge_tanh_temperature)
+        log_prob.new_tensor(float(ig_gain) / edge_tanh_temperature)
     )
     return log_prob.new_tensor(float(edge_ig_reward_lambda)) * normalized_gain
 
@@ -140,6 +159,7 @@ def _edge_ig_record(
     detail: Dict[str, Any],
     log_prob: torch.Tensor,
     coefficient: torch.Tensor,
+    discounted_ig_gain: float,
 ) -> Dict[str, Any]:
     """Return the raw values needed to verify that edge IG reached the loss."""
     ig_gain = float(detail["ig_gain"])
@@ -154,10 +174,89 @@ def _edge_ig_record(
             "after_teacher_logprob", detail.get("after_answer_score")
         ),
         "ig_gain": ig_gain,
+        "discounted_ig_gain": float(discounted_ig_gain),
         "log_prob": log_prob_value,
         "ig_coefficient": coefficient_value,
         "ig_loss_term": -(coefficient_value * log_prob_value),
     }
+
+
+def discounted_edge_ig_gains(
+    graph,
+    edge_details: Dict[str, Dict[str, Any]],
+    discount_factor: float,
+) -> Dict[str, float]:
+    """Propagate immediate IG within each realized spatial DAG round.
+
+    Rewards reset between rounds. Temporal edges never carry downstream credit,
+    because temporal topology is not part of the optimized spatial policy. At a
+    spatial branch, downstream returns are averaged uniformly, preventing an
+    artificial preference for high-outdegree nodes.
+    """
+    gamma = float(discount_factor)
+    if not 0.0 <= gamma <= 1.0:
+        raise ValueError(
+            f"edge_ig_discount_factor must be in [0, 1], got {gamma}."
+        )
+
+    edge_infos: Dict[str, Dict[str, Any]] = {}
+    immediate_gains: Dict[str, float] = {}
+    for edge_info in getattr(graph, "edge_log_probs", []):
+        key = edge_key(edge_info)
+        detail = edge_details.get(key)
+        if detail is None or "ig_gain" not in detail:
+            continue
+        edge_infos[key] = edge_info
+        immediate_gains[key] = float(detail["ig_gain"])
+
+    # Preserve the previous numerical path exactly when discounting is disabled.
+    if gamma == 0.0:
+        return immediate_gains
+
+    outgoing_by_state: Dict[Tuple[Any, int], List[str]] = {}
+    destination_state: Dict[str, Tuple[Any, int]] = {}
+    for key, edge_info in edge_infos.items():
+        round_idx = int(edge_info["round"])
+        edge_type = edge_info["type"]
+        if edge_type != "spatial":
+            continue
+        source_state = (edge_info["source"], round_idx)
+        target_state = (edge_info["target"], round_idx)
+        outgoing_by_state.setdefault(source_state, []).append(key)
+        destination_state[key] = target_state
+
+    edge_returns: Dict[str, float] = {}
+    node_values: Dict[Tuple[Any, int], float] = {}
+    visiting_states = set()
+
+    def node_value(state: Tuple[Any, int]) -> float:
+        if state in node_values:
+            return node_values[state]
+        if state in visiting_states:
+            raise RuntimeError(
+                "Cycle detected while propagating discounted edge IG rewards."
+            )
+        visiting_states.add(state)
+        outgoing = outgoing_by_state.get(state, [])
+        if not outgoing:
+            value = 0.0
+        else:
+            value = sum(edge_return(key) for key in outgoing) / len(outgoing)
+        visiting_states.remove(state)
+        node_values[state] = value
+        return value
+
+    def edge_return(key: str) -> float:
+        if key not in edge_returns:
+            target_state = destination_state.get(key)
+            edge_returns[key] = immediate_gains[key]
+            if target_state is not None:
+                edge_returns[key] += gamma * node_value(target_state)
+        return edge_returns[key]
+
+    for key in edge_infos:
+        edge_return(key)
+    return edge_returns
 
 
 def _average_edge_ig_logprob_loss(records: Sequence[Dict[str, Any]]) -> float:
@@ -184,6 +283,40 @@ def _correctness_advantages(
     return baseline, advantages, variance, std
 
 
+def normalized_spatial_edge_cost(graph) -> float:
+    """Mean realized spatial-edge ratio per round; temporal edges are excluded."""
+    num_nodes = int(getattr(graph, "num_nodes", 0))
+    max_edges_per_round = num_nodes * (num_nodes - 1) // 2
+    if max_edges_per_round <= 0:
+        return 0.0
+
+    num_rounds = len(getattr(graph, "realized_edge_counts", []))
+    if num_rounds <= 0:
+        spatial_rounds = [
+            int(edge_info.get("round", 0))
+            for edge_info in getattr(graph, "edge_log_probs", [])
+            if edge_info.get("type") == "spatial"
+        ]
+        num_rounds = max(spatial_rounds, default=-1) + 1
+    num_rounds = max(1, num_rounds)
+
+    realized_spatial_edges = sum(
+        1
+        for edge_info in getattr(graph, "edge_log_probs", [])
+        if edge_info.get("type") == "spatial"
+    )
+    return realized_spatial_edges / (num_rounds * max_edges_per_round)
+
+
+def cost_adjusted_graph_reward(
+    graph,
+    correctness: float,
+    edge_cost_alpha: float = 0.2,
+) -> Tuple[float, float]:
+    edge_ratio = normalized_spatial_edge_cost(graph)
+    return float(correctness) - float(edge_cost_alpha) * edge_ratio, edge_ratio
+
+
 def edge_information_gain_loss(
     graph,
     edge_details: Dict[str, Dict[str, Any]],
@@ -191,6 +324,7 @@ def edge_information_gain_loss(
     *,
     edge_tanh_temperature: float = 1.0,
     edge_ig_reward_lambda: float = 0.0,
+    edge_ig_discount_factor: float = 0.0,
 ) -> Tuple[torch.Tensor, Dict[str, Any]]:
     """Build a fine-grained per-edge policy-gradient loss from IG gains."""
     zero = reference_loss.new_tensor(0.0)
@@ -198,6 +332,9 @@ def edge_information_gain_loss(
     edge_ig_reward_lambda = float(edge_ig_reward_lambda)
     if edge_ig_reward_lambda == 0.0:
         return zero, {"used_edges": 0, "avg_edge_ig_coefficient": 0.0}
+    discounted_gains = discounted_edge_ig_gains(
+        graph, edge_details, edge_ig_discount_factor
+    )
 
     terms: List[torch.Tensor] = []
     coefficients: List[float] = []
@@ -221,13 +358,19 @@ def edge_information_gain_loss(
 
         coefficient = _edge_ig_coefficient(
             log_prob,
-            detail,
+            discounted_gains[edge_key(edge_info)],
             edge_tanh_temperature=edge_tanh_temperature,
             edge_ig_reward_lambda=edge_ig_reward_lambda,
         )
         terms.append(-(coefficient * log_prob))
         coefficients.append(float(coefficient.detach().cpu().item()))
-        records.append(_edge_ig_record(edge_info, detail, log_prob, coefficient))
+        records.append(_edge_ig_record(
+            edge_info,
+            detail,
+            log_prob,
+            coefficient,
+            discounted_gains[edge_key(edge_info)],
+        ))
 
     avg_edge_ig_logprob_loss = _average_edge_ig_logprob_loss(records)
     print("average edge IG logprob loss:", avg_edge_ig_logprob_loss)
@@ -242,6 +385,7 @@ def edge_information_gain_loss(
             "missing_ig_gain": missing_ig_gain,
             "edge_ig_records": records,
             "avg_edge_ig_logprob_loss": avg_edge_ig_logprob_loss,
+            "edge_ig_discount_factor": float(edge_ig_discount_factor),
             "avg_edge_ig_coefficient": (
                 sum(coefficients) / len(coefficients)
                 if coefficients
@@ -259,6 +403,8 @@ def graph_correctness_advantage_edge_loss(
     *,
     edge_tanh_temperature: float = 1.0,
     edge_ig_reward_lambda: float = 0.0,
+    edge_ig_discount_factor: float = 0.0,
+    graph_edge_cost_alpha: float = 0.2,
     advantage_epsilon: float = 1e-6,
 ) -> Tuple[torch.Tensor, List[Dict[str, Any]]]:
     """Build edge losses from graph-level correctness advantages plus edge IG."""
@@ -273,8 +419,16 @@ def graph_correctness_advantage_edge_loss(
         correctness_groups,
         edge_detail_groups,
     ):
+        graph_rewards = []
+        edge_ratios = []
+        for graph, correctness in zip(graphs, correctness_scores):
+            reward, edge_ratio = cost_adjusted_graph_reward(
+                graph, correctness, graph_edge_cost_alpha
+            )
+            graph_rewards.append(reward)
+            edge_ratios.append(edge_ratio)
         baseline, advantages, variance, std = _correctness_advantages(
-            correctness_scores,
+            graph_rewards,
             advantage_epsilon=advantage_epsilon,
         )
 
@@ -293,6 +447,9 @@ def graph_correctness_advantage_edge_loss(
             graphs,
             edge_details_list,
         ):
+            discounted_gains = discounted_edge_ig_gains(
+                graph, edge_details, edge_ig_discount_factor
+            )
             for edge_info in getattr(graph, "edge_log_probs", []):
                 sampled_edges += 1
                 log_prob = edge_info.get("log_prob")
@@ -310,7 +467,7 @@ def graph_correctness_advantage_edge_loss(
                 if edge_ig_reward_lambda != 0.0 and "ig_gain" in detail:
                     edge_ig_coefficient = _edge_ig_coefficient(
                         log_prob,
-                        detail,
+                        discounted_gains[edge_key(edge_info)],
                         edge_tanh_temperature=edge_tanh_temperature,
                         edge_ig_reward_lambda=edge_ig_reward_lambda,
                     )
@@ -320,7 +477,11 @@ def graph_correctness_advantage_edge_loss(
                     )
                     edge_ig_records.append(
                         _edge_ig_record(
-                            edge_info, detail, log_prob, edge_ig_coefficient
+                            edge_info,
+                            detail,
+                            log_prob,
+                            edge_ig_coefficient,
+                            discounted_gains[edge_key(edge_info)],
                         )
                     )
 
@@ -335,6 +496,9 @@ def graph_correctness_advantage_edge_loss(
         group_losses.append(torch.sum(torch.stack(terms)) if terms else zero)
         summaries.append({
             "correctness_scores": [float(score) for score in correctness_scores],
+            "graph_rewards": graph_rewards,
+            "spatial_edge_ratios": edge_ratios,
+            "graph_edge_cost_alpha": float(graph_edge_cost_alpha),
             "correctness_baseline": float(baseline),
             "correctness_variance": float(variance),
             "correctness_std": float(std),
@@ -347,6 +511,7 @@ def graph_correctness_advantage_edge_loss(
             "missing_ig_gain": missing_ig_gain,
             "edge_ig_records": edge_ig_records,
             "avg_edge_ig_logprob_loss": avg_edge_ig_logprob_loss,
+            "edge_ig_discount_factor": float(edge_ig_discount_factor),
             "avg_edge_coefficient": (
                 sum(coefficients) / len(coefficients)
                 if coefficients
@@ -373,6 +538,7 @@ def teacher_forcing_edge_loss(
     graph_softmax_temperature: float = 1.0,
     edge_tanh_temperature: float = 1.0,
     edge_ig_reward_lambda: float = _DEFAULT_TF_EDGE_IG_REWARD_LAMBDA,
+    edge_ig_discount_factor: float = 0.0,
 ) -> Tuple[torch.Tensor, List[Dict[str, Any]]]:
     """Build the edge-level policy-gradient loss from graph and edge weights."""
     zero = reference_loss.new_tensor(0.0)
@@ -392,6 +558,9 @@ def teacher_forcing_edge_loss(
         used_edges = 0
 
         for graph_weight, graph, edge_details in zip(weights, graphs, edge_details_list):
+            discounted_gains = discounted_edge_ig_gains(
+                graph, edge_details, edge_ig_discount_factor
+            )
             for edge_info in getattr(graph, "edge_log_probs", []):
                 log_prob = edge_info.get("log_prob")
                 if not torch.is_tensor(log_prob):
@@ -401,7 +570,10 @@ def teacher_forcing_edge_loss(
                     continue
 
                 normalized_gain = torch.tanh(
-                    log_prob.new_tensor(float(detail["ig_gain"]) / edge_tanh_temperature)
+                    log_prob.new_tensor(
+                        discounted_gains[edge_key(edge_info)]
+                        / edge_tanh_temperature
+                    )
                 )
                 coefficient = (
                     log_prob.new_tensor(float(graph_weight))

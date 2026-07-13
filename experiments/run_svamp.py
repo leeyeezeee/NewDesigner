@@ -57,10 +57,10 @@ def parse_args():
     parser.add_argument("--selector_ig_tau", type=float, default=0.0)
     parser.add_argument("--refine_rank", type=int, default=4,
                         help="Rank used by the refined adjacency decoder.")
-    parser.add_argument("--anchor_reg_weight", type=float, default=1.0,
-                        help="Weight for G-Designer refined adjacency anchor regularization.")
-    parser.add_argument("--sparsity_reg_weight", type=float, default=1.0,
-                        help="Weight for G-Designer refined adjacency nuclear-norm sparsity regularization.")
+    parser.add_argument("--anchor_reg_weight", type=float, default=0.0,
+                        help="Reserved compatibility option; currently unused.")
+    parser.add_argument("--sparsity_reg_weight", type=float, default=0.0,
+                        help="Reserved compatibility option; currently unused.")
     add_teacher_forcing_reward_args(parser)
     parser.add_argument("--optimized_spatial", action="store_true")
     parser.add_argument("--optimized_temporal", action="store_true")

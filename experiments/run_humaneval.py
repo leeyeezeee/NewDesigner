@@ -31,9 +31,9 @@ from GDesigner.utils.uncertainty import (
 from GDesigner.utils.ig_scorer import FinalAnswerScorer, make_target_spec
 from experiments.checkpoint import save_graph_checkpoint
 from experiments.graph_concurrency import limited_graph_arun, make_graph_semaphore
-from experiments.refinement_loss import refinement_regularization_loss
 from experiments.teacher_forcing_reward import (
     add_teacher_forcing_reward_args,
+    cost_adjusted_graph_reward,
     edge_information_gain_loss,
     graph_correctness_advantage_edge_loss,
 )
@@ -87,10 +87,10 @@ def parse_args():
                         help="IG gain threshold for positive selector labels.")
     parser.add_argument('--refine_rank', type=int, default=4,
                         help="Rank used by the refined adjacency decoder.")
-    parser.add_argument('--anchor_reg_weight', type=float, default=1.0,
-                        help="Weight for G-Designer refined adjacency anchor regularization.")
-    parser.add_argument('--sparsity_reg_weight', type=float, default=1.0,
-                        help="Weight for G-Designer refined adjacency nuclear-norm sparsity regularization.")
+    parser.add_argument('--anchor_reg_weight', type=float, default=0.0,
+                        help="Reserved compatibility option; currently unused.")
+    parser.add_argument('--sparsity_reg_weight', type=float, default=0.0,
+                        help="Reserved compatibility option; currently unused.")
     add_teacher_forcing_reward_args(parser)
     parser.add_argument('--num_iterations', type=int, default = 10,help="The num of training iterations.")
     parser.add_argument('--domain', type=str, default="humaneval",help="Domain (the same as dataset name), default 'humaneval'")
@@ -135,7 +135,7 @@ async def main():
                   **kwargs)
     graph.gcn.train()
     graph.mlp.train()
-    optimizer_params = list(graph.gcn.parameters()) + list(graph.mlp.parameters()) + graph.refinement_parameters()
+    optimizer_params = list(graph.gcn.parameters()) + list(graph.mlp.parameters()) + graph.spatial_parameters()
     if graph.optimized_temporal:
         optimizer_params.append(graph.temporal_logits)
     optimizer = torch.optim.Adam(optimizer_params, lr=args.lr)
@@ -215,7 +215,6 @@ async def main():
                 realized_graph.gcn = graph.gcn
                 realized_graph.mlp = graph.mlp
                 realized_graph.spatial_affinity_weight = graph.spatial_affinity_weight
-                realized_graph.refinement_weight = graph.refinement_weight
                 realized_graph.temporal_logits = graph.temporal_logits
                 group_indices.append(len(realized_graphs))
                 realized_graphs.append(realized_graph)
@@ -312,6 +311,8 @@ async def main():
                 reference_loss,
                 edge_tanh_temperature=args.edge_tanh_temperature,
                 edge_ig_reward_lambda=edge_ig_reward_lambda,
+                edge_ig_discount_factor=args.edge_ig_discount_factor,
+                graph_edge_cost_alpha=args.graph_edge_cost_alpha,
                 advantage_epsilon=args.graph_advantage_epsilon,
             )
             if graph_tf_corrects:
@@ -381,7 +382,12 @@ async def main():
                     "edge_entropy_rewards": edge_rewards,
                 }
                 utilities.append(utility)
-                single_loss = -log_prob * is_solved
+                graph_reward, edge_ratio = cost_adjusted_graph_reward(
+                    realized_graph, is_solved, args.graph_edge_cost_alpha
+                )
+                utility["graph_reward"] = graph_reward
+                utility["spatial_edge_ratio"] = edge_ratio
+                single_loss = -log_prob * graph_reward
                 if edge_ig_reward_lambda != 0.0:
                     edge_ig_loss, edge_ig_summary = edge_information_gain_loss(
                         realized_graph,
@@ -389,19 +395,14 @@ async def main():
                         log_prob,
                         edge_tanh_temperature=args.edge_tanh_temperature,
                         edge_ig_reward_lambda=edge_ig_reward_lambda,
+                        edge_ig_discount_factor=args.edge_ig_discount_factor,
                     )
                     single_loss = single_loss + edge_ig_loss
                     utility["edge_ig_loss_summary"] = edge_ig_summary
                 loss_list.append(single_loss)
 
             utility_loss = torch.mean(torch.stack(loss_list))
-        reg_loss, anchor_loss, sparse_loss = refinement_regularization_loss(
-            realized_graphs,
-            utility_loss,
-            anchor_reg_weight=args.anchor_reg_weight,
-            sparsity_reg_weight=args.sparsity_reg_weight,
-        )
-        total_loss = utility_loss + reg_loss
+        total_loss = utility_loss
         if train_updates_enabled:
             optimizer.zero_grad()
             total_loss.backward()
@@ -423,8 +424,6 @@ async def main():
         if not use_multi_graph_reward:
             print("utilities:", utilities)
         print("utility loss:", utility_loss.item())
-        print("anchor loss:", anchor_loss.item())
-        print("sparse loss:", sparse_loss.item())
         print("loss:", total_loss.item())
 
         if i_batch+1 == args.num_iterations:

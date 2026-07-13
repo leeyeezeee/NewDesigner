@@ -82,15 +82,9 @@ class Graph(ABC):
         self.edge_log_probs:List[Dict[str, Any]] = []
         self.realized_edge_counts:List[int] = []
         self.node_kwargs = node_kwargs if node_kwargs is not None else [{} for _ in agent_names]
-        self.anchor_spatial_matrix = fixed_spatial_masks.view(len(agent_names), len(agent_names)).float()
-        self.refine_rank = min(max(1, int(refine_rank)), len(agent_names))
-        self.refinement_weight = torch.nn.Parameter(
-            torch.eye(self.refine_rank),
-            requires_grad=optimized_spatial,
-        )
-        self.refinement_anchor_loss = torch.tensor(0.0)
-        self.refinement_sparse_loss = torch.tensor(0.0)
-        self.spatial_edge_probabilities = None
+        # ``refine_rank`` is accepted only so existing launch commands remain
+        # compatible. Spatial probabilities now come directly from affinity
+        # logits; the former SVD refinement/anchor path has been removed.
         self.edge_embedding_dim = 16
         
         self.init_nodes() # add nodes to the self.nodes
@@ -116,13 +110,16 @@ class Graph(ABC):
                                                  requires_grad=optimized_temporal) # trainable edge logits
         self.temporal_masks = torch.nn.Parameter(fixed_temporal_masks,requires_grad=False)  # fixed edge masks
 
+    def spatial_parameters(self) -> List[torch.nn.Parameter]:
+        return (
+            [self.spatial_affinity_weight]
+            if self.spatial_affinity_weight.requires_grad
+            else []
+        )
+
     def refinement_parameters(self) -> List[torch.nn.Parameter]:
-        parameters = []
-        if self.refinement_weight.requires_grad:
-            parameters.append(self.refinement_weight)
-        if self.spatial_affinity_weight.requires_grad:
-            parameters.append(self.spatial_affinity_weight)
-        return parameters
+        """Deprecated compatibility alias for older experiment runners."""
+        return self.spatial_parameters()
     
     def construct_adj_matrix(self):
         role_connect:List[Tuple[str,str]] = self.prompt_set.get_role_connection()
@@ -165,50 +162,6 @@ class Graph(ABC):
         new_features = torch.cat((self.features,query_embedding),dim=1)
         return new_features
 
-    def _reset_refinement_losses(self, reference: Optional[torch.Tensor] = None) -> None:
-        if reference is None:
-            reference = self.refinement_weight
-        self.refinement_anchor_loss = reference.new_tensor(0.0)
-        self.refinement_sparse_loss = reference.new_tensor(0.0)
-
-    def _refine_spatial_logits(self, raw_spatial_logits: torch.Tensor) -> torch.Tensor:
-        if not self.optimized_spatial:
-            self.spatial_edge_probabilities = None
-            self._reset_refinement_losses(raw_spatial_logits)
-            return raw_spatial_logits.view(-1)
-
-        raw_spatial_logits = raw_spatial_logits.view(self.num_nodes, self.num_nodes)
-        mask = self.spatial_masks.view(self.num_nodes, self.num_nodes).to(
-            device=raw_spatial_logits.device,
-            dtype=raw_spatial_logits.dtype,
-        )
-        sketched_adj = torch.sigmoid(raw_spatial_logits) * mask
-        anchor_adj = self.anchor_spatial_matrix.to(
-            device=raw_spatial_logits.device,
-            dtype=raw_spatial_logits.dtype,
-        )
-        rank = min(self.refine_rank, self.num_nodes)
-        left_singular_vectors, _, _ = torch.linalg.svd(
-            sketched_adj,
-            full_matrices=False,
-        )
-        left_singular_vectors = left_singular_vectors[:, :rank]
-        refinement_weight = self.refinement_weight[:rank, :rank].to(
-            device=raw_spatial_logits.device,
-            dtype=raw_spatial_logits.dtype,
-        )
-        refined_adj = left_singular_vectors @ refinement_weight @ left_singular_vectors.t()
-
-        self.refinement_anchor_loss = (
-            0.5 * torch.linalg.matrix_norm(sketched_adj - refined_adj, ord="fro").pow(2)
-            + 0.5 * torch.linalg.matrix_norm(anchor_adj - refined_adj, ord="fro").pow(2)
-        )
-        self.refinement_sparse_loss = torch.linalg.svdvals(refinement_weight).sum()
-        refined_prob = refined_adj.clamp(1e-6, 1.0 - 1e-6)
-        refined_logits = torch.logit(refined_prob)
-        self.spatial_edge_probabilities = refined_prob.view(-1)
-        return refined_logits.view(-1)
-
     def prepare_spatial_logits(
             self,
             task: str,
@@ -223,8 +176,9 @@ class Graph(ABC):
                 dtype=edge_embeddings.dtype,
             )
             affinity_scores = edge_embeddings @ affinity_weight @ edge_embeddings.t()
-            raw_spatial_logits = min_max_norm(torch.flatten(affinity_scores))
-            self.spatial_logits = self._refine_spatial_logits(raw_spatial_logits)
+            self.spatial_logits = torch.flatten(affinity_scores) / np.sqrt(
+                self.edge_embedding_dim
+            )
 
         if track_grad:
             _compute_spatial_logits()
@@ -430,10 +384,7 @@ class Graph(ABC):
                     out_node.add_successor(in_node,'spatial')
                 continue
             if not self.check_cycle(in_node, {out_node}):
-                if self.spatial_edge_probabilities is not None:
-                    edge_prob = self.spatial_edge_probabilities[edge_idx]
-                else:
-                    edge_prob = torch.sigmoid(edge_logit / temperature)
+                edge_prob = torch.sigmoid(edge_logit / temperature)
                 edge_prob = edge_prob.clamp(1e-6, 1.0 - 1e-6)
                 if threshold:
                     edge_prob = torch.tensor(1 if edge_prob > threshold else 0)
@@ -729,12 +680,3 @@ class Graph(ABC):
             prune_idx = sorted_edges_idx[:int(prune_num_edges + num_masks)]
             self.temporal_masks[prune_idx] = 0
         return self.spatial_masks, self.temporal_masks
-
-def min_max_norm(tensor:torch.Tensor):
-    min_val = tensor.min()
-    max_val = tensor.max()
-    if torch.isclose(max_val, min_val):
-        return torch.zeros_like(tensor)
-    normalized_0_to_1 = (tensor - min_val) / (max_val - min_val)
-    normalized_minus1_to_1 = normalized_0_to_1 * 2 - 1
-    return normalized_minus1_to_1

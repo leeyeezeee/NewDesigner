@@ -70,10 +70,10 @@ def parse_args():
                         help="IG gain threshold for positive selector labels.")
     parser.add_argument('--refine_rank', type=int, default=4,
                         help="Rank used by the refined adjacency decoder.")
-    parser.add_argument('--anchor_reg_weight', type=float, default=1.0,
-                        help="Weight for G-Designer refined adjacency anchor regularization.")
-    parser.add_argument('--sparsity_reg_weight', type=float, default=1.0,
-                        help="Weight for G-Designer refined adjacency nuclear-norm sparsity regularization.")
+    parser.add_argument('--anchor_reg_weight', type=float, default=0.0,
+                        help="Reserved compatibility option; currently unused.")
+    parser.add_argument('--sparsity_reg_weight', type=float, default=0.0,
+                        help="Reserved compatibility option; currently unused.")
     add_teacher_forcing_reward_args(parser)
     parser.add_argument('--llm_name', type=str, default="gpt-4o",
                         help="Model name, None runs the default ChatGPT4")
@@ -140,6 +140,8 @@ async def main():
                     graph_softmax_temperature=args.graph_softmax_temperature,
                     edge_tanh_temperature=args.edge_tanh_temperature,
                     edge_ig_reward_lambda=args.edge_ig_reward_lambda,
+                    edge_ig_discount_factor=args.edge_ig_discount_factor,
+                    graph_edge_cost_alpha=args.graph_edge_cost_alpha,
                     graph_advantage_epsilon=args.graph_advantage_epsilon,
                     max_concurrent_graphs=args.max_concurrent_graphs)
         save_graph_checkpoint(

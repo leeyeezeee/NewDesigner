@@ -22,9 +22,9 @@ from GDesigner.utils.uncertainty import (
     edge_entropy_rewards,
 )
 from GDesigner.utils.ig_scorer import FinalAnswerScorer, make_target_spec
-from experiments.refinement_loss import refinement_regularization_loss
 from experiments.graph_concurrency import limited_graph_arun, make_graph_semaphore
 from experiments.teacher_forcing_reward import (
+    cost_adjusted_graph_reward,
     edge_information_gain_loss,
     graph_correctness_advantage_edge_loss,
 )
@@ -63,14 +63,16 @@ async def train(graph:Graph,
             nonpositive_edge_penalty: float = 0.01,
             selector_buffer_size: int = 512,
             selector_ig_tau: float = 0.0,
-            anchor_reg_weight: float = 1.0,
-            sparsity_reg_weight: float = 1.0,
+            anchor_reg_weight: float = 0.0,
+            sparsity_reg_weight: float = 0.0,
             use_graph_tf_reward: bool = False,
             use_graph_correctness_advantage: bool = False,
             graph_sample_count: int = 5,
             graph_softmax_temperature: float = 1.0,
             edge_tanh_temperature: float = 1.0,
             edge_ig_reward_lambda: float = None,
+            edge_ig_discount_factor: float = 0.0,
+            graph_edge_cost_alpha: float = 0.2,
             graph_advantage_epsilon: float = 1e-6,
             max_concurrent_graphs: int = 10,
           ):
@@ -113,7 +115,7 @@ async def train(graph:Graph,
         _reset_jsonl(_GRAPH_TF_RECORD_FILE)
     graph_semaphore = make_graph_semaphore(max_concurrent_graphs)
     
-    optimizer_params = list(graph.gcn.parameters()) + list(graph.mlp.parameters()) + graph.refinement_parameters()
+    optimizer_params = list(graph.gcn.parameters()) + list(graph.mlp.parameters()) + graph.spatial_parameters()
     if graph.optimized_temporal:
         optimizer_params.append(graph.temporal_logits)
     optimizer = torch.optim.Adam(optimizer_params, lr=lr)
@@ -139,7 +141,6 @@ async def train(graph:Graph,
                 realized_graph.gcn = graph.gcn
                 realized_graph.mlp = graph.mlp
                 realized_graph.spatial_affinity_weight = graph.spatial_affinity_weight
-                realized_graph.refinement_weight = graph.refinement_weight
                 realized_graph.temporal_logits = graph.temporal_logits
                 group_indices.append(len(realized_graphs))
                 realized_graphs.append(realized_graph)
@@ -241,6 +242,8 @@ async def train(graph:Graph,
                 reference_loss,
                 edge_tanh_temperature=edge_tanh_temperature,
                 edge_ig_reward_lambda=resolved_edge_ig_reward_lambda,
+                edge_ig_discount_factor=edge_ig_discount_factor,
+                graph_edge_cost_alpha=graph_edge_cost_alpha,
                 advantage_epsilon=graph_advantage_epsilon,
             )
             if graph_tf_corrects:
@@ -313,7 +316,12 @@ async def train(graph:Graph,
                     "edge_entropy_rewards": edge_rewards,
                 }
                 utilities.append(utility)
-                single_loss = -log_prob * correctness_reward
+                graph_reward, edge_ratio = cost_adjusted_graph_reward(
+                    realized_graph, correctness_reward, graph_edge_cost_alpha
+                )
+                utility["graph_reward"] = graph_reward
+                utility["spatial_edge_ratio"] = edge_ratio
+                single_loss = -log_prob * graph_reward
                 if resolved_edge_ig_reward_lambda != 0.0:
                     edge_ig_loss, edge_ig_summary = edge_information_gain_loss(
                         realized_graph,
@@ -321,6 +329,7 @@ async def train(graph:Graph,
                         log_prob,
                         edge_tanh_temperature=edge_tanh_temperature,
                         edge_ig_reward_lambda=resolved_edge_ig_reward_lambda,
+                        edge_ig_discount_factor=edge_ig_discount_factor,
                     )
                     single_loss = single_loss + edge_ig_loss
                     utility["edge_ig_loss_summary"] = edge_ig_summary
@@ -329,13 +338,7 @@ async def train(graph:Graph,
                 print(f"edge entropy rewards:{edge_rewards}")
 
             utility_loss = torch.mean(torch.stack(loss_list))
-        reg_loss, anchor_loss, sparse_loss = refinement_regularization_loss(
-            realized_graphs,
-            utility_loss,
-            anchor_reg_weight=anchor_reg_weight,
-            sparsity_reg_weight=sparsity_reg_weight,
-        )
-        total_loss = utility_loss + reg_loss
+        total_loss = utility_loss
         optimizer.zero_grad()
         total_loss.backward()
         optimizer.step()
@@ -357,8 +360,6 @@ async def train(graph:Graph,
         if not use_multi_graph_reward:
             print("utilities:", utilities) # [0.0, 0.0, 0.0, 1.0]
         print("utility loss:", utility_loss.item())
-        print("anchor loss:", anchor_loss.item())
-        print("sparse loss:", sparse_loss.item())
         print("loss:", total_loss.item()) # 4.6237263679504395
         print(f"Cost {Cost.instance().value}")
         print(f"PromptTokens {PromptTokens.instance().value}")

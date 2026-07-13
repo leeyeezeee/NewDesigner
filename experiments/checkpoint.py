@@ -41,11 +41,9 @@ def save_graph_checkpoint(
             "agent_names": list(graph.agent_names),
             "optimized_spatial": bool(graph.optimized_spatial),
             "optimized_temporal": bool(graph.optimized_temporal),
-            "refine_rank": int(graph.refine_rank),
             "gcn_state_dict": graph.gcn.state_dict(),
             "mlp_state_dict": graph.mlp.state_dict(),
             "spatial_affinity_weight": graph.spatial_affinity_weight.detach().cpu(),
-            "refinement_weight": graph.refinement_weight.detach().cpu(),
             "spatial_masks": graph.spatial_masks.detach().cpu(),
             "temporal_logits": graph.temporal_logits.detach().cpu(),
             "temporal_masks": graph.temporal_masks.detach().cpu(),
@@ -96,8 +94,6 @@ def load_graph_checkpoint(
             graph_state["spatial_affinity_weight"],
             "spatial_affinity_weight",
         )
-    if "refinement_weight" in graph_state:
-        _copy_parameter(graph.refinement_weight, graph_state["refinement_weight"], "refinement_weight")
     if "temporal_logits" in graph_state:
         _copy_parameter(graph.temporal_logits, graph_state["temporal_logits"], "temporal_logits")
     if "spatial_masks" in graph_state:
