@@ -89,7 +89,7 @@ class Graph(ABC):
         self.refine_rank = min(max(1, int(refine_rank)), len(agent_names))
         self.refinement_weight = torch.nn.Parameter(
             torch.eye(self.refine_rank),
-            requires_grad=optimized_spatial,
+            requires_grad=False,
         )
         self.spatial_edge_probabilities = None
         self.edge_embedding_dim = 16
@@ -122,8 +122,6 @@ class Graph(ABC):
 
     def refinement_parameters(self) -> List[torch.nn.Parameter]:
         parameters = []
-        if self.refinement_weight.requires_grad:
-            parameters.append(self.refinement_weight)
         if self.spatial_affinity_weight.requires_grad:
             parameters.append(self.spatial_affinity_weight)
         return parameters
@@ -170,32 +168,8 @@ class Graph(ABC):
         return new_features
 
     def _refine_spatial_logits(self, raw_spatial_logits: torch.Tensor) -> torch.Tensor:
-        if not self.optimized_spatial:
-            self.spatial_edge_probabilities = None
-            return raw_spatial_logits.view(-1)
-
-        raw_spatial_logits = raw_spatial_logits.view(self.num_nodes, self.num_nodes)
-        mask = self.spatial_masks.view(self.num_nodes, self.num_nodes).to(
-            device=raw_spatial_logits.device,
-            dtype=raw_spatial_logits.dtype,
-        )
-        sketched_adj = torch.sigmoid(raw_spatial_logits) * mask
-        rank = min(self.refine_rank, self.num_nodes)
-        left_singular_vectors, _, _ = torch.linalg.svd(
-            sketched_adj,
-            full_matrices=False,
-        )
-        left_singular_vectors = left_singular_vectors[:, :rank]
-        refinement_weight = self.refinement_weight[:rank, :rank].to(
-            device=raw_spatial_logits.device,
-            dtype=raw_spatial_logits.dtype,
-        )
-        refined_adj = left_singular_vectors @ refinement_weight @ left_singular_vectors.t()
-
-        refined_prob = refined_adj.clamp(1e-6, 1.0 - 1e-6)
-        refined_logits = torch.logit(refined_prob)
-        self.spatial_edge_probabilities = refined_prob.view(-1)
-        return refined_logits.view(-1)
+        self.spatial_edge_probabilities = None
+        return raw_spatial_logits.view(-1)
 
     def prepare_spatial_logits(
             self,
