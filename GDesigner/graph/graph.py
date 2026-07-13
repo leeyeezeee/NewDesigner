@@ -68,13 +68,6 @@ class Graph(ABC):
         fixed_temporal_masks = torch.tensor(fixed_temporal_masks).view(-1)
         assert len(fixed_spatial_masks)==len(agent_names)*len(agent_names),"The fixed_spatial_masks doesn't match the number of agents"
         assert len(fixed_temporal_masks)==len(agent_names)*len(agent_names),"The fixed_temporal_masks doesn't match the number of agents"
-        # A fixed node order makes every allowed spatial edge point forward.
-        # Any subset of this upper-triangular mask is therefore a DAG, so the
-        # spatial policy can sample its legal edges independently.
-        spatial_dag_mask = torch.triu(
-            torch.ones(len(agent_names), len(agent_names)), diagonal=1
-        ).view(-1)
-        fixed_spatial_masks = fixed_spatial_masks * spatial_dag_mask
         
         self.id:str = shortuuid.ShortUUID().random(length=4)
         self.domain:str = domain
@@ -111,7 +104,6 @@ class Graph(ABC):
         # self.spatial_logits = torch.nn.Parameter(torch.ones(len(self.potential_spatial_edges), requires_grad=optimized_spatial) * init_spatial_logit,
         #                                          requires_grad=optimized_spatial) # trainable edge logits
         self.spatial_masks = torch.nn.Parameter(fixed_spatial_masks,requires_grad=False)  # fixed edge masks
-        self.spatial_dag_mask = torch.nn.Parameter(spatial_dag_mask, requires_grad=False)
 
         init_temporal_logit = torch.log(torch.tensor(initial_temporal_probability / (1 - initial_temporal_probability))) if optimized_temporal else 10.0
         self.temporal_logits = torch.nn.Parameter(torch.ones(len(self.potential_temporal_edges), requires_grad=optimized_temporal) * init_temporal_logit,
@@ -388,30 +380,33 @@ class Graph(ABC):
             if edge_mask == 0.0:
                 continue
             elif edge_mask == 1.0 and self.optimized_spatial==False:
-                out_node.add_successor(in_node,'spatial')
+                if not self.check_cycle(in_node, {out_node}):
+                    out_node.add_successor(in_node,'spatial')
                 continue
-            edge_prob = torch.sigmoid(edge_logit / temperature)
-            edge_prob = edge_prob.clamp(1e-6, 1.0 - 1e-6)
-            if threshold is None:
-                edge_selected = bool(torch.rand((), device=edge_prob.device) < edge_prob)
-            else:
-                edge_selected = bool(edge_prob >= float(threshold))
-            if edge_selected:
-                out_node.add_successor(in_node,'spatial')
-                edge_info = {
-                    "type": "spatial",
-                    "round": round,
-                    "source": out_node.id,
-                    "target": in_node.id,
-                    "edge_key": f"spatial:{round}:{out_node.id}->{in_node.id}",
-                }
-                if track_grad:
-                    edge_log_prob = torch.log(edge_prob)
-                    log_probs.append(edge_log_prob)
-                    edge_info["log_prob"] = edge_log_prob
-                self.edge_log_probs.append(edge_info)
-            elif track_grad:
-                log_probs.append(torch.log(1 - edge_prob))
+            if not self.check_cycle(in_node, {out_node}):
+                edge_prob = torch.sigmoid(edge_logit / temperature)
+                edge_prob = edge_prob.clamp(1e-6, 1.0 - 1e-6)
+                if threshold is None:
+                    edge_selected = bool(torch.rand((), device=edge_prob.device) < edge_prob)
+                else:
+                    edge_selected = bool(edge_prob >= float(threshold))
+                if edge_selected:
+                    out_node.add_successor(in_node,'spatial')
+                    edge_info = {
+                        "type": "spatial",
+                        "round": round,
+                        "source": out_node.id,
+                        "target": in_node.id,
+                        "edge_key": f"spatial:{round}:{out_node.id}->{in_node.id}",
+                    }
+                    if track_grad:
+                        edge_log_prob = torch.log(edge_prob)
+                        log_probs.append(edge_log_prob)
+                        edge_info["log_prob"] = edge_log_prob
+                    self.edge_log_probs.append(edge_info)
+                else:
+                    if track_grad:
+                        log_probs.append(torch.log(1 - edge_prob))
                     
         return torch.sum(torch.stack(log_probs))
     

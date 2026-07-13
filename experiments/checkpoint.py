@@ -97,8 +97,7 @@ def load_graph_checkpoint(
     if "temporal_logits" in graph_state:
         _copy_parameter(graph.temporal_logits, graph_state["temporal_logits"], "temporal_logits")
     if "spatial_masks" in graph_state:
-        spatial_masks = graph_state["spatial_masks"] * graph.spatial_dag_mask.cpu()
-        _copy_parameter(graph.spatial_masks, spatial_masks, "spatial_masks")
+        _copy_parameter(graph.spatial_masks, graph_state["spatial_masks"], "spatial_masks")
     if "temporal_masks" in graph_state:
         _copy_parameter(graph.temporal_masks, graph_state["temporal_masks"], "temporal_masks")
 
