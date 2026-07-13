@@ -386,9 +386,11 @@ class Graph(ABC):
             if not self.check_cycle(in_node, {out_node}):
                 edge_prob = torch.sigmoid(edge_logit / temperature)
                 edge_prob = edge_prob.clamp(1e-6, 1.0 - 1e-6)
-                if threshold:
-                    edge_prob = torch.tensor(1 if edge_prob > threshold else 0)
-                if torch.rand(1) < edge_prob:
+                if threshold is None:
+                    edge_selected = bool(torch.rand((), device=edge_prob.device) < edge_prob)
+                else:
+                    edge_selected = bool(edge_prob >= float(threshold))
+                if edge_selected:
                     out_node.add_successor(in_node,'spatial')
                     edge_info = {
                         "type": "spatial",
@@ -471,7 +473,11 @@ class Graph(ABC):
         task = inputs.get("task", str(inputs)) if isinstance(inputs, dict) else str(inputs)
         self.prepare_spatial_logits(task, track_grad=track_grad)
         for round in range(num_rounds):
-            log_probs += self.construct_spatial_connection(round, track_grad=track_grad)
+            log_probs += self.construct_spatial_connection(
+                round,
+                threshold=None if track_grad else 0.5,
+                track_grad=track_grad,
+            )
             log_probs += self.construct_temporal_connection(round, track_grad=track_grad)
             self.apply_edge_selector(task, edge_selector, round)
             self.realized_edge_counts.append(self.communication_edge_count)
@@ -551,7 +557,11 @@ class Graph(ABC):
         self.prepare_spatial_logits(input['task'], track_grad=track_grad)
 
         for round in range(num_rounds):
-            log_probs += self.construct_spatial_connection(round, track_grad=track_grad)
+            log_probs += self.construct_spatial_connection(
+                round,
+                threshold=None if track_grad else 0.5,
+                track_grad=track_grad,
+            )
             log_probs += self.construct_temporal_connection(round, track_grad=track_grad)
             self.apply_edge_selector(input.get("task", str(input)), edge_selector, round)
             self.realized_edge_counts.append(self.communication_edge_count)
