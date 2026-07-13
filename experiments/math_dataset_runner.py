@@ -24,7 +24,6 @@ from GDesigner.utils.ig_scorer import FinalAnswerScorer, make_target_spec
 from experiments.checkpoint import save_graph_checkpoint
 from experiments.graph_concurrency import limited_graph_arun, make_graph_semaphore
 from experiments.teacher_forcing_reward import (
-    cost_adjusted_graph_reward,
     edge_information_gain_loss,
     graph_correctness_advantage_edge_loss,
 )
@@ -78,9 +77,8 @@ async def run_math_dataset(
         refine_rank=getattr(args, "refine_rank", 4),
         **kwargs,
     )
-    graph.gcn.train()
-    graph.mlp.train()
-    optimizer_params = list(graph.gcn.parameters()) + list(graph.mlp.parameters()) + graph.spatial_parameters()
+    graph.gat.train()
+    optimizer_params = list(graph.gat.parameters()) + graph.refinement_parameters()
     if graph.optimized_temporal:
         optimizer_params.append(graph.temporal_logits)
     optimizer = torch.optim.Adam(optimizer_params, lr=args.lr)
@@ -158,9 +156,9 @@ async def run_math_dataset(
             )
             for _ in range(sample_count):
                 realized_graph = copy.deepcopy(graph)
-                realized_graph.gcn = graph.gcn
-                realized_graph.mlp = graph.mlp
+                realized_graph.gat = graph.gat
                 realized_graph.spatial_affinity_weight = graph.spatial_affinity_weight
+                realized_graph.refinement_weight = graph.refinement_weight
                 realized_graph.temporal_logits = graph.temporal_logits
                 group_indices.append(len(realized_graphs))
                 realized_graphs.append(realized_graph)
@@ -188,6 +186,7 @@ async def run_math_dataset(
 
         if use_multi_graph_reward and train_updates_enabled:
             graph_groups = []
+            graph_log_prob_groups = []
             correctness_groups = []
             edge_detail_groups = []
             graph_tf_corrects: List[float] = []
@@ -200,6 +199,7 @@ async def run_math_dataset(
             ):
                 target_spec = make_target_spec(dataset_name, true_answer)
                 graph_group = []
+                graph_log_prob_group = []
                 correctness_group = []
                 edge_detail_group = []
                 for sample_pos, graph_idx in enumerate(group_indices):
@@ -245,23 +245,27 @@ async def run_math_dataset(
                             "correctness": correctness_reward,
                         })
                     graph_group.append(realized_graph)
+                    graph_log_prob_group.append(log_probs[graph_idx])
                     correctness_group.append(correctness_reward)
                     edge_detail_group.append(edge_details)
                     realized_graph.clear_execution_history()
                 graph_groups.append(graph_group)
+                graph_log_prob_groups.append(graph_log_prob_group)
                 correctness_groups.append(correctness_group)
                 edge_detail_groups.append(edge_detail_group)
             reference_loss = torch.mean(torch.stack(list(log_probs)))
             utility_loss, tf_summaries = graph_correctness_advantage_edge_loss(
                 graph_groups,
+                graph_log_prob_groups,
                 correctness_groups,
                 edge_detail_groups,
                 reference_loss,
                 edge_tanh_temperature=getattr(args, "edge_tanh_temperature", 1.0),
                 edge_ig_reward_lambda=edge_ig_reward_lambda,
                 edge_ig_discount_factor=getattr(args, "edge_ig_discount_factor", 0.0),
-                graph_edge_cost_alpha=getattr(args, "graph_edge_cost_alpha", 0.2),
                 advantage_epsilon=getattr(args, "graph_advantage_epsilon", 1e-6),
+                graph_ib_beta=getattr(args, "graph_ib_beta", 0.2),
+                graph_ib_prior_prob=getattr(args, "graph_ib_prior_prob", 0.45),
             )
             if graph_tf_corrects:
                 avg_correct = sum(graph_tf_corrects) / len(graph_tf_corrects)
@@ -336,14 +340,7 @@ async def run_math_dataset(
                     "edge_entropy_rewards": edge_rewards,
                 }
                 utilities.append(utility)
-                graph_reward, edge_ratio = cost_adjusted_graph_reward(
-                    realized_graph,
-                    correctness_reward,
-                    getattr(args, "graph_edge_cost_alpha", 0.2),
-                )
-                utility["graph_reward"] = graph_reward
-                utility["spatial_edge_ratio"] = edge_ratio
-                single_loss = -log_prob * graph_reward
+                single_loss = -log_prob * float(correctness_reward)
                 if edge_ig_reward_lambda != 0.0:
                     edge_ig_loss, edge_ig_summary = edge_information_gain_loss(
                         realized_graph,
@@ -398,8 +395,7 @@ async def run_math_dataset(
             total_edges = 0
             edge_samples = 0
             accuracy = 0.0
-            graph.gcn.eval()
-            graph.mlp.eval()
+            graph.gat.eval()
             reset_usage_counters()
             print("Start Eval")
 

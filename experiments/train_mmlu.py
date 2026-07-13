@@ -24,7 +24,6 @@ from GDesigner.utils.uncertainty import (
 from GDesigner.utils.ig_scorer import FinalAnswerScorer, make_target_spec
 from experiments.graph_concurrency import limited_graph_arun, make_graph_semaphore
 from experiments.teacher_forcing_reward import (
-    cost_adjusted_graph_reward,
     edge_information_gain_loss,
     graph_correctness_advantage_edge_loss,
 )
@@ -63,8 +62,6 @@ async def train(graph:Graph,
             nonpositive_edge_penalty: float = 0.01,
             selector_buffer_size: int = 512,
             selector_ig_tau: float = 0.0,
-            anchor_reg_weight: float = 0.0,
-            sparsity_reg_weight: float = 0.0,
             use_graph_tf_reward: bool = False,
             use_graph_correctness_advantage: bool = False,
             graph_sample_count: int = 5,
@@ -72,8 +69,9 @@ async def train(graph:Graph,
             edge_tanh_temperature: float = 1.0,
             edge_ig_reward_lambda: float = None,
             edge_ig_discount_factor: float = 0.0,
-            graph_edge_cost_alpha: float = 0.2,
             graph_advantage_epsilon: float = 1e-6,
+            graph_ib_beta: float = 0.2,
+            graph_ib_prior_prob: float = 0.45,
             max_concurrent_graphs: int = 10,
           ):
     
@@ -115,12 +113,11 @@ async def train(graph:Graph,
         _reset_jsonl(_GRAPH_TF_RECORD_FILE)
     graph_semaphore = make_graph_semaphore(max_concurrent_graphs)
     
-    optimizer_params = list(graph.gcn.parameters()) + list(graph.mlp.parameters()) + graph.spatial_parameters()
+    optimizer_params = list(graph.gat.parameters()) + graph.refinement_parameters()
     if graph.optimized_temporal:
         optimizer_params.append(graph.temporal_logits)
     optimizer = torch.optim.Adam(optimizer_params, lr=lr)
-    graph.gcn.train()
-    graph.mlp.train()
+    graph.gat.train()
     for i_iter in range(num_iters):
         print(f"Iter {i_iter}", 80*'-')
         start_ts = time.time()
@@ -138,9 +135,9 @@ async def train(graph:Graph,
             sample_count = max(1, int(graph_sample_count)) if use_multi_graph_reward else 1
             for _ in range(sample_count):
                 realized_graph = copy.deepcopy(graph)
-                realized_graph.gcn = graph.gcn
-                realized_graph.mlp = graph.mlp
+                realized_graph.gat = graph.gat
                 realized_graph.spatial_affinity_weight = graph.spatial_affinity_weight
+                realized_graph.refinement_weight = graph.refinement_weight
                 realized_graph.temporal_logits = graph.temporal_logits
                 group_indices.append(len(realized_graphs))
                 realized_graphs.append(realized_graph)
@@ -170,6 +167,7 @@ async def train(graph:Graph,
         
         if use_multi_graph_reward:
             graph_groups = []
+            graph_log_prob_groups = []
             correctness_groups = []
             edge_detail_groups = []
             for record_idx, (correct_answer, group_indices, input_dict) in enumerate(zip(
@@ -181,6 +179,7 @@ async def train(graph:Graph,
                         f"String expected but got {correct_answer} of type {type(correct_answer)} (1)"
                 target_spec = make_target_spec("mmlu", correct_answer)
                 graph_group = []
+                graph_log_prob_group = []
                 correctness_group = []
                 edge_detail_group = []
                 for sample_pos, graph_idx in enumerate(group_indices):
@@ -228,23 +227,27 @@ async def train(graph:Graph,
                             "correctness": correctness_reward,
                         })
                     graph_group.append(realized_graph)
+                    graph_log_prob_group.append(log_probs[graph_idx])
                     correctness_group.append(float(record_accuracy.get()))
                     edge_detail_group.append(edge_details)
                     realized_graph.clear_execution_history()
                 graph_groups.append(graph_group)
+                graph_log_prob_groups.append(graph_log_prob_group)
                 correctness_groups.append(correctness_group)
                 edge_detail_groups.append(edge_detail_group)
             reference_loss = torch.mean(torch.stack(list(log_probs)))
             utility_loss, tf_summaries = graph_correctness_advantage_edge_loss(
                 graph_groups,
+                graph_log_prob_groups,
                 correctness_groups,
                 edge_detail_groups,
                 reference_loss,
                 edge_tanh_temperature=edge_tanh_temperature,
                 edge_ig_reward_lambda=resolved_edge_ig_reward_lambda,
                 edge_ig_discount_factor=edge_ig_discount_factor,
-                graph_edge_cost_alpha=graph_edge_cost_alpha,
                 advantage_epsilon=graph_advantage_epsilon,
+                graph_ib_beta=graph_ib_beta,
+                graph_ib_prior_prob=graph_ib_prior_prob,
             )
             if graph_tf_corrects:
                 avg_adv_variance = (
@@ -316,12 +319,7 @@ async def train(graph:Graph,
                     "edge_entropy_rewards": edge_rewards,
                 }
                 utilities.append(utility)
-                graph_reward, edge_ratio = cost_adjusted_graph_reward(
-                    realized_graph, correctness_reward, graph_edge_cost_alpha
-                )
-                utility["graph_reward"] = graph_reward
-                utility["spatial_edge_ratio"] = edge_ratio
-                single_loss = -log_prob * graph_reward
+                single_loss = -log_prob * float(correctness_reward)
                 if resolved_edge_ig_reward_lambda != 0.0:
                     edge_ig_loss, edge_ig_summary = edge_information_gain_loss(
                         realized_graph,

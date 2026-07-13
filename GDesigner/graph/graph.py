@@ -12,7 +12,7 @@ from GDesigner.graph.node import Node
 from GDesigner.agents.agent_registry import AgentRegistry
 from GDesigner.prompt.prompt_set_registry import PromptSetRegistry
 from GDesigner.llm.profile_embedding import get_sentence_embedding
-from GDesigner.gnn.gcn import GCN,MLP
+from GDesigner.gnn.gat import GAT
 from torch_geometric.utils import dense_to_sparse
 
 _DECISION_NODE_MAX_TRIES = 5
@@ -80,11 +80,18 @@ class Graph(ABC):
         self.potential_spatial_edges:List[List[str, str]] = []
         self.potential_temporal_edges:List[List[str,str]] = []
         self.edge_log_probs:List[Dict[str, Any]] = []
+        # Every sampled Bernoulli decision, including rejected edges.  IG uses
+        # edge_log_probs (selected edges only), while graph-level information
+        # bottleneck regularization needs both outcomes.
+        self.edge_decisions:List[Dict[str, Any]] = []
         self.realized_edge_counts:List[int] = []
         self.node_kwargs = node_kwargs if node_kwargs is not None else [{} for _ in agent_names]
-        # ``refine_rank`` is accepted only so existing launch commands remain
-        # compatible. Spatial probabilities now come directly from affinity
-        # logits; the former SVD refinement/anchor path has been removed.
+        self.refine_rank = min(max(1, int(refine_rank)), len(agent_names))
+        self.refinement_weight = torch.nn.Parameter(
+            torch.eye(self.refine_rank),
+            requires_grad=optimized_spatial,
+        )
+        self.spatial_edge_probabilities = None
         self.edge_embedding_dim = 16
         
         self.init_nodes() # add nodes to the self.nodes
@@ -93,8 +100,11 @@ class Graph(ABC):
         self.prompt_set = PromptSetRegistry.get(domain)
         self.role_adj_matrix = self.construct_adj_matrix()
         self.features = self.construct_features()
-        self.gcn = GCN(self.features.size(1)*2,16,self.features.size(1))
-        self.mlp = MLP(self.features.size(1),16,self.edge_embedding_dim)
+        self.gat = GAT(
+            self.features.size(1) * 2,
+            16,
+            self.edge_embedding_dim,
+        )
         self.spatial_affinity_weight = torch.nn.Parameter(
             torch.eye(self.edge_embedding_dim),
             requires_grad=optimized_spatial,
@@ -110,16 +120,13 @@ class Graph(ABC):
                                                  requires_grad=optimized_temporal) # trainable edge logits
         self.temporal_masks = torch.nn.Parameter(fixed_temporal_masks,requires_grad=False)  # fixed edge masks
 
-    def spatial_parameters(self) -> List[torch.nn.Parameter]:
-        return (
-            [self.spatial_affinity_weight]
-            if self.spatial_affinity_weight.requires_grad
-            else []
-        )
-
     def refinement_parameters(self) -> List[torch.nn.Parameter]:
-        """Deprecated compatibility alias for older experiment runners."""
-        return self.spatial_parameters()
+        parameters = []
+        if self.refinement_weight.requires_grad:
+            parameters.append(self.refinement_weight)
+        if self.spatial_affinity_weight.requires_grad:
+            parameters.append(self.spatial_affinity_weight)
+        return parameters
     
     def construct_adj_matrix(self):
         role_connect:List[Tuple[str,str]] = self.prompt_set.get_role_connection()
@@ -162,6 +169,34 @@ class Graph(ABC):
         new_features = torch.cat((self.features,query_embedding),dim=1)
         return new_features
 
+    def _refine_spatial_logits(self, raw_spatial_logits: torch.Tensor) -> torch.Tensor:
+        if not self.optimized_spatial:
+            self.spatial_edge_probabilities = None
+            return raw_spatial_logits.view(-1)
+
+        raw_spatial_logits = raw_spatial_logits.view(self.num_nodes, self.num_nodes)
+        mask = self.spatial_masks.view(self.num_nodes, self.num_nodes).to(
+            device=raw_spatial_logits.device,
+            dtype=raw_spatial_logits.dtype,
+        )
+        sketched_adj = torch.sigmoid(raw_spatial_logits) * mask
+        rank = min(self.refine_rank, self.num_nodes)
+        left_singular_vectors, _, _ = torch.linalg.svd(
+            sketched_adj,
+            full_matrices=False,
+        )
+        left_singular_vectors = left_singular_vectors[:, :rank]
+        refinement_weight = self.refinement_weight[:rank, :rank].to(
+            device=raw_spatial_logits.device,
+            dtype=raw_spatial_logits.dtype,
+        )
+        refined_adj = left_singular_vectors @ refinement_weight @ left_singular_vectors.t()
+
+        refined_prob = refined_adj.clamp(1e-6, 1.0 - 1e-6)
+        refined_logits = torch.logit(refined_prob)
+        self.spatial_edge_probabilities = refined_prob.view(-1)
+        return refined_logits.view(-1)
+
     def prepare_spatial_logits(
             self,
             task: str,
@@ -169,16 +204,14 @@ class Graph(ABC):
             ) -> None:
         def _compute_spatial_logits() -> None:
             new_features = self.construct_new_features(task)
-            logits = self.gcn(new_features,self.role_adj_matrix)
-            edge_embeddings = self.mlp(logits)
+            edge_embeddings = self.gat(new_features, self.role_adj_matrix)
             affinity_weight = self.spatial_affinity_weight.to(
                 device=edge_embeddings.device,
                 dtype=edge_embeddings.dtype,
             )
             affinity_scores = edge_embeddings @ affinity_weight @ edge_embeddings.t()
-            self.spatial_logits = torch.flatten(affinity_scores) / np.sqrt(
-                self.edge_embedding_dim
-            )
+            raw_spatial_logits = min_max_norm(torch.flatten(affinity_scores))
+            self.spatial_logits = self._refine_spatial_logits(raw_spatial_logits)
 
         if track_grad:
             _compute_spatial_logits()
@@ -384,12 +417,25 @@ class Graph(ABC):
                     out_node.add_successor(in_node,'spatial')
                 continue
             if not self.check_cycle(in_node, {out_node}):
-                edge_prob = torch.sigmoid(edge_logit / temperature)
+                if self.spatial_edge_probabilities is not None:
+                    edge_prob = self.spatial_edge_probabilities[edge_idx]
+                else:
+                    edge_prob = torch.sigmoid(edge_logit / temperature)
                 edge_prob = edge_prob.clamp(1e-6, 1.0 - 1e-6)
                 if threshold is None:
                     edge_selected = bool(torch.rand((), device=edge_prob.device) < edge_prob)
                 else:
                     edge_selected = bool(edge_prob >= float(threshold))
+                if track_grad:
+                    self.edge_decisions.append({
+                        "type": "spatial",
+                        "round": round,
+                        "source": out_node.id,
+                        "target": in_node.id,
+                        "edge_key": f"spatial:{round}:{out_node.id}->{in_node.id}",
+                        "selected": edge_selected,
+                        "probability": edge_prob,
+                    })
                 if edge_selected:
                     out_node.add_successor(in_node,'spatial')
                     edge_info = {
@@ -431,10 +477,21 @@ class Graph(ABC):
                     out_node.add_successor(in_node,'temporal')
                 continue
             
-            edge_prob = torch.sigmoid(edge_logit / temperature)
+            edge_prob = torch.sigmoid(edge_logit / temperature).clamp(1e-6, 1.0 - 1e-6)
             if threshold:
                 edge_prob = torch.tensor(1 if edge_prob > threshold else 0)
-            if torch.rand(1) < edge_prob:
+            edge_selected = bool(torch.rand((), device=edge_prob.device) < edge_prob)
+            if track_grad:
+                self.edge_decisions.append({
+                    "type": "temporal",
+                    "round": round,
+                    "source": out_node.id,
+                    "target": in_node.id,
+                    "edge_key": f"temporal:{round}:{out_node.id}->{in_node.id}",
+                    "selected": edge_selected,
+                    "probability": edge_prob,
+                })
+            if edge_selected:
                 out_node.add_successor(in_node,'temporal')
                 edge_info = {
                     "type": "temporal",
@@ -469,6 +526,7 @@ class Graph(ABC):
         # inputs:{'task':"xxx"}
         log_probs = 0
         self.edge_log_probs = []
+        self.edge_decisions = []
         self.realized_edge_counts = []
         task = inputs.get("task", str(inputs)) if isinstance(inputs, dict) else str(inputs)
         self.prepare_spatial_logits(task, track_grad=track_grad)
@@ -553,6 +611,7 @@ class Graph(ABC):
         # inputs:{'task':"xxx"}
         log_probs = 0
         self.edge_log_probs = []
+        self.edge_decisions = []
         self.realized_edge_counts = []
         self.prepare_spatial_logits(input['task'], track_grad=track_grad)
 
@@ -690,3 +749,13 @@ class Graph(ABC):
             prune_idx = sorted_edges_idx[:int(prune_num_edges + num_masks)]
             self.temporal_masks[prune_idx] = 0
         return self.spatial_masks, self.temporal_masks
+
+
+def min_max_norm(tensor:torch.Tensor):
+    min_val = tensor.min()
+    max_val = tensor.max()
+    if torch.isclose(max_val, min_val):
+        return torch.zeros_like(tensor)
+    normalized_0_to_1 = (tensor - min_val) / (max_val - min_val)
+    normalized_minus1_to_1 = normalized_0_to_1 * 2 - 1
+    return normalized_minus1_to_1

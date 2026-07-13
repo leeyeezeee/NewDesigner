@@ -70,10 +70,6 @@ def parse_args():
                         help="IG gain threshold for positive selector labels.")
     parser.add_argument('--refine_rank', type=int, default=4,
                         help="Rank used by the refined adjacency decoder.")
-    parser.add_argument('--anchor_reg_weight', type=float, default=0.0,
-                        help="Reserved compatibility option; currently unused.")
-    parser.add_argument('--sparsity_reg_weight', type=float, default=0.0,
-                        help="Reserved compatibility option; currently unused.")
     add_teacher_forcing_reward_args(parser)
     parser.add_argument('--llm_name', type=str, default="gpt-4o",
                         help="Model name, None runs the default ChatGPT4")
@@ -132,8 +128,6 @@ async def main():
                     nonpositive_edge_penalty=args.nonpositive_edge_penalty,
                     selector_buffer_size=args.selector_buffer_size,
                     selector_ig_tau=args.selector_ig_tau,
-                    anchor_reg_weight=args.anchor_reg_weight,
-                    sparsity_reg_weight=args.sparsity_reg_weight,
                     use_graph_tf_reward=args.use_graph_tf_reward,
                     use_graph_correctness_advantage=args.use_graph_correctness_advantage,
                     graph_sample_count=args.graph_sample_count,
@@ -141,8 +135,9 @@ async def main():
                     edge_tanh_temperature=args.edge_tanh_temperature,
                     edge_ig_reward_lambda=args.edge_ig_reward_lambda,
                     edge_ig_discount_factor=args.edge_ig_discount_factor,
-                    graph_edge_cost_alpha=args.graph_edge_cost_alpha,
                     graph_advantage_epsilon=args.graph_advantage_epsilon,
+                    graph_ib_beta=args.graph_ib_beta,
+                    graph_ib_prior_prob=args.graph_ib_prior_prob,
                     max_concurrent_graphs=args.max_concurrent_graphs)
         save_graph_checkpoint(
             graph,
