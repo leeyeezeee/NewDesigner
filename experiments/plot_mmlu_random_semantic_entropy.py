@@ -729,7 +729,8 @@ def build_graph(bundle: DatasetBundle, args, agent_names: List[str]) -> Graph:
         optimized_temporal=False,
         **kwargs,
     )
-    graph.gat.eval()
+    graph.gcn.eval()
+    graph.mlp.eval()
     return graph
 
 

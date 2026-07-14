@@ -12,12 +12,8 @@ from GDesigner.graph.node import Node
 from GDesigner.agents.agent_registry import AgentRegistry
 from GDesigner.prompt.prompt_set_registry import PromptSetRegistry
 from GDesigner.llm.profile_embedding import get_sentence_embedding
-from GDesigner.gnn.gat import GAT
+from GDesigner.gnn.gcn import GCN, MLP
 from torch_geometric.utils import dense_to_sparse
-
-_DECISION_NODE_MAX_TRIES = 5
-_DECISION_NODE_TIMEOUT_SECONDS = 1200
-
 
 def _format_exception(exc: Exception) -> str:
     return "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
@@ -57,25 +53,45 @@ class Graph(ABC):
                 initial_temporal_probability: float = 0.5,
                 fixed_temporal_masks:List[List[int]] = None,
                 node_kwargs:List[Dict] = None,
-                refine_rank:int = 4,
-                ):
-        
-        if fixed_spatial_masks is None:
-            fixed_spatial_masks = [[1 if i!=j else 0 for j in range(len(agent_names))] for i in range(len(agent_names))]
-        if fixed_temporal_masks is None:
-            fixed_temporal_masks = [[1 for j in range(len(agent_names))] for i in range(len(agent_names))]
-        fixed_spatial_masks = torch.tensor(fixed_spatial_masks).view(-1)
-        fixed_temporal_masks = torch.tensor(fixed_temporal_masks).view(-1)
-        assert len(fixed_spatial_masks)==len(agent_names)*len(agent_names),"The fixed_spatial_masks doesn't match the number of agents"
-        assert len(fixed_temporal_masks)==len(agent_names)*len(agent_names),"The fixed_temporal_masks doesn't match the number of agents"
-        
+                 refine_rank:int = 4,
+                 ):
         self.id:str = shortuuid.ShortUUID().random(length=4)
         self.domain:str = domain
         self.llm_name:str = llm_name
-        self.agent_names:List[str] = agent_names
+        self.agent_names:List[str] = list(agent_names)
         self.optimized_spatial = optimized_spatial
         self.optimized_temporal = optimized_temporal
+        self.prompt_set = PromptSetRegistry.get(domain)
         self.decision_node:Node = AgentRegistry.get(decision_method, **{"domain":self.domain,"llm_name":self.llm_name})
+        decision_role_getter = getattr(self.prompt_set, "get_decision_role", None)
+        if not callable(decision_role_getter):
+            raise ValueError(
+                f"Prompt set {domain!r} must define get_decision_role(); the "
+                "decision node is always part of the optimized policy graph."
+            )
+        decision_role = str(decision_role_getter() or "").strip()
+        if not decision_role:
+            raise ValueError(
+                f"Prompt set {domain!r} returned an empty decision role; the "
+                "decision node cannot fall back to an external aggregator."
+            )
+        self.decision_node.role = decision_role
+
+        regular_node_count = len(self.agent_names)
+        total_node_count = regular_node_count + 1
+        fixed_spatial_masks = self._prepare_fixed_mask(
+            fixed_spatial_masks,
+            regular_node_count,
+            total_node_count,
+            spatial=True,
+        )
+        fixed_temporal_masks = self._prepare_fixed_mask(
+            fixed_temporal_masks,
+            regular_node_count,
+            total_node_count,
+            spatial=False,
+        )
+
         self.nodes:Dict[str,Node] = {}
         self.potential_spatial_edges:List[List[str, str]] = []
         self.potential_temporal_edges:List[List[str,str]] = []
@@ -85,32 +101,37 @@ class Graph(ABC):
         # bottleneck regularization needs both outcomes.
         self.edge_decisions:List[Dict[str, Any]] = []
         self.realized_edge_counts:List[int] = []
+        self.realized_spatial_edge_counts:List[int] = []
         self.node_kwargs = node_kwargs if node_kwargs is not None else [{} for _ in agent_names]
-        self.refine_rank = min(max(1, int(refine_rank)), len(agent_names))
-        self.refinement_weight = torch.nn.Parameter(
-            torch.eye(self.refine_rank),
-            requires_grad=False,
-        )
-        self.spatial_edge_probabilities = None
+        # ``refine_rank`` is accepted only so existing launch commands remain
+        # compatible. The pre-GAT GCN/MLP policy does not use SVD refinement.
         self.edge_embedding_dim = 16
         
         self.init_nodes() # add nodes to the self.nodes
         self.node_id_to_index = {node_id: idx for idx, node_id in enumerate(self.nodes)}
         self.init_potential_edges() # add potential edges to the self.potential_spatial/temporal_edges
-        self.prompt_set = PromptSetRegistry.get(domain)
         self.role_adj_matrix = self.construct_adj_matrix()
         self.features = self.construct_features()
-        self.gat = GAT(
+        self.gcn = GCN(self.features.size(1) * 2, 16, self.features.size(1))
+        self.mlp = MLP(self.features.size(1), 16, self.edge_embedding_dim)
+        # Preserve role/task-specific node information that can be smoothed by
+        # message passing on a dense role graph.  This projection deliberately
+        # has no bias, and the normalization has no affine shift, so neither
+        # reintroduces a shared edge-logit bias.
+        self.spatial_skip_projection = torch.nn.Linear(
             self.features.size(1) * 2,
-            16,
             self.edge_embedding_dim,
+            bias=False,
+        )
+        self.spatial_embedding_norm = torch.nn.LayerNorm(
+            self.edge_embedding_dim,
+            elementwise_affine=False,
         )
         self.spatial_affinity_weight = torch.nn.Parameter(
             torch.eye(self.edge_embedding_dim),
             requires_grad=optimized_spatial,
         )
 
-        init_spatial_logit = torch.log(torch.tensor(initial_spatial_probability / (1 - initial_spatial_probability))) if optimized_spatial else 10.0
         # self.spatial_logits = torch.nn.Parameter(torch.ones(len(self.potential_spatial_edges), requires_grad=optimized_spatial) * init_spatial_logit,
         #                                          requires_grad=optimized_spatial) # trainable edge logits
         self.spatial_masks = torch.nn.Parameter(fixed_spatial_masks,requires_grad=False)  # fixed edge masks
@@ -120,11 +141,67 @@ class Graph(ABC):
                                                  requires_grad=optimized_temporal) # trainable edge logits
         self.temporal_masks = torch.nn.Parameter(fixed_temporal_masks,requires_grad=False)  # fixed edge masks
 
-    def refinement_parameters(self) -> List[torch.nn.Parameter]:
-        parameters = []
+    def spatial_parameters(self) -> List[torch.nn.Parameter]:
+        parameters = list(self.spatial_skip_projection.parameters())
         if self.spatial_affinity_weight.requires_grad:
             parameters.append(self.spatial_affinity_weight)
         return parameters
+
+    def refinement_parameters(self) -> List[torch.nn.Parameter]:
+        """Deprecated compatibility alias for older experiment runners."""
+        return self.spatial_parameters()
+
+    @staticmethod
+    def _prepare_fixed_mask(
+            mask,
+            regular_node_count: int,
+            total_node_count: int,
+            *,
+            spatial: bool,
+            ) -> torch.Tensor:
+        if mask is None:
+            if spatial:
+                base = torch.ones((regular_node_count, regular_node_count))
+                base.fill_diagonal_(0)
+            else:
+                base = torch.ones((regular_node_count, regular_node_count))
+        else:
+            base = torch.as_tensor(mask).reshape(-1)
+            expected_regular = regular_node_count * regular_node_count
+            expected_total = total_node_count * total_node_count
+            if base.numel() == expected_regular:
+                base = base.view(regular_node_count, regular_node_count)
+            elif base.numel() == expected_total:
+                base = base.view(total_node_count, total_node_count)
+            else:
+                raise ValueError(
+                    "The fixed edge mask must describe either the regular agents "
+                    f"({expected_regular} values) or all policy nodes "
+                    f"({expected_total} values); received {base.numel()}."
+                )
+
+        if tuple(base.shape) == (regular_node_count, regular_node_count):
+            expanded = torch.zeros((total_node_count, total_node_count), dtype=base.dtype)
+            expanded[:regular_node_count, :regular_node_count] = base
+            if total_node_count > regular_node_count:
+                # The final decision node is a sink. All regular agents may send
+                # to it, while it never sends information back into the policy DAG.
+                expanded[:regular_node_count, -1] = 1
+            base = expanded
+        else:
+            base = base.clone()
+
+        if spatial:
+            # potential_spatial_edges uses [source, target], so the strict upper
+            # triangle enforces source_index < target_index and makes the final
+            # decision node the last possible receiver.
+            dag_mask = torch.triu(torch.ones_like(base), diagonal=1)
+            base = base * dag_mask
+        elif total_node_count > regular_node_count:
+            # Preserve the final node as a sink across rounds as well.
+            base[-1, :] = 0
+
+        return base.reshape(-1)
     
     def construct_adj_matrix(self):
         role_connect:List[Tuple[str,str]] = self.prompt_set.get_role_connection()
@@ -138,7 +215,7 @@ class Graph(ABC):
             role_2_id[out_role] = []
         for i, node_id in enumerate(self.nodes):
             role = self.nodes[node_id].role
-            role_2_id[role].append(i)
+            role_2_id.setdefault(role, []).append(i)
             
         for edge in role_connect:
             in_role,out_role = edge
@@ -147,6 +224,15 @@ class Graph(ABC):
             for in_id in in_ids:
                 for out_id in out_ids:
                     role_adj[in_id][out_id] = 1
+
+        decision_idx = self.node_id_to_index[self.decision_node.id]
+        for node_idx in range(num_nodes):
+            if node_idx == decision_idx:
+                continue
+            # The GCN substrate remains fully connected around the final role;
+            # the strict DAG mask is applied only to generated edges.
+            role_adj[node_idx][decision_idx] = 1
+            role_adj[decision_idx][node_idx] = 1
         
         edge_index, edge_weight = dense_to_sparse(role_adj)
         return edge_index
@@ -154,8 +240,12 @@ class Graph(ABC):
     def construct_features(self):
         features = []
         for node_id in self.nodes:
-            role = self.nodes[node_id].role
-            profile = self.prompt_set.get_description(role)
+            node = self.nodes[node_id]
+            role = node.role
+            if node is self.decision_node:
+                profile = role
+            else:
+                profile = self.prompt_set.get_description(role)
             feature = get_sentence_embedding(profile)
             features.append(feature)
         features = torch.tensor(np.array(features))
@@ -167,10 +257,6 @@ class Graph(ABC):
         new_features = torch.cat((self.features,query_embedding),dim=1)
         return new_features
 
-    def _refine_spatial_logits(self, raw_spatial_logits: torch.Tensor) -> torch.Tensor:
-        self.spatial_edge_probabilities = None
-        return raw_spatial_logits.view(-1)
-
     def prepare_spatial_logits(
             self,
             task: str,
@@ -178,14 +264,21 @@ class Graph(ABC):
             ) -> None:
         def _compute_spatial_logits() -> None:
             new_features = self.construct_new_features(task)
-            edge_embeddings = self.gat(new_features, self.role_adj_matrix)
+            logits = self.gcn(new_features, self.role_adj_matrix)
+            propagated_embeddings = self.mlp(logits)
+            skip_embeddings = self.spatial_skip_projection(new_features)
+            edge_embeddings = self.spatial_embedding_norm(
+                propagated_embeddings + skip_embeddings
+            )
             affinity_weight = self.spatial_affinity_weight.to(
                 device=edge_embeddings.device,
                 dtype=edge_embeddings.dtype,
             )
-            affinity_scores = edge_embeddings @ affinity_weight @ edge_embeddings.t()
-            raw_spatial_logits = min_max_norm(torch.flatten(affinity_scores))
-            self.spatial_logits = self._refine_spatial_logits(raw_spatial_logits)
+            affinity_scores = (
+                edge_embeddings @ affinity_weight @ edge_embeddings.t()
+                / np.sqrt(self.edge_embedding_dim)
+            )
+            self.spatial_logits = torch.flatten(affinity_scores)
 
         if track_grad:
             _compute_spatial_logits()
@@ -308,6 +401,15 @@ class Graph(ABC):
                 if successor.id in node_ids
             )
         return num_edges
+
+    @property
+    def mean_spatial_edges_per_round(self) -> float:
+        """Return one-round-equivalent spatial edges, excluding temporal edges."""
+        if not self.realized_spatial_edge_counts:
+            return 0.0
+        return sum(self.realized_spatial_edge_counts) / len(
+            self.realized_spatial_edge_counts
+        )
     
     @property
     def num_nodes(self):
@@ -339,6 +441,9 @@ class Graph(ABC):
                 kwargs["llm_name"] = self.llm_name
                 agent_instance = AgentRegistry.get(agent_name, **kwargs)
                 self.add_node(agent_instance)
+        # Dict insertion order is the policy order used by the strict DAG mask.
+        # Appending here guarantees that the decision node is v_N.
+        self.add_node(self.decision_node)
     
     def init_potential_edges(self):
         """
@@ -367,10 +472,6 @@ class Graph(ABC):
             self.nodes[node_id].temporal_predecessors = []
             self.nodes[node_id].temporal_successors = []
 
-    def connect_decision_node(self):
-        for node_id in self.nodes.keys():
-            self.nodes[node_id].add_successor(self.decision_node)
-
     def construct_spatial_connection(
             self,
             round:int = 0,
@@ -387,46 +488,40 @@ class Graph(ABC):
             if edge_mask == 0.0:
                 continue
             elif edge_mask == 1.0 and self.optimized_spatial==False:
-                if not self.check_cycle(in_node, {out_node}):
-                    out_node.add_successor(in_node,'spatial')
+                out_node.add_successor(in_node,'spatial')
                 continue
-            if not self.check_cycle(in_node, {out_node}):
-                if self.spatial_edge_probabilities is not None:
-                    edge_prob = self.spatial_edge_probabilities[edge_idx]
-                else:
-                    edge_prob = torch.sigmoid(edge_logit / temperature)
-                edge_prob = edge_prob.clamp(1e-6, 1.0 - 1e-6)
-                if threshold is None:
-                    edge_selected = bool(torch.rand((), device=edge_prob.device) < edge_prob)
-                else:
-                    edge_selected = bool(edge_prob >= float(threshold))
+            edge_prob = torch.sigmoid(edge_logit / temperature)
+            edge_prob = edge_prob.clamp(1e-6, 1.0 - 1e-6)
+            if threshold is None:
+                edge_selected = bool(torch.rand((), device=edge_prob.device) < edge_prob)
+            else:
+                edge_selected = bool(edge_prob >= float(threshold))
+            if track_grad:
+                self.edge_decisions.append({
+                    "type": "spatial",
+                    "round": round,
+                    "source": out_node.id,
+                    "target": in_node.id,
+                    "edge_key": f"spatial:{round}:{out_node.id}->{in_node.id}",
+                    "selected": edge_selected,
+                    "probability": edge_prob,
+                })
+            if edge_selected:
+                out_node.add_successor(in_node,'spatial')
+                edge_info = {
+                    "type": "spatial",
+                    "round": round,
+                    "source": out_node.id,
+                    "target": in_node.id,
+                    "edge_key": f"spatial:{round}:{out_node.id}->{in_node.id}",
+                }
                 if track_grad:
-                    self.edge_decisions.append({
-                        "type": "spatial",
-                        "round": round,
-                        "source": out_node.id,
-                        "target": in_node.id,
-                        "edge_key": f"spatial:{round}:{out_node.id}->{in_node.id}",
-                        "selected": edge_selected,
-                        "probability": edge_prob,
-                    })
-                if edge_selected:
-                    out_node.add_successor(in_node,'spatial')
-                    edge_info = {
-                        "type": "spatial",
-                        "round": round,
-                        "source": out_node.id,
-                        "target": in_node.id,
-                        "edge_key": f"spatial:{round}:{out_node.id}->{in_node.id}",
-                    }
-                    if track_grad:
-                        edge_log_prob = torch.log(edge_prob)
-                        log_probs.append(edge_log_prob)
-                        edge_info["log_prob"] = edge_log_prob
-                    self.edge_log_probs.append(edge_info)
-                else:
-                    if track_grad:
-                        log_probs.append(torch.log(1 - edge_prob))
+                    edge_log_prob = torch.log(edge_prob)
+                    log_probs.append(edge_log_prob)
+                    edge_info["log_prob"] = edge_log_prob
+                self.edge_log_probs.append(edge_info)
+            elif track_grad:
+                log_probs.append(torch.log(1 - edge_prob))
                     
         return torch.sum(torch.stack(log_probs))
     
@@ -447,8 +542,7 @@ class Graph(ABC):
             if edge_mask == 0.0:
                 continue
             elif edge_mask == 1.0 and self.optimized_temporal==False:
-                if not self.check_cycle(in_node, {out_node}):
-                    out_node.add_successor(in_node,'temporal')
+                out_node.add_successor(in_node,'temporal')
                 continue
             
             edge_prob = torch.sigmoid(edge_logit / temperature).clamp(1e-6, 1.0 - 1e-6)
@@ -502,6 +596,7 @@ class Graph(ABC):
         self.edge_log_probs = []
         self.edge_decisions = []
         self.realized_edge_counts = []
+        self.realized_spatial_edge_counts = []
         task = inputs.get("task", str(inputs)) if isinstance(inputs, dict) else str(inputs)
         self.prepare_spatial_logits(task, track_grad=track_grad)
         for round in range(num_rounds):
@@ -512,59 +607,40 @@ class Graph(ABC):
             )
             log_probs += self.construct_temporal_connection(round, track_grad=track_grad)
             self.apply_edge_selector(task, edge_selector, round)
+            self.realized_spatial_edge_counts.append(self.num_edges)
             self.realized_edge_counts.append(self.communication_edge_count)
             
-            in_degree = {node_id: len(node.spatial_predecessors) for node_id, node in self.nodes.items()}
-            zero_in_degree_queue = [node_id for node_id, deg in in_degree.items() if deg == 0]
-
-            while zero_in_degree_queue:
-                current_node_id = zero_in_degree_queue.pop(0)
+            # The strict upper-triangular mask makes insertion order a valid
+            # topological order and guarantees that the appended decision node
+            # executes last even when it samples no incoming edge.
+            for current_node_id, current_node in self.nodes.items():
                 tries = 0
                 while tries < max_tries:
                     try:
-                        self.nodes[current_node_id].execute(
+                        current_node.execute(
                             inputs,
                             round_idx=round,
                             num_entropy_samples=num_entropy_samples,
                             record_execution_history=record_execution_history,
-                            return_logprobs=record_node_logprobs,
+                            return_logprobs=(
+                                record_decision_logprobs
+                                if current_node is self.decision_node
+                                else record_node_logprobs
+                            ),
                             logprob_token_limit=node_logprob_token_limit,
                         ) # output is saved in the node.outputs
                         break
                     except Exception as e:
-                        node = self.nodes[current_node_id]
                         print(
                             "Error during execution of node "
-                            f"{current_node_id} ({node.role}) "
+                            f"{current_node_id} ({current_node.role}) "
                             f"round={round} try={tries + 1}/{max_tries}: "
                             f"{type(e).__name__}: {e!r}\n{_format_exception(e)}"
                         )
                     tries += 1
-                for successor in self.nodes[current_node_id].spatial_successors:
-                    if successor.id not in self.nodes.keys():
-                        continue
-                    in_degree[successor.id] -= 1
-                    if in_degree[successor.id] == 0:
-                        zero_in_degree_queue.append(successor.id)
             
             self.update_memory()
             
-        self.connect_decision_node()
-        tries = 0
-        while tries < _DECISION_NODE_MAX_TRIES:
-            try:
-                self.decision_node.execute(
-                    inputs,
-                    return_logprobs=record_decision_logprobs,
-                )
-                break
-            except Exception as e:
-                print(
-                    "Error during execution of decision node "
-                    f"try={tries + 1}/{_DECISION_NODE_MAX_TRIES}: "
-                    f"{type(e).__name__}: {e!r}\n{_format_exception(e)}"
-                )
-                tries += 1
         final_answers = self.decision_node.outputs
         if len(final_answers) == 0:
             final_answers.append("No answer of the decision node")
@@ -587,6 +663,7 @@ class Graph(ABC):
         self.edge_log_probs = []
         self.edge_decisions = []
         self.realized_edge_counts = []
+        self.realized_spatial_edge_counts = []
         self.prepare_spatial_logits(input['task'], track_grad=track_grad)
 
         for round in range(num_rounds):
@@ -597,65 +674,40 @@ class Graph(ABC):
             )
             log_probs += self.construct_temporal_connection(round, track_grad=track_grad)
             self.apply_edge_selector(input.get("task", str(input)), edge_selector, round)
+            self.realized_spatial_edge_counts.append(self.num_edges)
             self.realized_edge_counts.append(self.communication_edge_count)
             
-            in_degree = {node_id: len(node.spatial_predecessors) for node_id, node in self.nodes.items()}
-            zero_in_degree_queue = [node_id for node_id, deg in in_degree.items() if deg == 0]
-
-            while zero_in_degree_queue:
-                current_node_id = zero_in_degree_queue.pop(0)
+            for current_node_id, current_node in self.nodes.items():
                 tries = 0
                 while tries < max_tries:
                     try:
                         await asyncio.wait_for(
-                            self.nodes[current_node_id].async_execute(
+                            current_node.async_execute(
                                 input,
                                 round_idx=round,
                                 num_entropy_samples=num_entropy_samples,
                                 record_execution_history=record_execution_history,
-                                return_logprobs=record_node_logprobs,
+                                return_logprobs=(
+                                    record_decision_logprobs
+                                    if current_node is self.decision_node
+                                    else record_node_logprobs
+                                ),
                                 logprob_token_limit=node_logprob_token_limit,
                             ),
                             timeout=max_time,
                         ) # output is saved in the node.outputs
                         break
                     except Exception as e:
-                        node = self.nodes[current_node_id]
                         print(
                             "Error during execution of node "
-                            f"{current_node_id} ({node.role}) "
+                            f"{current_node_id} ({current_node.role}) "
                             f"round={round} try={tries + 1}/{max_tries}: "
                             f"{type(e).__name__}: {e!r}\n{_format_exception(e)}"
                         )
                     tries += 1
-                for successor in self.nodes[current_node_id].spatial_successors:
-                    if successor.id not in self.nodes.keys():
-                        continue
-                    in_degree[successor.id] -= 1
-                    if in_degree[successor.id] == 0:
-                        zero_in_degree_queue.append(successor.id)
             
             self.update_memory()
             
-        self.connect_decision_node()
-        tries = 0
-        while tries < _DECISION_NODE_MAX_TRIES:
-            try:
-                await asyncio.wait_for(
-                    self.decision_node.async_execute(
-                        input,
-                        return_logprobs=record_decision_logprobs,
-                    ),
-                    timeout=_DECISION_NODE_TIMEOUT_SECONDS,
-                )
-                break
-            except Exception as e:
-                print(
-                    "Error during execution of decision node "
-                    f"try={tries + 1}/{_DECISION_NODE_MAX_TRIES}: "
-                    f"{type(e).__name__}: {e!r}\n{_format_exception(e)}"
-                )
-                tries += 1
         final_answers = self.decision_node.outputs
         if len(final_answers) == 0:
             final_answers.append("No answer of the decision node")
@@ -669,14 +721,6 @@ class Graph(ABC):
         for node in self.nodes.values():
             node.execution_history = []
     
-    def check_cycle(self, new_node, target_nodes):
-        if new_node in target_nodes:
-            return True
-        for successor in new_node.spatial_successors:
-            if self.check_cycle(successor, target_nodes):
-                return True
-        return False
-
     def prune_temporal_edges(self, pruning_rate: float) -> Tuple[torch.Tensor, torch.Tensor]:
         if not self.optimized_temporal or pruning_rate <= 0:
             return self.temporal_masks, torch.empty(0, dtype=torch.long)
@@ -723,13 +767,3 @@ class Graph(ABC):
             prune_idx = sorted_edges_idx[:int(prune_num_edges + num_masks)]
             self.temporal_masks[prune_idx] = 0
         return self.spatial_masks, self.temporal_masks
-
-
-def min_max_norm(tensor:torch.Tensor):
-    min_val = tensor.min()
-    max_val = tensor.max()
-    if torch.isclose(max_val, min_val):
-        return torch.zeros_like(tensor)
-    normalized_0_to_1 = (tensor - min_val) / (max_val - min_val)
-    normalized_minus1_to_1 = normalized_0_to_1 * 2 - 1
-    return normalized_minus1_to_1

@@ -24,7 +24,8 @@ async def evaluate(
 
     print(f"Evaluating gdesigner on {dataset.__class__.__name__} split {dataset.split}")
     
-    graph.gat.eval()
+    graph.gcn.eval()
+    graph.mlp.eval()
     accuracy = Accuracy()
     total_edges = 0
     edge_samples = 0
@@ -54,7 +55,10 @@ async def evaluate(
         
         for record in record_batch:
             realized_graph = copy.deepcopy(graph)
-            realized_graph.gat = graph.gat
+            realized_graph.gcn = graph.gcn
+            realized_graph.mlp = graph.mlp
+            realized_graph.spatial_skip_projection = graph.spatial_skip_projection
+            realized_graph.spatial_embedding_norm = graph.spatial_embedding_norm
             realized_graph.spatial_affinity_weight = graph.spatial_affinity_weight
             realized_graphs.append(realized_graph)
             input_dict = dataset.record_to_input(record)
@@ -74,7 +78,7 @@ async def evaluate(
         raw_results = await asyncio.gather(*answer_log_probs)
         raw_answers, log_probs = zip(*raw_results)
         for realized_graph in realized_graphs:
-            total_edges += sum(realized_graph.realized_edge_counts)
+            total_edges += realized_graph.mean_spatial_edges_per_round
             edge_samples += 1
         print(f"Batch time {time.time() - start_ts:.3f}")
         for raw_answer, record in zip(raw_answers, record_batch):

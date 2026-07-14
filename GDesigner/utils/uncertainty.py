@@ -610,7 +610,24 @@ async def edge_entropy_rewards(
         before_answer_score = None
         after_answer_score = None
         if target_spec is not None and scorer is not None:
-            if target_spec.mode != "execution":
+            target_is_final = target_node is graph.decision_node
+            if target_is_final and target_spec.mode != "execution":
+                before_score_task = scorer.teacher_answer_logprob(
+                    target_node,
+                    input_data,
+                    before_spatial_info,
+                    before_temporal_info,
+                    target_spec,
+                )
+            elif target_is_final:
+                before_score_task = scorer.score_outputs(
+                    target_node,
+                    input_data,
+                    before_outputs,
+                    target_spec,
+                    cluster_labels=None,
+                )
+            elif target_spec.mode != "execution":
                 before_score_task = scorer.final_agent_teacher_answer_logprob(
                     graph.decision_node,
                     input_data,
@@ -636,7 +653,23 @@ async def edge_entropy_rewards(
                 before_score = await before_score_task
                 after_score = after_score_cache[after_cache_key]
             else:
-                if target_spec.mode != "execution":
+                if target_is_final and target_spec.mode != "execution":
+                    after_score_task = scorer.teacher_answer_logprob(
+                        target_node,
+                        input_data,
+                        spatial_info,
+                        temporal_info,
+                        target_spec,
+                    )
+                elif target_is_final:
+                    after_score_task = scorer.score_outputs(
+                        target_node,
+                        input_data,
+                        after_outputs,
+                        target_spec,
+                        cluster_labels=None,
+                    )
+                elif target_spec.mode != "execution":
                     after_score_task = scorer.final_agent_teacher_answer_logprob(
                         graph.decision_node,
                         input_data,

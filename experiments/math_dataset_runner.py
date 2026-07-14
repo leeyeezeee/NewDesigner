@@ -77,8 +77,13 @@ async def run_math_dataset(
         refine_rank=getattr(args, "refine_rank", 4),
         **kwargs,
     )
-    graph.gat.train()
-    optimizer_params = list(graph.gat.parameters()) + graph.refinement_parameters()
+    graph.gcn.train()
+    graph.mlp.train()
+    optimizer_params = (
+        list(graph.gcn.parameters())
+        + list(graph.mlp.parameters())
+        + graph.spatial_parameters()
+    )
     if graph.optimized_temporal:
         optimizer_params.append(graph.temporal_logits)
     optimizer = torch.optim.Adam(optimizer_params, lr=args.lr)
@@ -156,9 +161,11 @@ async def run_math_dataset(
             )
             for _ in range(sample_count):
                 realized_graph = copy.deepcopy(graph)
-                realized_graph.gat = graph.gat
+                realized_graph.gcn = graph.gcn
+                realized_graph.mlp = graph.mlp
+                realized_graph.spatial_skip_projection = graph.spatial_skip_projection
+                realized_graph.spatial_embedding_norm = graph.spatial_embedding_norm
                 realized_graph.spatial_affinity_weight = graph.spatial_affinity_weight
-                realized_graph.refinement_weight = graph.refinement_weight
                 realized_graph.temporal_logits = graph.temporal_logits
                 group_indices.append(len(realized_graphs))
                 realized_graphs.append(realized_graph)
@@ -209,7 +216,7 @@ async def run_math_dataset(
                     is_solved = correctness_fn(predict_answer, true_answer)
                     correctness_reward = float(is_solved)
                     graph_tf_corrects.append(correctness_reward)
-                    graph_tf_edge_counts.append(float(sum(realized_graph.realized_edge_counts)))
+                    graph_tf_edge_counts.append(realized_graph.mean_spatial_edges_per_round)
                     needs_edge_details = (
                         bool(realized_graph.edge_log_probs)
                         and (
@@ -267,20 +274,19 @@ async def run_math_dataset(
                 edge_ig_reward_lambda=edge_ig_reward_lambda,
                 edge_ig_discount_factor=getattr(args, "edge_ig_discount_factor", 0.0),
                 advantage_epsilon=getattr(args, "graph_advantage_epsilon", 1e-6),
-                graph_ib_beta=getattr(args, "graph_ib_beta", 1.0),
-                graph_ib_prior_prob=getattr(args, "graph_ib_prior_prob", 0.45),
+                graph_sparsity_lambda=getattr(args, "graph_sparsity_lambda", 0.1),
             )
             if graph_tf_corrects:
                 avg_correct = sum(graph_tf_corrects) / len(graph_tf_corrects)
                 avg_edges = sum(graph_tf_edge_counts) / len(graph_tf_edge_counts)
                 avg_adv_variance = (
-                    sum(summary["correctness_variance"] for summary in tf_summaries)
+                    sum(summary["graph_reward_variance"] for summary in tf_summaries)
                     / len(tf_summaries)
                     if tf_summaries
                     else 0.0
                 )
                 avg_adv_std = (
-                    sum(summary["correctness_std"] for summary in tf_summaries)
+                    sum(summary["graph_reward_std"] for summary in tf_summaries)
                     / len(tf_summaries)
                     if tf_summaries
                     else 0.0
@@ -309,7 +315,7 @@ async def run_math_dataset(
                 total_executed += 1
                 accuracy = total_solved / total_executed
                 if not train_updates_enabled:
-                    total_edges += sum(realized_graph.realized_edge_counts)
+                    total_edges += realized_graph.mean_spatial_edges_per_round
                     edge_samples += 1
 
                 edge_rewards = {}
@@ -404,7 +410,8 @@ async def run_math_dataset(
             total_edges = 0
             edge_samples = 0
             accuracy = 0.0
-            graph.gat.eval()
+            graph.gcn.eval()
+            graph.mlp.eval()
             reset_usage_counters()
             print("Start Eval")
 

@@ -41,10 +41,11 @@ def save_graph_checkpoint(
             "agent_names": list(graph.agent_names),
             "optimized_spatial": bool(graph.optimized_spatial),
             "optimized_temporal": bool(graph.optimized_temporal),
-            "refine_rank": int(graph.refine_rank),
-            "gat_state_dict": graph.gat.state_dict(),
+            "gcn_state_dict": graph.gcn.state_dict(),
+            "mlp_state_dict": graph.mlp.state_dict(),
+            "spatial_skip_projection_state_dict": graph.spatial_skip_projection.state_dict(),
+            "spatial_embedding_norm_state_dict": graph.spatial_embedding_norm.state_dict(),
             "spatial_affinity_weight": graph.spatial_affinity_weight.detach().cpu(),
-            "refinement_weight": graph.refinement_weight.detach().cpu(),
             "spatial_masks": graph.spatial_masks.detach().cpu(),
             "temporal_logits": graph.temporal_logits.detach().cpu(),
             "temporal_masks": graph.temporal_masks.detach().cpu(),
@@ -72,6 +73,30 @@ def _copy_parameter(target: torch.nn.Parameter, value: torch.Tensor, name: str) 
         target.copy_(value.to(device=target.device, dtype=target.dtype))
 
 
+def _copy_graph_mask(graph, target, value, name: str, *, spatial: bool) -> None:
+    value = graph._prepare_fixed_mask(
+        value,
+        graph.num_nodes - 1,
+        graph.num_nodes,
+        spatial=spatial,
+    )
+    _copy_parameter(target, value, name)
+
+
+def _copy_temporal_logits(graph, value: torch.Tensor) -> None:
+    target = graph.temporal_logits
+    if tuple(target.shape) != tuple(value.shape):
+        regular_node_count = graph.num_nodes - 1
+        if value.numel() == regular_node_count * regular_node_count:
+            expanded = target.detach().clone().view(graph.num_nodes, graph.num_nodes)
+            expanded[:regular_node_count, :regular_node_count] = value.view(
+                regular_node_count,
+                regular_node_count,
+            ).to(device=expanded.device, dtype=expanded.dtype)
+            value = expanded.reshape(-1)
+    _copy_parameter(target, value, "temporal_logits")
+
+
 def load_graph_checkpoint(
     graph,
     checkpoint_file: str,
@@ -85,13 +110,23 @@ def load_graph_checkpoint(
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
     graph_state = checkpoint.get("graph", {})
 
+    if "gcn_state_dict" in graph_state:
+        graph.gcn.load_state_dict(graph_state["gcn_state_dict"])
+    if "mlp_state_dict" in graph_state:
+        graph.mlp.load_state_dict(graph_state["mlp_state_dict"])
+    if "spatial_skip_projection_state_dict" in graph_state:
+        graph.spatial_skip_projection.load_state_dict(
+            graph_state["spatial_skip_projection_state_dict"]
+        )
+    if "spatial_embedding_norm_state_dict" in graph_state:
+        graph.spatial_embedding_norm.load_state_dict(
+            graph_state["spatial_embedding_norm_state_dict"]
+        )
     if "gat_state_dict" in graph_state:
-        graph.gat.load_state_dict(graph_state["gat_state_dict"])
-    elif "gcn_state_dict" in graph_state or "mlp_state_dict" in graph_state:
         raise ValueError(
-            "This checkpoint contains the retired GCN/MLP policy network and "
-            "cannot be loaded into the GAT policy network. Retrain or use a "
-            "checkpoint containing 'gat_state_dict'."
+            "This checkpoint contains the retired GAT policy network and "
+            "cannot be loaded into the GCN/MLP policy network. Retrain or use a "
+            "checkpoint containing 'gcn_state_dict' and 'mlp_state_dict'."
         )
     if "spatial_affinity_weight" in graph_state:
         _copy_parameter(
@@ -99,14 +134,24 @@ def load_graph_checkpoint(
             graph_state["spatial_affinity_weight"],
             "spatial_affinity_weight",
         )
-    if "refinement_weight" in graph_state:
-        _copy_parameter(graph.refinement_weight, graph_state["refinement_weight"], "refinement_weight")
     if "temporal_logits" in graph_state:
-        _copy_parameter(graph.temporal_logits, graph_state["temporal_logits"], "temporal_logits")
+        _copy_temporal_logits(graph, graph_state["temporal_logits"])
     if "spatial_masks" in graph_state:
-        _copy_parameter(graph.spatial_masks, graph_state["spatial_masks"], "spatial_masks")
+        _copy_graph_mask(
+            graph,
+            graph.spatial_masks,
+            graph_state["spatial_masks"],
+            "spatial_masks",
+            spatial=True,
+        )
     if "temporal_masks" in graph_state:
-        _copy_parameter(graph.temporal_masks, graph_state["temporal_masks"], "temporal_masks")
+        _copy_graph_mask(
+            graph,
+            graph.temporal_masks,
+            graph_state["temporal_masks"],
+            "temporal_masks",
+            spatial=False,
+        )
 
     if load_optimizer is not None and "optimizer_state_dict" in checkpoint:
         load_optimizer.load_state_dict(checkpoint["optimizer_state_dict"])

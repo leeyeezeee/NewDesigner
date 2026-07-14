@@ -70,8 +70,7 @@ async def train(graph:Graph,
             edge_ig_reward_lambda: float = None,
             edge_ig_discount_factor: float = 0.0,
             graph_advantage_epsilon: float = 1e-6,
-            graph_ib_beta: float = 1.0,
-            graph_ib_prior_prob: float = 0.45,
+            graph_sparsity_lambda: float = 0.1,
             max_concurrent_graphs: int = 10,
           ):
     
@@ -113,11 +112,16 @@ async def train(graph:Graph,
         _reset_jsonl(_GRAPH_TF_RECORD_FILE)
     graph_semaphore = make_graph_semaphore(max_concurrent_graphs)
     
-    optimizer_params = list(graph.gat.parameters()) + graph.refinement_parameters()
+    optimizer_params = (
+        list(graph.gcn.parameters())
+        + list(graph.mlp.parameters())
+        + graph.spatial_parameters()
+    )
     if graph.optimized_temporal:
         optimizer_params.append(graph.temporal_logits)
     optimizer = torch.optim.Adam(optimizer_params, lr=lr)
-    graph.gat.train()
+    graph.gcn.train()
+    graph.mlp.train()
     for i_iter in range(num_iters):
         print(f"Iter {i_iter}", 80*'-')
         start_ts = time.time()
@@ -135,9 +139,11 @@ async def train(graph:Graph,
             sample_count = max(1, int(graph_sample_count)) if use_multi_graph_reward else 1
             for _ in range(sample_count):
                 realized_graph = copy.deepcopy(graph)
-                realized_graph.gat = graph.gat
+                realized_graph.gcn = graph.gcn
+                realized_graph.mlp = graph.mlp
+                realized_graph.spatial_skip_projection = graph.spatial_skip_projection
+                realized_graph.spatial_embedding_norm = graph.spatial_embedding_norm
                 realized_graph.spatial_affinity_weight = graph.spatial_affinity_weight
-                realized_graph.refinement_weight = graph.refinement_weight
                 realized_graph.temporal_logits = graph.temporal_logits
                 group_indices.append(len(realized_graphs))
                 realized_graphs.append(realized_graph)
@@ -189,7 +195,7 @@ async def train(graph:Graph,
                     record_accuracy = Accuracy()
                     record_accuracy.update(record_answer, correct_answer)
                     graph_tf_corrects.append(float(record_accuracy.get()))
-                    graph_tf_edge_counts.append(float(sum(realized_graph.realized_edge_counts)))
+                    graph_tf_edge_counts.append(realized_graph.mean_spatial_edges_per_round)
                     needs_edge_details = (
                         bool(realized_graph.edge_log_probs)
                         and (
@@ -249,18 +255,17 @@ async def train(graph:Graph,
                 edge_ig_reward_lambda=resolved_edge_ig_reward_lambda,
                 edge_ig_discount_factor=edge_ig_discount_factor,
                 advantage_epsilon=graph_advantage_epsilon,
-                graph_ib_beta=graph_ib_beta,
-                graph_ib_prior_prob=graph_ib_prior_prob,
+                graph_sparsity_lambda=graph_sparsity_lambda,
             )
             if graph_tf_corrects:
                 avg_adv_variance = (
-                    sum(summary["correctness_variance"] for summary in tf_summaries)
+                    sum(summary["graph_reward_variance"] for summary in tf_summaries)
                     / len(tf_summaries)
                     if tf_summaries
                     else 0.0
                 )
                 avg_adv_std = (
-                    sum(summary["correctness_std"] for summary in tf_summaries)
+                    sum(summary["graph_reward_std"] for summary in tf_summaries)
                     / len(tf_summaries)
                     if tf_summaries
                     else 0.0

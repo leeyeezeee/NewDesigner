@@ -11,23 +11,6 @@ from GDesigner.utils.uncertainty import edge_key
 _DEFAULT_TF_EDGE_IG_REWARD_LAMBDA = 1.0
 
 
-def _graph_output_info(graph) -> Dict[str, Dict[str, Any]]:
-    output_info: Dict[str, Dict[str, Any]] = {}
-    for node_id, node in graph.nodes.items():
-        node_outputs = getattr(node, "outputs", [])
-        if isinstance(node_outputs, list):
-            if not node_outputs:
-                continue
-            node_output = node_outputs[-1]
-        else:
-            node_output = node_outputs
-        output_info[node_id] = {
-            "role": getattr(node, "role", ""),
-            "output": node_output,
-        }
-    return output_info
-
-
 def add_teacher_forcing_reward_args(parser) -> None:
     add_agent_backend_args(parser)
     parser.add_argument(
@@ -98,19 +81,13 @@ def add_teacher_forcing_reward_args(parser) -> None:
         help="Small constant used when normalizing graph advantages.",
     )
     parser.add_argument(
-        "--graph_ib_beta",
+        "--graph_sparsity_lambda",
         type=float,
-        default=1.0,
+        default=0.1,
         help=(
-            "Coefficient for the mean per-candidate-edge Bernoulli information "
-            "bottleneck. Set to 0 to disable it."
+            "Correctness-gated penalty on the mean realized spatial-edge "
+            "density per round. Must be in [0, 1)."
         ),
-    )
-    parser.add_argument(
-        "--graph_ib_prior_prob",
-        type=float,
-        default=0.45,
-        help="Bernoulli prior edge probability used by the graph information bottleneck.",
     )
 async def graph_teacher_forcing_score(
     scorer: FinalAnswerScorer,
@@ -120,11 +97,18 @@ async def graph_teacher_forcing_score(
     target_spec: TargetSpec,
 ) -> ScoreResult:
     if target_spec.mode != "execution":
+        history = getattr(graph.decision_node, "execution_history", [])
+        if not history:
+            raise RuntimeError(
+                "The optimized decision node has no execution history for "
+                "graph-level teacher-forcing scoring."
+            )
+        final_history = history[-1]
         return await scorer.teacher_answer_logprob(
             graph.decision_node,
             input_data,
-            _graph_output_info(graph),
-            {},
+            final_history.get("spatial_info", {}),
+            final_history.get("temporal_info", {}),
             target_spec,
         )
 
@@ -287,6 +271,26 @@ def _correctness_advantages(
     return baseline, advantages, variance, std
 
 
+def correctness_gated_sparse_graph_reward(
+    graph,
+    correctness: float,
+    sparsity_lambda: float,
+) -> Tuple[float, float, float, int]:
+    """Reward correct graphs for being sparse without counting repeated rounds.
+
+    The realized edge count is averaged across rounds and temporal edges are
+    excluded.  The denominator is the number of valid spatial choices in one
+    round, so increasing ``num_rounds`` cannot increase the sparsity penalty.
+    """
+    valid_edges = int((getattr(graph, "spatial_masks") > 0).sum().item())
+    mean_edges = float(getattr(graph, "mean_spatial_edges_per_round", 0.0))
+    edge_density = mean_edges / valid_edges if valid_edges > 0 else 0.0
+    edge_density = min(max(edge_density, 0.0), 1.0)
+    correctness = float(correctness)
+    reward = correctness - float(sparsity_lambda) * correctness * edge_density
+    return reward, edge_density, mean_edges, valid_edges
+
+
 def edge_information_gain_loss(
     graph,
     edge_details: Dict[str, Dict[str, Any]],
@@ -388,23 +392,19 @@ def graph_correctness_advantage_edge_loss(
     edge_ig_reward_lambda: float = 0.0,
     edge_ig_discount_factor: float = 0.0,
     advantage_epsilon: float = 1e-6,
-    graph_ib_beta: float = 1.0,
-    graph_ib_prior_prob: float = 0.45,
+    graph_sparsity_lambda: float = 0.1,
 ) -> Tuple[torch.Tensor, List[Dict[str, Any]]]:
-    """Combine full-graph correctness, selected-edge IG, and graph IB losses."""
+    """Combine correctness-gated sparse graph rewards and selected-edge IG."""
     zero = reference_loss.new_tensor(0.0)
     group_losses: List[torch.Tensor] = []
     summaries: List[Dict[str, Any]] = []
     edge_tanh_temperature = max(float(edge_tanh_temperature), 1e-6)
     edge_ig_reward_lambda = float(edge_ig_reward_lambda)
-    graph_ib_beta = float(graph_ib_beta)
-    graph_ib_prior_prob = float(graph_ib_prior_prob)
-    if graph_ib_beta < 0.0:
-        raise ValueError(f"graph_ib_beta must be nonnegative, got {graph_ib_beta}.")
-    if not 0.0 < graph_ib_prior_prob < 1.0:
+    graph_sparsity_lambda = float(graph_sparsity_lambda)
+    if not 0.0 <= graph_sparsity_lambda < 1.0:
         raise ValueError(
-            "graph_ib_prior_prob must be strictly between 0 and 1, got "
-            f"{graph_ib_prior_prob}."
+            "graph_sparsity_lambda must be in [0, 1), got "
+            f"{graph_sparsity_lambda}."
         )
     if not (
         len(graph_groups)
@@ -432,16 +432,30 @@ def graph_correctness_advantage_edge_loss(
                 "Each graph reward group must contain the same number of graphs, "
                 "full graph log-probs, correctness scores, and edge-detail maps."
             )
-        graph_rewards = [float(correctness) for correctness in correctness_scores]
+        graph_rewards: List[float] = []
+        spatial_edge_densities: List[float] = []
+        mean_spatial_edges: List[float] = []
+        valid_spatial_edges: List[int] = []
+        for graph, correctness in zip(graphs, correctness_scores):
+            reward, density, mean_edges, valid_edges = (
+                correctness_gated_sparse_graph_reward(
+                    graph,
+                    correctness,
+                    graph_sparsity_lambda,
+                )
+            )
+            graph_rewards.append(reward)
+            spatial_edge_densities.append(density)
+            mean_spatial_edges.append(mean_edges)
+            valid_spatial_edges.append(valid_edges)
         baseline, advantages, variance, std = _correctness_advantages(
             graph_rewards,
             advantage_epsilon=advantage_epsilon,
         )
 
         per_graph_losses: List[torch.Tensor] = []
-        correctness_loss_values: List[float] = []
+        graph_reward_loss_values: List[float] = []
         edge_ig_loss_values: List[float] = []
-        graph_ib_loss_values: List[float] = []
         edge_ig_coefficients: List[float] = []
         edge_ig_records: List[Dict[str, Any]] = []
         sampled_edges = 0
@@ -449,7 +463,6 @@ def graph_correctness_advantage_edge_loss(
         missing_detail = 0
         missing_ig_gain = 0
         used_edges = 0
-        ib_edges = 0
 
         for graph_advantage, graph, graph_log_prob, edge_details in zip(
             advantages,
@@ -460,7 +473,7 @@ def graph_correctness_advantage_edge_loss(
             if not torch.is_tensor(graph_log_prob):
                 raise TypeError("Full graph log-prob must be a torch.Tensor.")
             graph_advantage_tensor = graph_log_prob.new_tensor(float(graph_advantage))
-            correctness_loss = -(graph_advantage_tensor * graph_log_prob)
+            graph_reward_loss = -(graph_advantage_tensor * graph_log_prob)
 
             discounted_gains = discounted_edge_ig_gains(
                 graph, edge_details, edge_ig_discount_factor
@@ -507,37 +520,12 @@ def graph_correctness_advantage_edge_loss(
                 else zero
             )
 
-            graph_ib_terms: List[torch.Tensor] = []
-            if graph_ib_beta != 0.0:
-                for decision in getattr(graph, "edge_decisions", []):
-                    probability = decision.get("probability")
-                    if not torch.is_tensor(probability):
-                        continue
-                    probability = probability.clamp(1e-6, 1.0 - 1e-6)
-                    prior = probability.new_tensor(graph_ib_prior_prob)
-                    kl = (
-                        probability * (torch.log(probability) - torch.log(prior))
-                        + (1.0 - probability)
-                        * (
-                            torch.log1p(-probability)
-                            - torch.log1p(-prior)
-                        )
-                    )
-                    graph_ib_terms.append(kl)
-                    ib_edges += 1
-            graph_ib_loss = (
-                graph_log_prob.new_tensor(graph_ib_beta)
-                * torch.mean(torch.stack(graph_ib_terms))
-                if graph_ib_terms
-                else zero
-            )
-            per_graph_loss = correctness_loss + edge_ig_loss + graph_ib_loss
+            per_graph_loss = graph_reward_loss + edge_ig_loss
             per_graph_losses.append(per_graph_loss)
-            correctness_loss_values.append(
-                float(correctness_loss.detach().cpu().item())
+            graph_reward_loss_values.append(
+                float(graph_reward_loss.detach().cpu().item())
             )
             edge_ig_loss_values.append(float(edge_ig_loss.detach().cpu().item()))
-            graph_ib_loss_values.append(float(graph_ib_loss.detach().cpu().item()))
 
         avg_edge_ig_logprob_loss = _average_edge_ig_logprob_loss(edge_ig_records)
         if edge_ig_records:
@@ -549,9 +537,13 @@ def graph_correctness_advantage_edge_loss(
         summaries.append({
             "correctness_scores": [float(score) for score in correctness_scores],
             "graph_rewards": graph_rewards,
-            "correctness_baseline": float(baseline),
-            "correctness_variance": float(variance),
-            "correctness_std": float(std),
+            "spatial_edge_densities": spatial_edge_densities,
+            "mean_spatial_edges_per_round": mean_spatial_edges,
+            "valid_spatial_edges_per_round": valid_spatial_edges,
+            "graph_sparsity_lambda": graph_sparsity_lambda,
+            "graph_reward_baseline": float(baseline),
+            "graph_reward_variance": float(variance),
+            "graph_reward_std": float(std),
             "standardized_graph_advantage": bool(std > float(advantage_epsilon)),
             "graph_advantages": [float(advantage) for advantage in advantages],
             "used_edges": used_edges,
@@ -567,9 +559,9 @@ def graph_correctness_advantage_edge_loss(
                 if edge_ig_coefficients
                 else 0.0
             ),
-            "avg_graph_correctness_loss": (
-                sum(correctness_loss_values) / len(correctness_loss_values)
-                if correctness_loss_values
+            "avg_graph_reward_loss": (
+                sum(graph_reward_loss_values) / len(graph_reward_loss_values)
+                if graph_reward_loss_values
                 else 0.0
             ),
             "avg_graph_edge_ig_loss": (
@@ -577,27 +569,26 @@ def graph_correctness_advantage_edge_loss(
                 if edge_ig_loss_values
                 else 0.0
             ),
-            "avg_graph_ib_loss": (
-                sum(graph_ib_loss_values) / len(graph_ib_loss_values)
-                if graph_ib_loss_values
-                else 0.0
-            ),
-            "graph_ib_beta": graph_ib_beta,
-            "graph_ib_prior_prob": graph_ib_prior_prob,
-            "ib_edges": ib_edges,
-            "avg_ib_edges_per_graph": (
-                ib_edges / len(graphs) if graphs else 0.0
-            ),
         })
 
     if not group_losses:
         return zero, summaries
+    edge_counts = [
+        count
+        for summary in summaries
+        for count in summary["mean_spatial_edges_per_round"]
+    ]
+    edge_densities = [
+        density
+        for summary in summaries
+        for density in summary["spatial_edge_densities"]
+    ]
     print(
         "graph loss components: "
-        f"correctness={sum(s['avg_graph_correctness_loss'] for s in summaries) / len(summaries):.6f}, "
+        f"correctness_sparsity={sum(s['avg_graph_reward_loss'] for s in summaries) / len(summaries):.6f}, "
         f"edge_ig={sum(s['avg_graph_edge_ig_loss'] for s in summaries) / len(summaries):.6f}, "
-        f"ib={sum(s['avg_graph_ib_loss'] for s in summaries) / len(summaries):.6f}, "
-        f"ib_edges={sum(s['avg_ib_edges_per_graph'] for s in summaries) / len(summaries):.2f}"
+        f"avg_edges={sum(edge_counts) / len(edge_counts) if edge_counts else 0.0:.2f}, "
+        f"edge_density={sum(edge_densities) / len(edge_densities) if edge_densities else 0.0:.6f}"
     )
     return torch.mean(torch.stack(group_losses)), summaries
 
