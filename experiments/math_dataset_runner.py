@@ -274,7 +274,7 @@ async def run_math_dataset(
                 edge_ig_reward_lambda=edge_ig_reward_lambda,
                 edge_ig_discount_factor=getattr(args, "edge_ig_discount_factor", 0.0),
                 advantage_epsilon=getattr(args, "graph_advantage_epsilon", 1e-6),
-                graph_sparsity_lambda=getattr(args, "graph_sparsity_lambda", 0.1),
+                graph_sparsity_lambda=getattr(args, "graph_sparsity_lambda", 0.5),
             )
             if graph_tf_corrects:
                 avg_correct = sum(graph_tf_corrects) / len(graph_tf_corrects)

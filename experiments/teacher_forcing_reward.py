@@ -83,10 +83,10 @@ def add_teacher_forcing_reward_args(parser) -> None:
     parser.add_argument(
         "--graph_sparsity_lambda",
         type=float,
-        default=0.1,
+        default=0.5,
         help=(
-            "Correctness-gated penalty on the mean realized spatial-edge "
-            "density per round. Must be in [0, 1)."
+            "Coefficient for the group-correctness-gated mean probability of "
+            "valid spatial edges. Must be nonnegative."
         ),
     )
 async def graph_teacher_forcing_score(
@@ -271,24 +271,32 @@ def _correctness_advantages(
     return baseline, advantages, variance, std
 
 
-def correctness_gated_sparse_graph_reward(
+def mean_valid_spatial_edge_probability(
     graph,
-    correctness: float,
-    sparsity_lambda: float,
-) -> Tuple[float, float, float, int]:
-    """Reward correct graphs for being sparse without counting repeated rounds.
+    reference_loss: torch.Tensor,
+) -> Tuple[torch.Tensor, int]:
+    """Return the expected one-round spatial-edge density.
 
-    The realized edge count is averaged across rounds and temporal edges are
-    excluded.  The denominator is the number of valid spatial choices in one
-    round, so increasing ``num_rounds`` cannot increase the sparsity penalty.
+    The probability matrix is generated once per task and reused by every
+    communication round. Only valid spatial entries participate; sampled edge
+    counts and temporal edges do not enter this differentiable regularizer.
     """
-    valid_edges = int((getattr(graph, "spatial_masks") > 0).sum().item())
-    mean_edges = float(getattr(graph, "mean_spatial_edges_per_round", 0.0))
-    edge_density = mean_edges / valid_edges if valid_edges > 0 else 0.0
-    edge_density = min(max(edge_density, 0.0), 1.0)
-    correctness = float(correctness)
-    reward = correctness - float(sparsity_lambda) * correctness * edge_density
-    return reward, edge_density, mean_edges, valid_edges
+    spatial_logits = getattr(graph, "spatial_logits", None)
+    spatial_masks = getattr(graph, "spatial_masks", None)
+    if not torch.is_tensor(spatial_logits) or not torch.is_tensor(spatial_masks):
+        return reference_loss.new_tensor(0.0), 0
+
+    flat_logits = spatial_logits.reshape(-1)
+    valid_mask = spatial_masks.reshape(-1).to(device=flat_logits.device) > 0
+    if flat_logits.numel() != valid_mask.numel():
+        raise ValueError(
+            "Spatial logits and masks must have the same number of entries; "
+            f"received {flat_logits.numel()} and {valid_mask.numel()}."
+        )
+    valid_edges = int(valid_mask.sum().item())
+    if valid_edges == 0:
+        return flat_logits.sum() * 0.0, 0
+    return torch.sigmoid(flat_logits[valid_mask]).mean(), valid_edges
 
 
 def edge_information_gain_loss(
@@ -392,18 +400,18 @@ def graph_correctness_advantage_edge_loss(
     edge_ig_reward_lambda: float = 0.0,
     edge_ig_discount_factor: float = 0.0,
     advantage_epsilon: float = 1e-6,
-    graph_sparsity_lambda: float = 0.1,
+    graph_sparsity_lambda: float = 0.5,
 ) -> Tuple[torch.Tensor, List[Dict[str, Any]]]:
-    """Combine correctness-gated sparse graph rewards and selected-edge IG."""
+    """Combine correctness advantages, selected-edge IG, and matrix sparsity."""
     zero = reference_loss.new_tensor(0.0)
     group_losses: List[torch.Tensor] = []
     summaries: List[Dict[str, Any]] = []
     edge_tanh_temperature = max(float(edge_tanh_temperature), 1e-6)
     edge_ig_reward_lambda = float(edge_ig_reward_lambda)
     graph_sparsity_lambda = float(graph_sparsity_lambda)
-    if not 0.0 <= graph_sparsity_lambda < 1.0:
+    if graph_sparsity_lambda < 0.0:
         raise ValueError(
-            "graph_sparsity_lambda must be in [0, 1), got "
+            "graph_sparsity_lambda must be nonnegative, got "
             f"{graph_sparsity_lambda}."
         )
     if not (
@@ -432,22 +440,33 @@ def graph_correctness_advantage_edge_loss(
                 "Each graph reward group must contain the same number of graphs, "
                 "full graph log-probs, correctness scores, and edge-detail maps."
             )
-        graph_rewards: List[float] = []
-        spatial_edge_densities: List[float] = []
-        mean_spatial_edges: List[float] = []
+        graph_rewards = [float(correctness) for correctness in correctness_scores]
+        correctness_gate = (
+            sum(graph_rewards) / len(graph_rewards) if graph_rewards else 0.0
+        )
+        spatial_probability_means: List[torch.Tensor] = []
         valid_spatial_edges: List[int] = []
-        for graph, correctness in zip(graphs, correctness_scores):
-            reward, density, mean_edges, valid_edges = (
-                correctness_gated_sparse_graph_reward(
-                    graph,
-                    correctness,
-                    graph_sparsity_lambda,
-                )
+        mean_spatial_edges = [
+            float(getattr(graph, "mean_spatial_edges_per_round", 0.0))
+            for graph in graphs
+        ]
+        for graph in graphs:
+            probability_mean, valid_edges = mean_valid_spatial_edge_probability(
+                graph,
+                reference_loss,
             )
-            graph_rewards.append(reward)
-            spatial_edge_densities.append(density)
-            mean_spatial_edges.append(mean_edges)
+            spatial_probability_means.append(probability_mean)
             valid_spatial_edges.append(valid_edges)
+        mean_probability = (
+            torch.mean(torch.stack(spatial_probability_means))
+            if spatial_probability_means
+            else zero
+        )
+        matrix_sparsity_loss = (
+            mean_probability
+            * mean_probability.new_tensor(graph_sparsity_lambda)
+            * mean_probability.new_tensor(correctness_gate)
+        )
         baseline, advantages, variance, std = _correctness_advantages(
             graph_rewards,
             advantage_epsilon=advantage_epsilon,
@@ -531,13 +550,18 @@ def graph_correctness_advantage_edge_loss(
         if edge_ig_records:
             print("average edge IG logprob loss:", avg_edge_ig_logprob_loss)
 
-        group_losses.append(
+        graph_and_ig_loss = (
             torch.mean(torch.stack(per_graph_losses)) if per_graph_losses else zero
         )
+        group_losses.append(graph_and_ig_loss + matrix_sparsity_loss)
         summaries.append({
             "correctness_scores": [float(score) for score in correctness_scores],
             "graph_rewards": graph_rewards,
-            "spatial_edge_densities": spatial_edge_densities,
+            "correctness_gate": float(correctness_gate),
+            "mean_spatial_edge_probabilities": [
+                float(value.detach().cpu().item())
+                for value in spatial_probability_means
+            ],
             "mean_spatial_edges_per_round": mean_spatial_edges,
             "valid_spatial_edges_per_round": valid_spatial_edges,
             "graph_sparsity_lambda": graph_sparsity_lambda,
@@ -569,6 +593,9 @@ def graph_correctness_advantage_edge_loss(
                 if edge_ig_loss_values
                 else 0.0
             ),
+            "matrix_sparsity_loss": float(
+                matrix_sparsity_loss.detach().cpu().item()
+            ),
         })
 
     if not group_losses:
@@ -578,17 +605,18 @@ def graph_correctness_advantage_edge_loss(
         for summary in summaries
         for count in summary["mean_spatial_edges_per_round"]
     ]
-    edge_densities = [
-        density
+    edge_probabilities = [
+        probability
         for summary in summaries
-        for density in summary["spatial_edge_densities"]
+        for probability in summary["mean_spatial_edge_probabilities"]
     ]
     print(
         "graph loss components: "
-        f"correctness_sparsity={sum(s['avg_graph_reward_loss'] for s in summaries) / len(summaries):.6f}, "
+        f"correctness={sum(s['avg_graph_reward_loss'] for s in summaries) / len(summaries):.6f}, "
         f"edge_ig={sum(s['avg_graph_edge_ig_loss'] for s in summaries) / len(summaries):.6f}, "
+        f"matrix_sparsity={sum(s['matrix_sparsity_loss'] for s in summaries) / len(summaries):.6f}, "
         f"avg_edges={sum(edge_counts) / len(edge_counts) if edge_counts else 0.0:.2f}, "
-        f"edge_density={sum(edge_densities) / len(edge_densities) if edge_densities else 0.0:.6f}"
+        f"mean_edge_probability={sum(edge_probabilities) / len(edge_probabilities) if edge_probabilities else 0.0:.6f}"
     )
     return torch.mean(torch.stack(group_losses)), summaries
 

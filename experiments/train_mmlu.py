@@ -70,7 +70,7 @@ async def train(graph:Graph,
             edge_ig_reward_lambda: float = None,
             edge_ig_discount_factor: float = 0.0,
             graph_advantage_epsilon: float = 1e-6,
-            graph_sparsity_lambda: float = 0.1,
+            graph_sparsity_lambda: float = 0.5,
             max_concurrent_graphs: int = 10,
           ):
     
