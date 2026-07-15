@@ -427,6 +427,31 @@ async def _sample_node_outputs(
     return _flatten_outputs([result])
 
 
+def _require_nonblank_edge_outputs(
+    outputs: Iterable[Any],
+    *,
+    key: str,
+    round_idx: int,
+    source_id: str,
+    target_id: str,
+    phase: str,
+) -> List[Any]:
+    output_list = list(outputs)
+    if output_list and all(str(output).strip() for output in output_list):
+        return output_list
+    blank_positions = [
+        index
+        for index, output in enumerate(output_list)
+        if not str(output).strip()
+    ]
+    raise RuntimeError(
+        "Edge IG received missing or blank candidate output. "
+        f"edge_key={key!r}, round={round_idx}, source={source_id!r}, "
+        f"target={target_id!r}, phase={phase!r}, "
+        f"output_count={len(output_list)}, blank_positions={blank_positions}"
+    )
+
+
 def _current_graph_output_info(graph) -> Dict[str, Dict[str, Any]]:
     output_info: Dict[str, Dict[str, Any]] = {}
     for node_id, node in graph.nodes.items():
@@ -557,22 +582,40 @@ async def edge_entropy_rewards(
         else:
             continue
 
-        before_outputs = await _sample_node_outputs(
-            target_node,
-            input_data,
-            before_spatial_info,
-            before_temporal_info,
+        try:
+            before_outputs = await _sample_node_outputs(
+                target_node,
+                input_data,
+                before_spatial_info,
+                before_temporal_info,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "Edge IG counterfactual generation failed. "
+                f"edge_key={key!r}, round={round_idx}, source={source_id!r}, "
+                f"target={target_id!r}, phase='before'"
+            ) from exc
+        before_outputs = _require_nonblank_edge_outputs(
+            before_outputs,
+            key=key,
+            round_idx=round_idx,
+            source_id=source_id,
+            target_id=target_id,
+            phase="before",
         )
-        if not before_outputs:
-            continue
 
         after_cache_key = (target_id, round_idx)
         if after_cache_key in after_outputs_cache:
             after_outputs = after_outputs_cache[after_cache_key]
         else:
-            after_outputs = history_item.get("entropy_samples", [])
-            if not after_outputs:
-                continue
+            after_outputs = _require_nonblank_edge_outputs(
+                history_item.get("entropy_samples", []),
+                key=key,
+                round_idx=round_idx,
+                source_id=source_id,
+                target_id=target_id,
+                phase="after",
+            )
             after_outputs_cache[after_cache_key] = list(after_outputs)
 
         if judge is None:

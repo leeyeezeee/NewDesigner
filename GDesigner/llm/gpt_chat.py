@@ -21,6 +21,7 @@ _OPENAI_CONNECT_TIMEOUT_SECONDS = 20.0
 _OPENAI_POOL_TIMEOUT_SECONDS = 20.0
 _OPENAI_WRITE_TIMEOUT_SECONDS = 120.0
 _ASYNC_OPENAI_CLIENTS: Dict[tuple[str, str], AsyncOpenAI] = {}
+_DIAGNOSTIC_TEXT_LIMIT = 500
 
 load_dotenv()
 
@@ -155,6 +156,71 @@ def _get_attr_or_key(value: Any, name: str, default: Any = None) -> Any:
     return getattr(value, name, default)
 
 
+class EmptyChatCompletionError(RuntimeError):
+    """An OpenAI-compatible request succeeded but returned no usable content."""
+
+
+def _diagnostic_preview(value: Any) -> str:
+    if value is None:
+        return "None"
+    text = str(value)
+    suffix = "..." if len(text) > _DIAGNOSTIC_TEXT_LIMIT else ""
+    return repr(text[:_DIAGNOSTIC_TEXT_LIMIT] + suffix)
+
+
+def _usage_field(usage: Any, name: str) -> Any:
+    return _get_attr_or_key(usage, name) if usage is not None else None
+
+
+def _choice_contents_or_raise(
+    response: Any,
+    *,
+    requested_model: str,
+    base_url: str,
+    request_kwargs: Dict[str, Any],
+) -> List[str]:
+    outputs: List[str] = []
+    for choice_position, choice in enumerate(response.choices):
+        message = _get_attr_or_key(choice, "message")
+        content = _get_attr_or_key(message, "content", "") or ""
+        if str(content).strip():
+            outputs.append(str(content))
+            continue
+
+        usage = _get_attr_or_key(response, "usage")
+        reasoning_content = _get_attr_or_key(message, "reasoning_content")
+        reasoning = _get_attr_or_key(message, "reasoning")
+        completion_details = _usage_field(usage, "completion_tokens_details")
+        chat_template_kwargs = (
+            request_kwargs.get("extra_body", {}).get("chat_template_kwargs", {})
+        )
+        raise EmptyChatCompletionError(
+            "OpenAI-compatible chat completion returned blank message.content.\n"
+            f"requested_model: {requested_model!r}\n"
+            f"response_model: {_get_attr_or_key(response, 'model')!r}\n"
+            f"base_url: {base_url!r}\n"
+            f"response_id: {_get_attr_or_key(response, 'id')!r}\n"
+            f"choice_position: {choice_position}\n"
+            f"choice_index: {_get_attr_or_key(choice, 'index')!r}\n"
+            f"finish_reason: {_get_attr_or_key(choice, 'finish_reason')!r}\n"
+            f"content: {_diagnostic_preview(content)}\n"
+            f"reasoning_content_length: {len(str(reasoning_content or ''))}\n"
+            f"reasoning_content_preview: {_diagnostic_preview(reasoning_content)}\n"
+            f"reasoning_length: {len(str(reasoning or ''))}\n"
+            f"reasoning_preview: {_diagnostic_preview(reasoning)}\n"
+            f"refusal: {_diagnostic_preview(_get_attr_or_key(message, 'refusal'))}\n"
+            f"prompt_tokens: {_usage_field(usage, 'prompt_tokens')!r}\n"
+            f"completion_tokens: {_usage_field(usage, 'completion_tokens')!r}\n"
+            f"total_tokens: {_usage_field(usage, 'total_tokens')!r}\n"
+            f"completion_tokens_details: {completion_details!r}\n"
+            f"request_max_tokens: {request_kwargs.get('max_tokens')!r}\n"
+            f"request_temperature: {request_kwargs.get('temperature')!r}\n"
+            f"request_n: {request_kwargs.get('n')!r}\n"
+            f"request_enable_thinking: {chat_template_kwargs.get('enable_thinking')!r}"
+        )
+    return outputs
+
+
 def _probability_from_logprob(logprob: Optional[float]) -> Optional[float]:
     if logprob is None:
         return None
@@ -187,11 +253,6 @@ def _choice_token_logprobs(choice: Any) -> List[TokenLogProb]:
     return token_logprobs
 
 
-def _choice_content(choice: Any) -> str:
-    message = _get_attr_or_key(choice, "message")
-    return _get_attr_or_key(message, "content", "") or ""
-
-
 async def openai_compatible_achat(
     model: str,
     msg: List[Dict],
@@ -219,7 +280,12 @@ async def openai_compatible_achat(
     response = await _get_async_openai_client(base_url).chat.completions.create(
         **request_kwargs,
     )
-    outputs = [_choice_content(choice) for choice in response.choices]
+    outputs = _choice_contents_or_raise(
+        response,
+        requested_model=model,
+        base_url=base_url,
+        request_kwargs=request_kwargs,
+    )
     prompt = "".join([item["content"] for item in msg])
     for output in outputs:
         cost_count(prompt, output, model)
@@ -262,7 +328,12 @@ def openai_compatible_chat(
     response = OpenAI(**_openai_client_kwargs(base_url)).chat.completions.create(
         **request_kwargs,
     )
-    outputs = [_choice_content(choice) for choice in response.choices]
+    outputs = _choice_contents_or_raise(
+        response,
+        requested_model=model,
+        base_url=base_url,
+        request_kwargs=request_kwargs,
+    )
     prompt = "".join([item["content"] for item in msg])
     for output in outputs:
         cost_count(prompt, output, model)
