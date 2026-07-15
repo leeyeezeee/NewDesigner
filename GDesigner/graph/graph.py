@@ -19,6 +19,40 @@ def _format_exception(exc: Exception) -> str:
     return "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
 
 
+def min_max_norm(
+        tensor: torch.Tensor,
+        valid_mask: Optional[torch.Tensor] = None,
+        ) -> torch.Tensor:
+    """Map selectable affinity scores to [-1, 1]."""
+    flat_tensor = tensor.reshape(-1)
+    if valid_mask is None:
+        flat_mask = torch.ones_like(flat_tensor, dtype=torch.bool)
+    else:
+        flat_mask = valid_mask.reshape(-1).to(device=flat_tensor.device) > 0
+        if flat_mask.numel() != flat_tensor.numel():
+            raise ValueError(
+                "Affinity scores and their valid-edge mask must have the same "
+                f"number of entries; received {flat_tensor.numel()} and "
+                f"{flat_mask.numel()}."
+            )
+
+    valid_values = flat_tensor[flat_mask]
+    if valid_values.numel() == 0:
+        return torch.zeros_like(tensor)
+    min_value = valid_values.min()
+    max_value = valid_values.max()
+    if torch.isclose(max_value, min_value):
+        normalized_values = torch.zeros_like(valid_values)
+    else:
+        normalized_values = (
+            2.0 * (valid_values - min_value) / (max_value - min_value) - 1.0
+        )
+
+    normalized = torch.zeros_like(flat_tensor)
+    normalized = normalized.masked_scatter(flat_mask, normalized_values)
+    return normalized.reshape_as(tensor)
+
+
 class Graph(ABC):
     """
     A framework for managing and executing a network of nodes using a language model.
@@ -127,17 +161,8 @@ class Graph(ABC):
             self.edge_embedding_dim,
             elementwise_affine=False,
         )
-        # A small zero-mean initialization keeps the initial bilinear scores
-        # centered near zero.  Spatial edges therefore start as approximately
-        # Bernoulli(0.5) decisions instead of inheriting the positive-cosine
-        # density bias produced by an identity affinity matrix.
-        initial_affinity_weight = torch.empty(
-            self.edge_embedding_dim,
-            self.edge_embedding_dim,
-        )
-        torch.nn.init.normal_(initial_affinity_weight, mean=0.0, std=0.05)
         self.spatial_affinity_weight = torch.nn.Parameter(
-            initial_affinity_weight,
+            torch.eye(self.edge_embedding_dim),
             requires_grad=optimized_spatial,
         )
 
@@ -285,9 +310,11 @@ class Graph(ABC):
             )
             affinity_scores = (
                 edge_embeddings @ affinity_weight @ edge_embeddings.t()
-                / np.sqrt(self.edge_embedding_dim)
             )
-            self.spatial_logits = torch.flatten(affinity_scores)
+            self.spatial_logits = torch.flatten(min_max_norm(
+                affinity_scores,
+                self.spatial_masks.reshape_as(affinity_scores),
+            ))
 
         if track_grad:
             _compute_spatial_logits()

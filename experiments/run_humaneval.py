@@ -322,7 +322,6 @@ async def main():
                 edge_ig_reward_lambda=edge_ig_reward_lambda,
                 edge_ig_discount_factor=args.edge_ig_discount_factor,
                 advantage_epsilon=args.graph_advantage_epsilon,
-                graph_sparsity_lambda=args.graph_sparsity_lambda,
             )
             if graph_tf_corrects:
                 avg_correct = sum(graph_tf_corrects) / len(graph_tf_corrects)

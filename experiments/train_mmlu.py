@@ -70,7 +70,6 @@ async def train(graph:Graph,
             edge_ig_reward_lambda: float = None,
             edge_ig_discount_factor: float = 0.0,
             graph_advantage_epsilon: float = 1e-6,
-            graph_sparsity_lambda: float = 0.5,
             max_concurrent_graphs: int = 10,
           ):
     
@@ -255,7 +254,6 @@ async def train(graph:Graph,
                 edge_ig_reward_lambda=resolved_edge_ig_reward_lambda,
                 edge_ig_discount_factor=edge_ig_discount_factor,
                 advantage_epsilon=graph_advantage_epsilon,
-                graph_sparsity_lambda=graph_sparsity_lambda,
             )
             if graph_tf_corrects:
                 avg_adv_variance = (
