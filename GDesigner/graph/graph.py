@@ -127,8 +127,17 @@ class Graph(ABC):
             self.edge_embedding_dim,
             elementwise_affine=False,
         )
+        # A small zero-mean initialization keeps the initial bilinear scores
+        # centered near zero.  Spatial edges therefore start as approximately
+        # Bernoulli(0.5) decisions instead of inheriting the positive-cosine
+        # density bias produced by an identity affinity matrix.
+        initial_affinity_weight = torch.empty(
+            self.edge_embedding_dim,
+            self.edge_embedding_dim,
+        )
+        torch.nn.init.normal_(initial_affinity_weight, mean=0.0, std=0.05)
         self.spatial_affinity_weight = torch.nn.Parameter(
-            torch.eye(self.edge_embedding_dim),
+            initial_affinity_weight,
             requires_grad=optimized_spatial,
         )
 
