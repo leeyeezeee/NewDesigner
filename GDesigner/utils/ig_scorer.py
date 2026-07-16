@@ -605,6 +605,7 @@ class FinalAnswerScorer:
     ) -> tuple[float, Dict[str, Any]]:
         from GDesigner.llm.gpt_chat import (
             _agent_base_url,
+            _async_openai_request,
             _get_async_openai_client,
             _is_openai_compatible,
         )
@@ -615,12 +616,15 @@ class FinalAnswerScorer:
 
         prompt_prefix = self._completion_prompt_prefix(messages)
         prompt = prompt_prefix + target_answer
-        response = await _get_async_openai_client(base_url).completions.create(
-            model=llm.model_name,
-            prompt=prompt,
-            max_tokens=1,
-            temperature=0.0,
-            extra_body={"prompt_logprobs": 1},
+        client = _get_async_openai_client(base_url)
+        response = await _async_openai_request(
+            lambda: client.completions.create(
+                model=llm.model_name,
+                prompt=prompt,
+                max_tokens=1,
+                temperature=0.0,
+                extra_body={"prompt_logprobs": 1},
+            )
         )
 
         choice = response.choices[0]
