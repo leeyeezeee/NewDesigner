@@ -27,6 +27,7 @@ from experiments.teacher_forcing_reward import (
     edge_information_gain_loss,
     graph_correctness_advantage_edge_loss,
 )
+from experiments.refinement_loss import refinement_regularization_loss
 
 _GRAPH_TF_RECORD_FILE = "mmlu_graph_tf_records.jsonl"
 
@@ -71,6 +72,8 @@ async def train(graph:Graph,
             edge_ig_discount_factor: float = 0.0,
             graph_advantage_epsilon: float = 1e-6,
             max_concurrent_graphs: int = 10,
+            anchor_reg_weight: float = 1.0,
+            sparsity_reg_weight: float = 1.0,
           ):
     
     def infinite_data_loader() -> Iterator[pd.DataFrame]:
@@ -140,9 +143,8 @@ async def train(graph:Graph,
                 realized_graph = copy.deepcopy(graph)
                 realized_graph.gcn = graph.gcn
                 realized_graph.mlp = graph.mlp
-                realized_graph.spatial_skip_projection = graph.spatial_skip_projection
-                realized_graph.spatial_embedding_norm = graph.spatial_embedding_norm
                 realized_graph.spatial_affinity_weight = graph.spatial_affinity_weight
+                realized_graph.refinement_weight = graph.refinement_weight
                 realized_graph.temporal_logits = graph.temporal_logits
                 group_indices.append(len(realized_graphs))
                 realized_graphs.append(realized_graph)
@@ -343,7 +345,13 @@ async def train(graph:Graph,
                 print(f"edge entropy rewards:{edge_rewards}")
 
             utility_loss = torch.mean(torch.stack(loss_list))
-        total_loss = utility_loss
+        reg_loss, anchor_loss, sparse_loss = refinement_regularization_loss(
+            realized_graphs,
+            utility_loss,
+            anchor_reg_weight=anchor_reg_weight,
+            sparsity_reg_weight=sparsity_reg_weight,
+        )
+        total_loss = utility_loss + reg_loss
         optimizer.zero_grad()
         if not total_loss.requires_grad:
             raise RuntimeError(
@@ -370,6 +378,8 @@ async def train(graph:Graph,
         if not use_multi_graph_reward:
             print("utilities:", utilities) # [0.0, 0.0, 0.0, 1.0]
         print("utility loss:", utility_loss.item())
+        print("anchor loss:", anchor_loss.item())
+        print("sparse loss:", sparse_loss.item())
         print("loss:", total_loss.item()) # 4.6237263679504395
         print(f"Cost {Cost.instance().value}")
         print(f"PromptTokens {PromptTokens.instance().value}")

@@ -57,9 +57,8 @@ async def evaluate(
             realized_graph = copy.deepcopy(graph)
             realized_graph.gcn = graph.gcn
             realized_graph.mlp = graph.mlp
-            realized_graph.spatial_skip_projection = graph.spatial_skip_projection
-            realized_graph.spatial_embedding_norm = graph.spatial_embedding_norm
             realized_graph.spatial_affinity_weight = graph.spatial_affinity_weight
+            realized_graph.refinement_weight = graph.refinement_weight
             realized_graphs.append(realized_graph)
             input_dict = dataset.record_to_input(record)
             # print(input_dict)

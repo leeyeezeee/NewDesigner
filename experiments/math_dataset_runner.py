@@ -27,6 +27,7 @@ from experiments.teacher_forcing_reward import (
     edge_information_gain_loss,
     graph_correctness_advantage_edge_loss,
 )
+from experiments.refinement_loss import refinement_regularization_loss
 
 
 AnswerParser = Callable[[str], str]
@@ -163,9 +164,8 @@ async def run_math_dataset(
                 realized_graph = copy.deepcopy(graph)
                 realized_graph.gcn = graph.gcn
                 realized_graph.mlp = graph.mlp
-                realized_graph.spatial_skip_projection = graph.spatial_skip_projection
-                realized_graph.spatial_embedding_norm = graph.spatial_embedding_norm
                 realized_graph.spatial_affinity_weight = graph.spatial_affinity_weight
+                realized_graph.refinement_weight = graph.refinement_weight
                 realized_graph.temporal_logits = graph.temporal_logits
                 group_indices.append(len(realized_graphs))
                 realized_graphs.append(realized_graph)
@@ -364,7 +364,13 @@ async def run_math_dataset(
                 loss_list.append(single_loss)
 
             utility_loss = torch.mean(torch.stack(loss_list))
-        total_loss = utility_loss
+        reg_loss, anchor_loss, sparse_loss = refinement_regularization_loss(
+            realized_graphs,
+            utility_loss,
+            anchor_reg_weight=getattr(args, "anchor_reg_weight", 1.0),
+            sparsity_reg_weight=getattr(args, "sparsity_reg_weight", 1.0),
+        )
+        total_loss = utility_loss + reg_loss
         if train_updates_enabled:
             optimizer.zero_grad()
             if not total_loss.requires_grad:
@@ -392,6 +398,8 @@ async def run_math_dataset(
         if not use_multi_graph_reward:
             print("utilities:", utilities)
         print("utility loss:", utility_loss.item())
+        print("anchor loss:", anchor_loss.item())
+        print("sparse loss:", sparse_loss.item())
         print("loss:", total_loss.item())
 
         if i_batch + 1 == args.num_iterations:

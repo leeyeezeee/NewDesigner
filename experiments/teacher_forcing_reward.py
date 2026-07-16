@@ -9,7 +9,6 @@ from GDesigner.utils.uncertainty import edge_key
 
 
 _DEFAULT_TF_EDGE_IG_REWARD_LAMBDA = 1.0
-_EDGE_REDUNDANCY_COST = 0.1
 
 
 def add_teacher_forcing_reward_args(parser) -> None:
@@ -81,6 +80,20 @@ def add_teacher_forcing_reward_args(parser) -> None:
         default=1e-6,
         help="Small constant used when normalizing graph advantages.",
     )
+    parser.add_argument(
+        "--anchor_reg_weight",
+        type=float,
+        default=1.0,
+        help="Weight for GDesigner refined-adjacency anchor regularization.",
+    )
+    parser.add_argument(
+        "--sparsity_reg_weight",
+        type=float,
+        default=1.0,
+        help="Weight for GDesigner refinement nuclear-norm regularization.",
+    )
+
+
 async def graph_teacher_forcing_score(
     scorer: FinalAnswerScorer,
     graph,
@@ -441,12 +454,11 @@ def graph_correctness_advantage_edge_loss(
     edge_ig_discount_factor: float = 0.0,
     advantage_epsilon: float = 1e-6,
 ) -> Tuple[torch.Tensor, List[Dict[str, Any]]]:
-    """Combine correctness and selected-edge IG minus a fixed edge cost."""
+    """Combine correctness advantages and selected-edge IG."""
     zero = reference_loss.new_tensor(0.0)
     group_losses: List[torch.Tensor] = []
     group_correctness_losses: List[torch.Tensor] = []
     group_edge_ig_losses: List[torch.Tensor] = []
-    group_redundancy_losses: List[torch.Tensor] = []
     summaries: List[Dict[str, Any]] = []
     edge_tanh_temperature = max(float(edge_tanh_temperature), 1e-6)
     edge_ig_reward_lambda = float(edge_ig_reward_lambda)
@@ -501,7 +513,6 @@ def graph_correctness_advantage_edge_loss(
         per_graph_losses: List[torch.Tensor] = []
         graph_reward_losses: List[torch.Tensor] = []
         graph_edge_ig_losses: List[torch.Tensor] = []
-        graph_redundancy_losses: List[torch.Tensor] = []
         graph_reward_loss_values: List[float] = []
         edge_ig_loss_values: List[float] = []
         edge_ig_coefficients: List[float] = []
@@ -527,27 +538,12 @@ def graph_correctness_advantage_edge_loss(
                 graph, edge_details, edge_ig_discount_factor
             )
             graph_edge_ig_terms: List[torch.Tensor] = []
-            graph_redundancy_terms: List[torch.Tensor] = []
             for edge_info in getattr(graph, "edge_log_probs", []):
                 sampled_edges += 1
                 log_prob = edge_info.get("log_prob")
                 if not torch.is_tensor(log_prob):
                     missing_log_prob += 1
                     continue
-                if (
-                    edge_ig_reward_lambda != 0.0
-                    and edge_info.get("type") == "spatial"
-                ):
-                    # Adding +lambda*c*log(p) is the policy-gradient term for
-                    # reward -c. Together with -lambda*r*log(p), the selected
-                    # edge is therefore trained with net reward lambda*(r-c).
-                    redundancy_coefficient = log_prob.new_tensor(
-                        edge_ig_reward_lambda * _EDGE_REDUNDANCY_COST
-                    )
-                    graph_redundancy_terms.append(
-                        redundancy_coefficient * log_prob
-                    )
-
                 detail = edge_details.get(edge_key(edge_info))
                 if detail is None:
                     missing_detail += 1
@@ -581,17 +577,10 @@ def graph_correctness_advantage_edge_loss(
                 if graph_edge_ig_terms
                 else zero
             )
-            redundancy_loss = (
-                torch.sum(torch.stack(graph_redundancy_terms))
-                if graph_redundancy_terms
-                else zero
-            )
-
-            per_graph_loss = graph_reward_loss + edge_ig_loss + redundancy_loss
+            per_graph_loss = graph_reward_loss + edge_ig_loss
             per_graph_losses.append(per_graph_loss)
             graph_reward_losses.append(graph_reward_loss)
             graph_edge_ig_losses.append(edge_ig_loss)
-            graph_redundancy_losses.append(redundancy_loss)
             graph_reward_loss_values.append(
                 float(graph_reward_loss.detach().cpu().item())
             )
@@ -612,11 +601,6 @@ def graph_correctness_advantage_edge_loss(
         group_edge_ig_losses.append(
             torch.mean(torch.stack(graph_edge_ig_losses))
             if graph_edge_ig_losses
-            else zero
-        )
-        group_redundancy_losses.append(
-            torch.mean(torch.stack(graph_redundancy_losses))
-            if graph_redundancy_losses
             else zero
         )
         group_losses.append(group_total_loss)
@@ -658,7 +642,6 @@ def graph_correctness_advantage_edge_loss(
                 if edge_ig_loss_values
                 else 0.0
             ),
-            "edge_redundancy_cost": _EDGE_REDUNDANCY_COST,
         })
 
     if not group_losses:
@@ -675,7 +658,6 @@ def graph_correctness_advantage_edge_loss(
     ]
     correctness_objective = torch.mean(torch.stack(group_correctness_losses))
     edge_ig_objective = torch.mean(torch.stack(group_edge_ig_losses))
-    redundancy_objective = torch.mean(torch.stack(group_redundancy_losses))
     trainable_parameters = _unique_trainable_graph_parameters(graph_groups)
     correctness_gradient_norm = _loss_gradient_l2_norm(
         correctness_objective,
@@ -685,15 +667,10 @@ def graph_correctness_advantage_edge_loss(
         edge_ig_objective,
         trainable_parameters,
     )
-    redundancy_gradient_norm = _loss_gradient_l2_norm(
-        redundancy_objective,
-        trainable_parameters,
-    )
     print(
         "graph gradient norms: "
         f"correctness={correctness_gradient_norm:.6f}, "
         f"edge_ig={edge_ig_gradient_norm:.6f}, "
-        f"redundancy={redundancy_gradient_norm:.6f}, "
         f"avg_edges={sum(edge_counts) / len(edge_counts) if edge_counts else 0.0:.2f}, "
         f"mean_edge_probability={sum(edge_probabilities) / len(edge_probabilities) if edge_probabilities else 0.0:.6f}"
     )

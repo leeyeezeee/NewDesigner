@@ -136,7 +136,9 @@ async def main():
                     edge_ig_reward_lambda=args.edge_ig_reward_lambda,
                     edge_ig_discount_factor=args.edge_ig_discount_factor,
                     graph_advantage_epsilon=args.graph_advantage_epsilon,
-                    max_concurrent_graphs=args.max_concurrent_graphs)
+                    max_concurrent_graphs=args.max_concurrent_graphs,
+                    anchor_reg_weight=args.anchor_reg_weight,
+                    sparsity_reg_weight=args.sparsity_reg_weight)
         save_graph_checkpoint(
             graph,
             args.checkpoint_file,
