@@ -4,13 +4,19 @@ import math
 from typing import Any, Awaitable, Callable, Dict, List, Optional, TypeVar, Union
 from tenacity import (
     retry,
-    retry_if_exception_type,
+    retry_if_exception,
     stop_after_attempt,
     wait_random_exponential,
 )
 from dotenv import load_dotenv
 import os
-from openai import APIConnectionError, APITimeoutError, AsyncOpenAI, OpenAI
+from openai import (
+    APIConnectionError,
+    APITimeoutError,
+    AsyncOpenAI,
+    NotFoundError,
+    OpenAI,
+)
 
 from GDesigner.llm.format import Message
 from GDesigner.llm.price import cost_count
@@ -158,21 +164,28 @@ def _get_async_openai_client(base_url: str) -> AsyncOpenAI:
     return client
 
 
+def _should_retry_openai_request(exception: BaseException) -> bool:
+    return isinstance(
+        exception,
+        (APIConnectionError, APITimeoutError, NotFoundError),
+    )
+
+
 @retry(
     wait=wait_random_exponential(multiplier=1, max=_NETWORK_RETRY_MAX_WAIT_SECONDS),
     stop=stop_after_attempt(_NETWORK_RETRY_ATTEMPTS),
-    retry=retry_if_exception_type((APIConnectionError, APITimeoutError)),
+    retry=retry_if_exception(_should_retry_openai_request),
     reraise=True,
 )
 async def _async_openai_request(operation: Callable[[], Awaitable[_T]]) -> _T:
-    """Retry only transient transport failures, never response validation errors."""
+    """Retry transport failures, timeouts, and HTTP 404 responses."""
     return await operation()
 
 
 @retry(
     wait=wait_random_exponential(multiplier=1, max=_NETWORK_RETRY_MAX_WAIT_SECONDS),
     stop=stop_after_attempt(_NETWORK_RETRY_ATTEMPTS),
-    retry=retry_if_exception_type((APIConnectionError, APITimeoutError)),
+    retry=retry_if_exception(_should_retry_openai_request),
     reraise=True,
 )
 def _sync_openai_request(operation: Callable[[], _T]) -> _T:
