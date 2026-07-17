@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 import platform
+import re
 from datetime import datetime
 from pathlib import Path
 import sys
@@ -15,10 +16,36 @@ from typing import Awaitable, Callable, TypeVar
 T = TypeVar("T")
 
 
+def _argument_value(name: str) -> str | None:
+    prefix = f"{name}="
+    for index, argument in enumerate(sys.argv[1:]):
+        if argument.startswith(prefix):
+            return argument[len(prefix):]
+        if argument == name and index + 2 < len(sys.argv):
+            return sys.argv[index + 2]
+    return None
+
+
+def _dataset_name() -> str:
+    """Resolve a stable dataset name for the current experiment entry point."""
+    explicit_name = _argument_value("--dataset") or _argument_value("--domain")
+    if explicit_name:
+        dataset_name = explicit_name
+    else:
+        dataset_name = Path(sys.argv[0]).stem or "experiment"
+        for prefix in ("run_", "train_", "evaluate_"):
+            if dataset_name.startswith(prefix):
+                dataset_name = dataset_name[len(prefix):]
+                break
+
+    safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", dataset_name).strip("._-")
+    return safe_name.lower() or "experiment"
+
+
 def _write_crash_log(exc: BaseException) -> Path:
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    script_name = Path(sys.argv[0]).stem or "experiment"
-    log_path = Path.cwd() / f"crash_{script_name}_{timestamp}_{os.getpid()}.log"
+    # A later failure for the same dataset intentionally replaces the previous
+    # one so the working directory contains only the latest relevant traceback.
+    log_path = Path.cwd() / f"{_dataset_name()}_error.log"
     traceback_text = "".join(
         traceback.format_exception(type(exc), exc, exc.__traceback__)
     )
