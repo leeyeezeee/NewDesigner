@@ -37,6 +37,12 @@ from experiments.teacher_forcing_reward import (
     graph_correctness_advantage_edge_loss,
 )
 from experiments.refinement_loss import refinement_regularization_loss
+from experiments.edge_training_log import (
+    append_edge_training_details,
+    reset_edge_training_log,
+    resolve_edge_training_log_file,
+    resolve_question_id,
+)
 
 def dataloader(data_list, batch_size, i_batch):
     return data_list[i_batch*batch_size:i_batch*batch_size + batch_size]
@@ -131,6 +137,8 @@ async def main():
                   **kwargs)
     graph.gcn.train()
     graph.mlp.train()
+    edge_training_log_file = resolve_edge_training_log_file("gsm8k")
+    reset_edge_training_log(edge_training_log_file)
     optimizer_params = (
         list(graph.gcn.parameters())
         + list(graph.mlp.parameters())
@@ -157,6 +165,7 @@ async def main():
         and (
             args.use_edge_selector
             or edge_ig_reward_lambda != 0.0
+            or bool(edge_training_log_file)
         )
     )
     semantic_judge = None
@@ -170,7 +179,11 @@ async def main():
         selector_optimizer = torch.optim.Adam(edge_selector.parameters(), lr=1e-3)
     tf_scorer = (
         FinalAnswerScorer()
-        if (args.use_edge_selector or edge_ig_reward_lambda != 0.0)
+        if (
+            args.use_edge_selector
+            or edge_ig_reward_lambda != 0.0
+            or bool(edge_training_log_file)
+        )
         else None
     )
     graph_semaphore = make_graph_semaphore(args.max_concurrent_graphs)
@@ -192,6 +205,7 @@ async def main():
         realized_graphs = []
         input_dicts = []
         record_input_dicts = []
+        question_ids = []
         sample_groups = []
 
         current_batch = dataloader(dataset,args.batch_size,i_batch)
@@ -200,6 +214,9 @@ async def main():
             break
 
         for i_record, record in enumerate(current_batch):
+            question_ids.append(resolve_question_id(
+                record, i_batch * args.batch_size + i_record
+            ))
             task = record["task"]
             answer = record["answer"]
             answers.append(answer)
@@ -246,11 +263,12 @@ async def main():
             edge_detail_groups = []
             graph_tf_corrects: List[float] = []
             graph_tf_edge_counts: List[float] = []
-            for record, true_answer, group_indices, input_dict in zip(
+            for record, true_answer, group_indices, input_dict, question_id in zip(
                 current_batch,
                 answers,
                 sample_groups,
                 record_input_dicts,
+                question_ids,
             ):
                 target_spec = make_target_spec("gsm8k", true_answer)
                 graph_group = []
@@ -272,6 +290,7 @@ async def main():
                         and (
                             edge_ig_reward_lambda != 0.0
                             or selector_buffer is not None
+                            or bool(edge_training_log_file)
                         )
                     )
                     if needs_edge_details:
@@ -287,9 +306,15 @@ async def main():
                             target_spec=target_spec,
                             ig_scorer=tf_scorer,
                             compute_rewards=False,
+                            edge_token_cost_beta=args.edge_token_cost_beta,
                         )
                     else:
                         edge_details = {}
+                    append_edge_training_details(
+                        edge_training_log_file,
+                        question_id=question_id,
+                        edge_details=edge_details,
+                    )
                     if selector_buffer is not None:
                         selector_buffer.add_many(build_edge_selector_examples(
                             realized_graph,
@@ -349,7 +374,7 @@ async def main():
                     f"num_graphs={len(graph_tf_corrects)}"
                 )
         else:
-            for task, answer, log_prob, true_answer, realized_graph, input_dict in zip(current_batch, raw_answers, log_probs, answers, realized_graphs, input_dicts):
+            for graph_idx, (task, answer, log_prob, true_answer, realized_graph, input_dict, question_id) in enumerate(zip(current_batch, raw_answers, log_probs, answers, realized_graphs, input_dicts, question_ids)):
                 predict_answer = gsm_get_predict(answer[0])
                 is_solved = float(predict_answer)==float(true_answer)
                 total_solved = total_solved + is_solved
@@ -362,7 +387,11 @@ async def main():
                 edge_details = {}
                 if (
                     use_semantic_edges
-                    and (is_solved or edge_ig_reward_lambda != 0.0)
+                    and (
+                        is_solved
+                        or edge_ig_reward_lambda != 0.0
+                        or bool(edge_training_log_file)
+                    )
                     and bool(realized_graph.edge_log_probs)
                 ):
                     edge_rewards, edge_details = await edge_entropy_rewards(
@@ -376,6 +405,7 @@ async def main():
                         kle_heat_t=getattr(args, "kle_heat_t", 0.3),
                         target_spec=make_target_spec("gsm8k", true_answer),
                         ig_scorer=tf_scorer,
+                        edge_token_cost_beta=args.edge_token_cost_beta,
                     )
                     if selector_buffer is not None and is_solved:
                         selector_buffer.add_many(build_edge_selector_examples(
@@ -384,6 +414,11 @@ async def main():
                             edge_details,
                             args.selector_ig_tau,
                         ))
+                append_edge_training_details(
+                    edge_training_log_file,
+                    question_id=question_id,
+                    edge_details=edge_details,
+                )
                 realized_graph.clear_execution_history()
                 utility = {
                     "correctness": is_solved,

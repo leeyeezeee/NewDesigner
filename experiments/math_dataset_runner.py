@@ -28,6 +28,12 @@ from experiments.teacher_forcing_reward import (
     graph_correctness_advantage_edge_loss,
 )
 from experiments.refinement_loss import refinement_regularization_loss
+from experiments.edge_training_log import (
+    append_edge_training_details,
+    reset_edge_training_log,
+    resolve_edge_training_log_file,
+    resolve_question_id,
+)
 
 
 AnswerParser = Callable[[str], str]
@@ -80,6 +86,10 @@ async def run_math_dataset(
     )
     graph.gcn.train()
     graph.mlp.train()
+    edge_training_log_file = resolve_edge_training_log_file(
+        dataset_name,
+    )
+    reset_edge_training_log(edge_training_log_file)
     optimizer_params = (
         list(graph.gcn.parameters())
         + list(graph.mlp.parameters())
@@ -107,6 +117,7 @@ async def run_math_dataset(
         and (
             args.use_edge_selector
             or edge_ig_reward_lambda != 0.0
+            or bool(edge_training_log_file)
         )
     )
     semantic_judge = None
@@ -120,7 +131,11 @@ async def run_math_dataset(
         selector_optimizer = torch.optim.Adam(edge_selector.parameters(), lr=1e-3)
     tf_scorer = (
         FinalAnswerScorer()
-        if (args.use_edge_selector or edge_ig_reward_lambda != 0.0)
+        if (
+            args.use_edge_selector
+            or edge_ig_reward_lambda != 0.0
+            or bool(edge_training_log_file)
+        )
         else None
     )
     graph_semaphore = make_graph_semaphore(getattr(args, "max_concurrent_graphs", 10))
@@ -142,6 +157,7 @@ async def run_math_dataset(
         realized_graphs = []
         input_dicts = []
         record_input_dicts = []
+        question_ids = []
         sample_groups = []
 
         current_batch = dataloader(dataset, args.batch_size, i_batch)
@@ -149,7 +165,10 @@ async def run_math_dataset(
             print("No more data available.")
             break
 
-        for record in current_batch:
+        for i_record, record in enumerate(current_batch):
+            question_ids.append(resolve_question_id(
+                record, i_batch * args.batch_size + i_record
+            ))
             task = record["task"]
             answers.append(record["answer"])
             input_dict = {"task": task}
@@ -198,11 +217,12 @@ async def run_math_dataset(
             edge_detail_groups = []
             graph_tf_corrects: List[float] = []
             graph_tf_edge_counts: List[float] = []
-            for record, true_answer, group_indices, input_dict in zip(
+            for record, true_answer, group_indices, input_dict, question_id in zip(
                 current_batch,
                 answers,
                 sample_groups,
                 record_input_dicts,
+                question_ids,
             ):
                 target_spec = make_target_spec(dataset_name, true_answer)
                 graph_group = []
@@ -222,6 +242,7 @@ async def run_math_dataset(
                         and (
                             edge_ig_reward_lambda != 0.0
                             or selector_buffer is not None
+                            or bool(edge_training_log_file)
                         )
                     )
                     if needs_edge_details:
@@ -237,9 +258,15 @@ async def run_math_dataset(
                             target_spec=target_spec,
                             ig_scorer=tf_scorer,
                             compute_rewards=False,
+                            edge_token_cost_beta=args.edge_token_cost_beta,
                         )
                     else:
                         edge_details = {}
+                    append_edge_training_details(
+                        edge_training_log_file,
+                        question_id=question_id,
+                        edge_details=edge_details,
+                    )
                     if selector_buffer is not None:
                         selector_buffer.add_many(build_edge_selector_examples(
                             realized_graph,
@@ -299,14 +326,15 @@ async def run_math_dataset(
                     f"num_graphs={len(graph_tf_corrects)}"
                 )
         else:
-            for record, answer, log_prob, true_answer, realized_graph, input_dict in zip(
+            for graph_idx, (record, answer, log_prob, true_answer, realized_graph, input_dict, question_id) in enumerate(zip(
                 current_batch,
                 raw_answers,
                 log_probs,
                 answers,
                 realized_graphs,
                 input_dicts,
-            ):
+                question_ids,
+            )):
                 predict_answer = answer_parser(answer[0])
                 is_solved = correctness_fn(predict_answer, true_answer)
                 correctness_reward = float(is_solved)
@@ -321,7 +349,11 @@ async def run_math_dataset(
                 edge_details = {}
                 if (
                     use_semantic_edges
-                    and (is_solved or edge_ig_reward_lambda != 0.0)
+                    and (
+                        is_solved
+                        or edge_ig_reward_lambda != 0.0
+                        or bool(edge_training_log_file)
+                    )
                     and bool(realized_graph.edge_log_probs)
                 ):
                     edge_rewards, edge_details = await edge_entropy_rewards(
@@ -335,6 +367,7 @@ async def run_math_dataset(
                         kle_heat_t=getattr(args, "kle_heat_t", 0.3),
                         target_spec=make_target_spec(dataset_name, true_answer),
                         ig_scorer=tf_scorer,
+                        edge_token_cost_beta=args.edge_token_cost_beta,
                     )
                     if selector_buffer is not None and is_solved:
                         selector_buffer.add_many(build_edge_selector_examples(
@@ -343,6 +376,11 @@ async def run_math_dataset(
                             edge_details,
                             getattr(args, "selector_ig_tau", 0.0),
                         ))
+                append_edge_training_details(
+                    edge_training_log_file,
+                    question_id=question_id,
+                    edge_details=edge_details,
+                )
                 realized_graph.clear_execution_history()
                 utility = {
                     "correctness": correctness_reward,

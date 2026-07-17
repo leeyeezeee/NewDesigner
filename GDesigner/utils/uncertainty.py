@@ -16,6 +16,7 @@ from tenacity import (
 )
 
 from GDesigner.utils.ig_scorer import FinalAnswerScorer, TargetSpec
+from GDesigner.llm.price import cal_token
 
 
 T = TypeVar("T")
@@ -452,6 +453,58 @@ def _require_nonblank_edge_outputs(
     )
 
 
+def _realized_spatial_edge_occurrences(
+    graph,
+    histories: Dict[Tuple[str, int], Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Return spatial edges actually sampled and transmitted in each round."""
+    occurrences: List[Dict[str, Any]] = []
+    for edge_info in getattr(graph, "edge_log_probs", []):
+        if edge_info.get("type") != "spatial":
+            continue
+        history_item = histories.get(
+            (edge_info.get("target"), edge_info.get("round"))
+        )
+        if history_item is None:
+            continue
+        if edge_info.get("source") not in history_item.get("spatial_info", {}):
+            continue
+        occurrences.append(edge_info)
+    return occurrences
+
+
+def _edge_message_token_costs(
+    graph,
+    histories: Dict[Tuple[str, int], Dict[str, Any]],
+) -> Tuple[Dict[str, int], Dict[int, int]]:
+    """Count realized spatial-edge tokens and totals separately per round."""
+    occurrence_token_counts: Dict[str, int] = {}
+    round_total_edge_tokens: Dict[int, int] = {}
+    model_name = str(getattr(graph, "llm_name", ""))
+    for edge_info in _realized_spatial_edge_occurrences(graph, histories):
+        key = edge_key(edge_info)
+        history_item = histories.get(
+            (edge_info.get("target"), edge_info.get("round"))
+        )
+        if history_item is None:
+            occurrence_token_counts[key] = 0
+            continue
+        source_info = history_item.get("spatial_info", {}).get(
+            edge_info.get("source")
+        )
+        if source_info is None:
+            occurrence_token_counts[key] = 0
+            continue
+        message_text = str(source_info.get("output", ""))
+        token_count = cal_token(model_name, message_text)
+        occurrence_token_counts[key] = token_count
+        round_idx = int(edge_info.get("round", 0))
+        round_total_edge_tokens[round_idx] = (
+            round_total_edge_tokens.get(round_idx, 0) + token_count
+        )
+    return occurrence_token_counts, round_total_edge_tokens
+
+
 def _current_graph_output_info(graph) -> Dict[str, Dict[str, Any]]:
     output_info: Dict[str, Dict[str, Any]] = {}
     for node_id, node in graph.nodes.items():
@@ -534,8 +587,15 @@ async def edge_entropy_rewards(
     target_spec: Optional[TargetSpec] = None,
     ig_scorer: Optional[FinalAnswerScorer] = None,
     compute_rewards: bool = True,
+    edge_token_cost_beta: float = 0.0,
 ) -> Tuple[Dict[str, float], Dict[str, Dict[str, Any]]]:
-    """Measure each selected edge by removing it and scoring receiver outputs."""
+    """Score each round's independently sampled spatial edges."""
+    edge_token_cost_beta = float(edge_token_cost_beta)
+    if edge_token_cost_beta < 0.0:
+        raise ValueError(
+            "edge_token_cost_beta must be non-negative, "
+            f"got {edge_token_cost_beta}."
+        )
     if not graph.edge_log_probs:
         return {}, {}
     histories: Dict[Tuple[str, int], Dict[str, Any]] = {}
@@ -543,16 +603,22 @@ async def edge_entropy_rewards(
         for history_item in node.execution_history:
             histories[(node_id, history_item["round"])] = history_item
 
+    edge_token_counts, round_total_edge_tokens = _edge_message_token_costs(
+        graph, histories
+    )
+
     details: Dict[str, Dict[str, Any]] = {}
     after_cache: Dict[Tuple[str, int], Tuple[float, Dict[str, Any]]] = {}
     after_outputs_cache: Dict[Tuple[str, int], List[Any]] = {}
     after_score_cache: Dict[Tuple[str, int], Any] = {}
     scorer = ig_scorer or (FinalAnswerScorer() if target_spec is not None else None)
-    for edge_info in graph.edge_log_probs:
+    for edge_info in _realized_spatial_edge_occurrences(graph, histories):
         target_id = edge_info["target"]
         source_id = edge_info["source"]
         round_idx = edge_info["round"]
         edge_type = edge_info["type"]
+        if edge_type != "spatial":
+            continue
         key = edge_key(edge_info)
         history_item = histories.get((target_id, round_idx))
         target_node = graph.nodes.get(target_id)
@@ -567,20 +633,11 @@ async def edge_entropy_rewards(
             node_id: dict(info)
             for node_id, info in history_item.get("temporal_info", {}).items()
         }
-        if edge_type == "spatial":
-            if source_id not in spatial_info:
-                continue
-            before_spatial_info = dict(spatial_info)
-            before_temporal_info = temporal_info
-            before_spatial_info.pop(source_id, None)
-        elif edge_type == "temporal":
-            if source_id not in temporal_info:
-                continue
-            before_spatial_info = spatial_info
-            before_temporal_info = dict(temporal_info)
-            before_temporal_info.pop(source_id, None)
-        else:
+        if source_id not in spatial_info:
             continue
+        before_spatial_info = dict(spatial_info)
+        before_temporal_info = temporal_info
+        before_spatial_info.pop(source_id, None)
 
         try:
             before_outputs = await _sample_node_outputs(
@@ -742,6 +799,15 @@ async def edge_entropy_rewards(
             before_answer_score = before_score.score
             after_answer_score = after_score.score
             ig_gain = after_answer_score - before_answer_score
+        graph_total_edge_tokens = round_total_edge_tokens.get(
+            int(round_idx), 0
+        )
+        edge_token_cost = (
+            float(edge_token_counts.get(key, 0))
+            / float(graph_total_edge_tokens)
+            if graph_total_edge_tokens > 0
+            else 0.0
+        )
         details[key] = {
             "type": edge_type,
             "round": round_idx,
@@ -759,9 +825,22 @@ async def edge_entropy_rewards(
             "reward": 0.0,
             "before_uncertainty_details": before_uncertainty_details,
             "after_uncertainty_details": after_uncertainty_details,
+            "edge_token_count": int(edge_token_counts.get(key, 0)),
+            "graph_total_edge_tokens": int(graph_total_edge_tokens),
+            "edge_token_cost": edge_token_cost,
+            "round_edge_token_cost": edge_token_cost,
+            "edge_token_cost_beta": edge_token_cost_beta,
+            "token_cost_scope": "realized_spatial_edges_same_round",
+            "token_count_method": "message_output_tiktoken_model_or_cl100k_fallback",
         }
         if ig_gain is not None:
-            details[key]["ig_gain"] = float(ig_gain)
+            raw_ig_gain = float(ig_gain)
+            effective_ig_gain = (
+                raw_ig_gain - edge_token_cost_beta * edge_token_cost
+            )
+            details[key]["raw_ig_gain"] = raw_ig_gain
+            details[key]["round_ig_gain"] = effective_ig_gain
+            details[key]["ig_gain"] = effective_ig_gain
             details[key]["before_answer_score"] = float(before_answer_score)
             details[key]["after_answer_score"] = float(after_answer_score)
             if target_spec.mode != "execution":

@@ -781,7 +781,9 @@ class Graph(ABC):
                 track_grad=track_grad,
             )
             log_probs += self.construct_temporal_connection(round, track_grad=track_grad)
-            self.apply_edge_selector(input.get("task", str(input)), edge_selector, round)
+            self.apply_edge_selector(
+                input.get("task", str(input)), edge_selector, round
+            )
             self.realized_spatial_edge_counts.append(self.num_edges)
             self.realized_edge_counts.append(self.communication_edge_count)
             

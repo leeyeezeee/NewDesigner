@@ -28,6 +28,12 @@ from experiments.teacher_forcing_reward import (
     graph_correctness_advantage_edge_loss,
 )
 from experiments.refinement_loss import refinement_regularization_loss
+from experiments.edge_training_log import (
+    append_edge_training_details,
+    reset_edge_training_log,
+    resolve_edge_training_log_file,
+    resolve_question_id,
+)
 
 _GRAPH_TF_RECORD_FILE = "mmlu_graph_tf_records.jsonl"
 
@@ -70,6 +76,7 @@ async def train(graph:Graph,
             edge_tanh_temperature: float = 1.0,
             edge_ig_reward_lambda: float = None,
             edge_ig_discount_factor: float = 0.0,
+            edge_token_cost_beta: float = 0.0,
             graph_advantage_epsilon: float = 1e-6,
             max_concurrent_graphs: int = 10,
             anchor_reg_weight: float = 1.0,
@@ -91,9 +98,13 @@ async def train(graph:Graph,
         else float(edge_ig_reward_lambda)
     )
     use_multi_graph_reward = use_graph_tf_reward or use_graph_correctness_advantage
+    record_edge_training = True
+    edge_training_log_path = resolve_edge_training_log_file("mmlu")
+    reset_edge_training_log(edge_training_log_path)
     use_semantic_edges = (
         use_edge_selector
         or resolved_edge_ig_reward_lambda != 0.0
+        or record_edge_training
     )
     batch_entropy_samples = 1
     semantic_judge = None
@@ -107,7 +118,11 @@ async def train(graph:Graph,
         selector_optimizer = torch.optim.Adam(edge_selector.parameters(), lr=1e-3)
     tf_scorer = (
         FinalAnswerScorer()
-        if (use_edge_selector or resolved_edge_ig_reward_lambda != 0.0)
+        if (
+            use_edge_selector
+            or resolved_edge_ig_reward_lambda != 0.0
+            or record_edge_training
+        )
         else None
     )
     if use_multi_graph_reward:
@@ -132,9 +147,13 @@ async def train(graph:Graph,
         realized_graphs = []
         input_dicts = []
         record_input_dicts = []
+        question_ids = []
         sample_groups = []
 
         for i_record, record in zip(range(batch_size), loader):
+            question_ids.append(resolve_question_id(
+                record, i_iter * batch_size + i_record
+            ))
             input_dict = dataset.record_to_input(record)
             record_input_dicts.append(input_dict)
             group_indices = []
@@ -177,10 +196,11 @@ async def train(graph:Graph,
             graph_log_prob_groups = []
             correctness_groups = []
             edge_detail_groups = []
-            for record_idx, (correct_answer, group_indices, input_dict) in enumerate(zip(
+            for record_idx, (correct_answer, group_indices, input_dict, question_id) in enumerate(zip(
                 correct_answers,
                 sample_groups,
                 record_input_dicts,
+                question_ids,
             )):
                 assert isinstance(correct_answer, str), \
                         f"String expected but got {correct_answer} of type {type(correct_answer)} (1)"
@@ -202,6 +222,7 @@ async def train(graph:Graph,
                         and (
                             resolved_edge_ig_reward_lambda != 0.0
                             or selector_buffer is not None
+                            or record_edge_training
                         )
                     )
                     if needs_edge_details:
@@ -217,9 +238,16 @@ async def train(graph:Graph,
                             target_spec=target_spec,
                             ig_scorer=tf_scorer,
                             compute_rewards=False,
+                            edge_token_cost_beta=edge_token_cost_beta,
                         )
                     else:
                         edge_details = {}
+                    if edge_training_log_path is not None:
+                        append_edge_training_details(
+                            edge_training_log_path,
+                            question_id=question_id,
+                            edge_details=edge_details,
+                        )
                     if selector_buffer is not None:
                         selector_buffer.add_many(build_edge_selector_examples(
                             realized_graph,
@@ -288,7 +316,7 @@ async def train(graph:Graph,
                     f"num_graphs={graph_tf_summary['num_graphs']}"
                 )
         else:
-            for raw_answer, log_prob, correct_answer, realized_graph, input_dict in zip(raw_answers, log_probs, correct_answers, realized_graphs, input_dicts):
+            for graph_idx, (raw_answer, log_prob, correct_answer, realized_graph, input_dict, question_id) in enumerate(zip(raw_answers, log_probs, correct_answers, realized_graphs, input_dicts, question_ids)):
                 answer = dataset.postprocess_answer(raw_answer)
                 answers.append(answer)
                 assert isinstance(correct_answer, str), \
@@ -300,7 +328,11 @@ async def train(graph:Graph,
                 edge_details = {}
                 if (
                     use_semantic_edges
-                    and (correctness_reward > 0 or resolved_edge_ig_reward_lambda != 0.0)
+                    and (
+                        correctness_reward > 0
+                        or resolved_edge_ig_reward_lambda != 0.0
+                        or record_edge_training
+                    )
                     and bool(realized_graph.edge_log_probs)
                 ):
                     edge_rewards, edge_details = await edge_entropy_rewards(
@@ -314,6 +346,7 @@ async def train(graph:Graph,
                         kle_heat_t=kle_heat_t,
                         target_spec=make_target_spec("mmlu", correct_answer),
                         ig_scorer=tf_scorer,
+                        edge_token_cost_beta=edge_token_cost_beta,
                     )
                     if selector_buffer is not None and correctness_reward > 0:
                         selector_buffer.add_many(build_edge_selector_examples(
@@ -322,6 +355,12 @@ async def train(graph:Graph,
                             edge_details,
                             selector_ig_tau,
                         ))
+                if edge_training_log_path is not None:
+                    append_edge_training_details(
+                        edge_training_log_path,
+                        question_id=question_id,
+                        edge_details=edge_details,
+                    )
                 realized_graph.clear_execution_history()
                 utility = {
                     "correctness": correctness_reward,

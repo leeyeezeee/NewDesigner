@@ -135,6 +135,7 @@ async def main():
                     edge_tanh_temperature=args.edge_tanh_temperature,
                     edge_ig_reward_lambda=args.edge_ig_reward_lambda,
                     edge_ig_discount_factor=args.edge_ig_discount_factor,
+                    edge_token_cost_beta=args.edge_token_cost_beta,
                     graph_advantage_epsilon=args.graph_advantage_epsilon,
                     max_concurrent_graphs=args.max_concurrent_graphs,
                     anchor_reg_weight=args.anchor_reg_weight,

@@ -70,8 +70,8 @@ def add_teacher_forcing_reward_args(parser) -> None:
         default=0.0,
         help=(
             "Discount factor for propagating downstream edge IG rewards within "
-            "each realized spatial DAG round. Rewards reset between rounds; 0.0 "
-            "exactly preserves immediate-only IG."
+            "each independently sampled spatial DAG round. Propagation does "
+            "not cross rounds; 0.0 keeps only each round's immediate IG."
         ),
     )
     parser.add_argument(
@@ -91,6 +91,15 @@ def add_teacher_forcing_reward_args(parser) -> None:
         type=float,
         default=1.0,
         help="Weight for GDesigner refinement nuclear-norm regularization.",
+    )
+    parser.add_argument(
+        "--edge_token_cost_beta",
+        type=float,
+        default=0.0,
+        help=(
+            "Non-negative token information-bottleneck weight. Effective "
+            "edge IG is raw_ig_gain - beta * edge_token_cost; 0 disables it."
+        ),
     )
 
 
@@ -160,6 +169,10 @@ def _edge_ig_record(
     coefficient_value = float(coefficient.detach().cpu().item())
     return {
         "edge_key": edge_key(edge_info),
+        "type": edge_info.get("type"),
+        "round": edge_info.get("round"),
+        "source": edge_info.get("source"),
+        "target": edge_info.get("target"),
         "before_score": detail.get(
             "before_teacher_logprob", detail.get("before_answer_score")
         ),
@@ -171,6 +184,15 @@ def _edge_ig_record(
         "log_prob": log_prob_value,
         "ig_coefficient": coefficient_value,
         "ig_loss_term": -(coefficient_value * log_prob_value),
+        "edge_token_count": int(detail.get("edge_token_count", 0)),
+        "graph_total_edge_tokens": int(
+            detail.get("graph_total_edge_tokens", 0)
+        ),
+        "edge_token_cost": float(detail.get("edge_token_cost", 0.0)),
+        "edge_token_cost_beta": float(
+            detail.get("edge_token_cost_beta", 0.0)
+        ),
+        "raw_ig_gain": float(detail.get("raw_ig_gain", detail["ig_gain"])),
     }
 
 
@@ -179,12 +201,11 @@ def discounted_edge_ig_gains(
     edge_details: Dict[str, Dict[str, Any]],
     discount_factor: float,
 ) -> Dict[str, float]:
-    """Propagate immediate IG within each realized spatial DAG round.
+    """Propagate immediate IG within each independently sampled spatial round.
 
-    Rewards reset between rounds. Temporal edges never carry downstream credit,
-    because temporal topology is not part of the optimized spatial policy. At a
-    spatial branch, downstream returns are averaged uniformly, preventing an
-    artificial preference for high-outdegree nodes.
+    Downstream propagation resets between rounds. Temporal edges never carry
+    downstream credit. At a spatial branch, downstream returns are averaged
+    uniformly, preventing an artificial preference for high-outdegree nodes.
     """
     gamma = float(discount_factor)
     if not 0.0 <= gamma <= 1.0:
