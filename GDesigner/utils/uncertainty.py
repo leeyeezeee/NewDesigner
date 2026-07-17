@@ -16,6 +16,7 @@ from tenacity import (
 )
 
 from GDesigner.utils.ig_scorer import FinalAnswerScorer, TargetSpec
+from GDesigner.llm.gpt_chat import EmptyChatCompletionError
 from GDesigner.llm.price import cal_token
 
 
@@ -639,6 +640,7 @@ async def edge_entropy_rewards(
         before_temporal_info = temporal_info
         before_spatial_info.pop(source_id, None)
 
+        before_response_empty = False
         try:
             before_outputs = await _sample_node_outputs(
                 target_node,
@@ -646,20 +648,22 @@ async def edge_entropy_rewards(
                 before_spatial_info,
                 before_temporal_info,
             )
+        except EmptyChatCompletionError:
+            # An ablated role may legitimately have no message to produce once
+            # its selected predecessor is removed.  Preserve that counterfactual
+            # silence instead of retrying or assigning the edge a zero reward.
+            before_outputs = []
+            before_response_empty = True
         except Exception as exc:
             raise RuntimeError(
                 "Edge IG counterfactual generation failed. "
                 f"edge_key={key!r}, round={round_idx}, source={source_id!r}, "
                 f"target={target_id!r}, phase='before'"
             ) from exc
-        before_outputs = _require_nonblank_edge_outputs(
-            before_outputs,
-            key=key,
-            round_idx=round_idx,
-            source_id=source_id,
-            target_id=target_id,
-            phase="before",
-        )
+        before_outputs = [
+            output for output in before_outputs if str(output).strip()
+        ]
+        before_response_empty = before_response_empty or not before_outputs
 
         after_cache_key = (target_id, round_idx)
         if after_cache_key in after_outputs_cache:
@@ -682,6 +686,7 @@ async def edge_entropy_rewards(
                 "method": "direct_final_answer_gain",
                 "outputs": list(before_outputs),
                 "labels": None,
+                "counterfactual_silence": before_response_empty,
             }
             after_uncertainty_details = {
                 "method": "direct_final_answer_gain",
@@ -720,24 +725,42 @@ async def edge_entropy_rewards(
                     target_spec,
                 )
             elif target_is_final:
-                before_score_task = scorer.score_outputs(
-                    target_node,
-                    input_data,
-                    before_outputs,
-                    target_spec,
-                    cluster_labels=None,
-                )
+                if before_response_empty:
+                    before_score_task = scorer.final_agent_execution_score(
+                        target_node,
+                        input_data,
+                        [],
+                        target_spec,
+                        cluster_labels=None,
+                    )
+                else:
+                    before_score_task = scorer.score_outputs(
+                        target_node,
+                        input_data,
+                        before_outputs,
+                        target_spec,
+                        cluster_labels=None,
+                    )
             elif target_spec.mode != "execution":
-                before_score_task = scorer.final_agent_teacher_answer_logprob(
-                    graph.decision_node,
-                    input_data,
-                    before_outputs,
-                    target_spec,
-                    cluster_labels=None,
-                    base_spatial_info=None,
-                    candidate_id=target_id,
-                    candidate_role=getattr(target_node, "role", "Candidate"),
-                )
+                if before_response_empty:
+                    before_score_task = scorer.teacher_answer_logprob(
+                        graph.decision_node,
+                        input_data,
+                        {},
+                        {},
+                        target_spec,
+                    )
+                else:
+                    before_score_task = scorer.final_agent_teacher_answer_logprob(
+                        graph.decision_node,
+                        input_data,
+                        before_outputs,
+                        target_spec,
+                        cluster_labels=None,
+                        base_spatial_info=None,
+                        candidate_id=target_id,
+                        candidate_role=getattr(target_node, "role", "Candidate"),
+                    )
             else:
                 before_score_task = scorer.final_agent_execution_score(
                     graph.decision_node,
@@ -825,6 +848,8 @@ async def edge_entropy_rewards(
             "reward": 0.0,
             "before_uncertainty_details": before_uncertainty_details,
             "after_uncertainty_details": after_uncertainty_details,
+            "before_target_message_present": not before_response_empty,
+            "before_counterfactual_silence": before_response_empty,
             "edge_token_count": int(edge_token_counts.get(key, 0)),
             "graph_total_edge_tokens": int(graph_total_edge_tokens),
             "edge_token_cost": edge_token_cost,
@@ -848,7 +873,17 @@ async def edge_entropy_rewards(
                 details[key]["after_teacher_logprob"] = float(after_answer_score)
                 details[key]["uncertainty_method"] = "final_agent_teacher_logprob_diff"
                 details[key]["teacher_forcing_agent"] = "final_agent"
-                details[key]["teacher_forcing_context"] = "local_candidate_output"
+                details[key]["teacher_forcing_context"] = (
+                    "counterfactual_no_candidate_vs_local_candidate"
+                    if before_response_empty
+                    else "local_candidate_output"
+                )
+                details[key]["teacher_forcing_before_context"] = (
+                    "no_candidate_message"
+                    if before_response_empty
+                    else "local_candidate_output"
+                )
+                details[key]["teacher_forcing_after_context"] = "local_candidate_output"
                 details[key]["teacher_forcing_candidate_role"] = getattr(target_node, "role", "")
             else:
                 details[key]["uncertainty_method"] = "final_agent_execution_score_diff"
