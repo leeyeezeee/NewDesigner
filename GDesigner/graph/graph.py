@@ -12,6 +12,7 @@ from GDesigner.graph.node import Node
 from GDesigner.agents.agent_registry import AgentRegistry
 from GDesigner.prompt.prompt_set_registry import PromptSetRegistry
 from GDesigner.llm.profile_embedding import get_sentence_embedding
+from GDesigner.llm.price import MissingRemoteTokenUsageError
 from GDesigner.gnn.gcn import GCN, MLP
 from torch_geometric.utils import dense_to_sparse
 
@@ -655,6 +656,8 @@ class Graph(ABC):
                             logprob_token_limit=node_logprob_token_limit,
                         ) # output is saved in the node.outputs
                         break
+                    except MissingRemoteTokenUsageError:
+                        raise
                     except Exception as e:
                         print(
                             "Error during execution of node "

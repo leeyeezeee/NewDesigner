@@ -77,7 +77,6 @@ async def train(graph:Graph,
             edge_ig_warmup_iterations: int = 2,
             edge_ig_discount_factor: float = 0.0,
             graph_token_cost_lambda: float = 0.4,
-            graph_tokenizer_path: str = "/data/lyz/models/Qwen3-8B",
             graph_advantage_epsilon: float = 1e-6,
             max_concurrent_graphs: int = 10,
           ):
@@ -185,11 +184,9 @@ async def train(graph:Graph,
                         num_entropy_samples=batch_entropy_samples,
                         record_execution_history=use_semantic_edges,
                         track_grad=True,
-                        graph_tokenizer_path=(
-                            graph_tokenizer_path
-                            if use_multi_graph_reward
+                        track_graph_tokens=(
+                            use_multi_graph_reward
                             and graph_token_cost_lambda != 0.0
-                            else None
                         ),
                     )
                 ))

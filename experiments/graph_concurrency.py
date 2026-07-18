@@ -17,13 +17,13 @@ async def limited_graph_arun(
     semaphore: asyncio.Semaphore | None,
     realized_graph,
     *args: Any,
-    graph_tokenizer_path: str | None = None,
+    track_graph_tokens: bool = False,
     **kwargs: Any,
 ):
     async def execute_graph():
-        if not graph_tokenizer_path:
+        if not track_graph_tokens:
             return await realized_graph.arun(*args, **kwargs)
-        with track_graph_token_usage(graph_tokenizer_path) as usage:
+        with track_graph_token_usage() as usage:
             try:
                 return await realized_graph.arun(*args, **kwargs)
             finally:

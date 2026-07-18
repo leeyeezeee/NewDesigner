@@ -19,7 +19,7 @@ from openai import (
 )
 
 from GDesigner.llm.format import Message
-from GDesigner.llm.price import cost_count
+from GDesigner.llm.price import cost_count, remote_token_usage_or_raise
 from GDesigner.llm.llm import LLM, LLMGeneration, TokenLogProb
 from GDesigner.llm.llm_registry import LLMRegistry
 
@@ -331,8 +331,18 @@ async def openai_compatible_achat(
         request_kwargs=request_kwargs,
     )
     prompt = "".join([item["content"] for item in msg])
-    for output in outputs:
-        cost_count(prompt, output, model, messages=msg)
+    prompt_tokens, completion_tokens = remote_token_usage_or_raise(
+        response,
+        requested_model=model,
+        base_url=base_url,
+    )
+    cost_count(
+        prompt,
+        "\n".join(outputs),
+        model,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+    )
     if return_logprobs:
         generations = [
             LLMGeneration(
@@ -380,8 +390,18 @@ def openai_compatible_chat(
         request_kwargs=request_kwargs,
     )
     prompt = "".join([item["content"] for item in msg])
-    for output in outputs:
-        cost_count(prompt, output, model, messages=msg)
+    prompt_tokens, completion_tokens = remote_token_usage_or_raise(
+        response,
+        requested_model=model,
+        base_url=base_url,
+    )
+    cost_count(
+        prompt,
+        "\n".join(outputs),
+        model,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+    )
     if return_logprobs:
         generations = [
             LLMGeneration(

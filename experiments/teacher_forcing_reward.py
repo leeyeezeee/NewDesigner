@@ -98,12 +98,6 @@ def add_teacher_forcing_reward_args(parser) -> None:
             "counterfactual calls and loss."
         ),
     )
-    parser.add_argument(
-        "--graph_tokenizer_path",
-        type=str,
-        default="/data/lyz/models/Qwen3-8B",
-        help="Local tokenizer used to count each normally executed graph's tokens.",
-    )
 
 
 async def graph_teacher_forcing_score(

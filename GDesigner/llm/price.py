@@ -1,8 +1,7 @@
 import os
 from contextlib import contextmanager
 from contextvars import ContextVar
-from functools import lru_cache
-from typing import Any, Dict, Iterator, Optional, Sequence
+from typing import Any, Dict, Iterator, Optional, Tuple
 
 from GDesigner.utils.globals import Cost, PromptTokens, CompletionTokens
 import tiktoken
@@ -24,44 +23,48 @@ _ACTIVE_GRAPH_TOKEN_USAGE: ContextVar[Optional[Dict[str, Any]]] = ContextVar(
 )
 
 
-@lru_cache(maxsize=4)
-def _load_local_tokenizer(tokenizer_path: str):
-    from transformers import AutoTokenizer
-
-    return AutoTokenizer.from_pretrained(
-        tokenizer_path,
-        local_files_only=True,
-        trust_remote_code=True,
-    )
+class MissingRemoteTokenUsageError(RuntimeError):
+    """Raised when an OpenAI-compatible response omits required token usage."""
 
 
-def _local_token_count(
-    tokenizer_path: str,
-    text: str,
+def remote_token_usage_or_raise(
+    response: Any,
     *,
-    messages: Optional[Sequence[Dict[str, Any]]] = None,
-) -> int:
-    tokenizer = _load_local_tokenizer(tokenizer_path)
-    if messages is not None and hasattr(tokenizer, "apply_chat_template"):
-        token_ids = tokenizer.apply_chat_template(
-            list(messages),
-            tokenize=True,
-            add_generation_prompt=True,
+    requested_model: str,
+    base_url: str,
+) -> Tuple[int, int]:
+    usage = getattr(response, "usage", None)
+    prompt_tokens = getattr(usage, "prompt_tokens", None)
+    completion_tokens = getattr(usage, "completion_tokens", None)
+    if usage is None or prompt_tokens is None or completion_tokens is None:
+        raise MissingRemoteTokenUsageError(
+            "OpenAI-compatible response did not include required remote token "
+            "usage fields. Local tokenization and fallback estimation are "
+            "disabled. "
+            f"requested_model={requested_model!r}, base_url={base_url!r}, "
+            f"response_id={getattr(response, 'id', None)!r}, "
+            f"usage={usage!r}."
         )
-    else:
-        token_ids = tokenizer.encode(str(text), add_special_tokens=False)
-    return len(token_ids)
+    prompt_tokens = int(prompt_tokens)
+    completion_tokens = int(completion_tokens)
+    if prompt_tokens < 0 or completion_tokens < 0:
+        raise MissingRemoteTokenUsageError(
+            "OpenAI-compatible response returned invalid negative token usage. "
+            f"prompt_tokens={prompt_tokens}, "
+            f"completion_tokens={completion_tokens}."
+        )
+    return prompt_tokens, completion_tokens
 
 
 @contextmanager
-def track_graph_token_usage(tokenizer_path: str) -> Iterator[Dict[str, Any]]:
+def track_graph_token_usage() -> Iterator[Dict[str, Any]]:
     """Track one asynchronously executed graph without mixing concurrent graphs."""
     usage: Dict[str, Any] = {
         "prompt_tokens": 0,
         "completion_tokens": 0,
         "total_tokens": 0,
         "request_count": 0,
-        "tokenizer_path": str(tokenizer_path),
+        "token_source": "remote_response_usage",
     }
     context_token = _ACTIVE_GRAPH_TOKEN_USAGE.set(usage)
     try:
@@ -75,15 +78,27 @@ def cost_count(
     response,
     model_name,
     *,
-    messages: Optional[Sequence[Dict[str, Any]]] = None,
+    prompt_tokens: Optional[int] = None,
+    completion_tokens: Optional[int] = None,
 ):
     branch: str
     prompt_len: int
     completion_len: int
     price: float
 
-    prompt_len = cal_token(model_name, prompt)
-    completion_len = cal_token(model_name, response)
+    graph_usage = _ACTIVE_GRAPH_TOKEN_USAGE.get()
+    if prompt_tokens is None or completion_tokens is None:
+        if graph_usage is not None:
+            raise MissingRemoteTokenUsageError(
+                "Graph token tracking requires remote prompt_tokens and "
+                "completion_tokens. Local tokenization and fallback estimation "
+                "are disabled."
+            )
+        prompt_len = cal_token(model_name, prompt)
+        completion_len = cal_token(model_name, response)
+    else:
+        prompt_len = int(prompt_tokens)
+        completion_len = int(completion_tokens)
     custom_input_price = os.getenv("LOCAL_MODEL_INPUT_PRICE_PER_1K")
     custom_output_price = os.getenv("LOCAL_MODEL_OUTPUT_PRICE_PER_1K")
     if custom_input_price is not None and custom_output_price is not None:
@@ -111,21 +126,10 @@ def cost_count(
     PromptTokens.instance().value += prompt_len
     CompletionTokens.instance().value += completion_len
 
-    graph_usage = _ACTIVE_GRAPH_TOKEN_USAGE.get()
     if graph_usage is not None:
-        tokenizer_path = str(graph_usage["tokenizer_path"])
-        graph_prompt_len = _local_token_count(
-            tokenizer_path,
-            str(prompt),
-            messages=messages,
-        )
-        graph_completion_len = _local_token_count(
-            tokenizer_path,
-            str(response),
-        )
-        graph_usage["prompt_tokens"] += graph_prompt_len
-        graph_usage["completion_tokens"] += graph_completion_len
-        graph_usage["total_tokens"] += graph_prompt_len + graph_completion_len
+        graph_usage["prompt_tokens"] += prompt_len
+        graph_usage["completion_tokens"] += completion_len
+        graph_usage["total_tokens"] += prompt_len + completion_len
         graph_usage["request_count"] += 1
 
     # print(f"Prompt Tokens: {prompt_len}, Completion Tokens: {completion_len}")

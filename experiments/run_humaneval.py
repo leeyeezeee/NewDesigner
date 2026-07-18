@@ -251,12 +251,10 @@ async def main():
                         record_execution_history=use_semantic_edges,
                         track_grad=train_updates_enabled,
                         edge_selector=batch_edge_selector,
-                        graph_tokenizer_path=(
-                            args.graph_tokenizer_path
-                            if use_multi_graph_reward
+                        track_graph_tokens=(
+                            use_multi_graph_reward
                             and train_updates_enabled
                             and args.graph_token_cost_lambda != 0.0
-                            else None
                         ),
                     )
                 ))

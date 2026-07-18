@@ -134,7 +134,6 @@ async def main():
                     edge_ig_warmup_iterations=args.edge_ig_warmup_iterations,
                     edge_ig_discount_factor=args.edge_ig_discount_factor,
                     graph_token_cost_lambda=args.graph_token_cost_lambda,
-                    graph_tokenizer_path=args.graph_tokenizer_path,
                     graph_advantage_epsilon=args.graph_advantage_epsilon,
                     max_concurrent_graphs=args.max_concurrent_graphs)
         save_graph_checkpoint(
