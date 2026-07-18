@@ -471,7 +471,7 @@ def graph_correctness_advantage_edge_loss(
     edge_ig_discount_factor: float = 0.0,
     advantage_epsilon: float = 1e-6,
 ) -> Tuple[torch.Tensor, List[Dict[str, Any]]]:
-    """Combine standardized correctness, centered token cost, and edge IG."""
+    """Combine standardized correctness, centered prompt-token cost, and edge IG."""
     zero = reference_loss.new_tensor(0.0)
     group_losses: List[torch.Tensor] = []
     group_correctness_losses: List[torch.Tensor] = []
@@ -793,7 +793,7 @@ def graph_correctness_advantage_edge_loss(
     )
     print(
         "graph token reward: "
-        f"avg_total_tokens={sum(graph_token_counts) / len(graph_token_counts) if graph_token_counts else 0.0:.2f}, "
+        f"avg_prompt_tokens={sum(graph_token_counts) / len(graph_token_counts) if graph_token_counts else 0.0:.2f}, "
         f"avg_normalized_cost={sum(normalized_graph_token_costs) / len(normalized_graph_token_costs) if normalized_graph_token_costs else 0.0:.6f}, "
         f"avg_abs_token_advantage={sum(abs(value) for value in token_advantages) / len(token_advantages) if token_advantages else 0.0:.6f}, "
         f"avg_reward={sum(graph_rewards) / len(graph_rewards) if graph_rewards else 0.0:.6f}, "

@@ -282,7 +282,7 @@ async def train(graph:Graph,
                     correctness_group.append(float(record_accuracy.get()))
                     graph_token_group.append(float(
                         getattr(realized_graph, "graph_token_usage", {}).get(
-                            "total_tokens", 0
+                            "prompt_tokens", 0
                         )
                     ))
                     edge_detail_group.append(edge_details)

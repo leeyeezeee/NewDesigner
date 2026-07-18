@@ -299,7 +299,7 @@ async def run_math_dataset(
                     correctness_group.append(correctness_reward)
                     graph_token_group.append(float(
                         getattr(realized_graph, "graph_token_usage", {}).get(
-                            "total_tokens", 0
+                            "prompt_tokens", 0
                         )
                     ))
                     edge_detail_group.append(edge_details)
