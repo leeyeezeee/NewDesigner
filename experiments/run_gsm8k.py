@@ -36,7 +36,6 @@ from experiments.teacher_forcing_reward import (
     edge_information_gain_loss,
     graph_correctness_advantage_edge_loss,
 )
-from experiments.refinement_loss import refinement_regularization_loss
 from experiments.edge_training_log import (
     append_edge_training_details,
     reset_edge_training_log,
@@ -91,8 +90,6 @@ def parse_args():
                         help="Replay buffer capacity for selector edge samples.")
     parser.add_argument('--selector_ig_tau', type=float, default=0.0,
                         help="IG gain threshold for positive selector labels.")
-    parser.add_argument('--refine_rank', type=int, default=4,
-                        help="Rank used by the refined adjacency decoder.")
     add_teacher_forcing_reward_args(parser)
     parser.add_argument('--num_iterations', type=int, default=10,help="The num of training iterations.")
     parser.add_argument('--domain', type=str, default="gsm8k",help="Domain (the same as dataset name), default 'gsm8k'")
@@ -133,7 +130,6 @@ async def main():
                   decision_method=decision_method,
                   optimized_spatial=args.optimized_spatial,
                   optimized_temporal=args.optimized_temporal,
-                  refine_rank=args.refine_rank,
                   **kwargs)
     graph.gcn.train()
     graph.mlp.train()
@@ -231,9 +227,10 @@ async def main():
             for _ in range(sample_count):
                 realized_graph = copy.deepcopy(graph)
                 realized_graph.gcn = graph.gcn
+                realized_graph.node_self_projection = graph.node_self_projection
+                realized_graph.node_feature_norm = graph.node_feature_norm
                 realized_graph.mlp = graph.mlp
                 realized_graph.spatial_affinity_weight = graph.spatial_affinity_weight
-                realized_graph.refinement_weight = graph.refinement_weight
                 realized_graph.temporal_logits = graph.temporal_logits
                 group_indices.append(len(realized_graphs))
                 realized_graphs.append(realized_graph)
@@ -248,6 +245,13 @@ async def main():
                         record_execution_history=use_semantic_edges,
                         track_grad=train_updates_enabled,
                         edge_selector=batch_edge_selector,
+                        graph_tokenizer_path=(
+                            args.graph_tokenizer_path
+                            if use_multi_graph_reward
+                            and train_updates_enabled
+                            and args.graph_token_cost_lambda != 0.0
+                            else None
+                        ),
                     )
                 ))
             sample_groups.append(group_indices)
@@ -260,6 +264,7 @@ async def main():
             graph_groups = []
             graph_log_prob_groups = []
             correctness_groups = []
+            graph_token_groups = []
             edge_detail_groups = []
             graph_tf_corrects: List[float] = []
             graph_tf_edge_counts: List[float] = []
@@ -274,6 +279,7 @@ async def main():
                 graph_group = []
                 graph_log_prob_group = []
                 correctness_group = []
+                graph_token_group = []
                 edge_detail_group = []
                 for sample_pos, graph_idx in enumerate(group_indices):
                     realized_graph = realized_graphs[graph_idx]
@@ -306,7 +312,6 @@ async def main():
                             target_spec=target_spec,
                             ig_scorer=tf_scorer,
                             compute_rewards=False,
-                            edge_token_cost_beta=args.edge_token_cost_beta,
                         )
                     else:
                         edge_details = {}
@@ -332,11 +337,17 @@ async def main():
                     graph_group.append(realized_graph)
                     graph_log_prob_group.append(log_probs[graph_idx])
                     correctness_group.append(float(is_solved))
+                    graph_token_group.append(float(
+                        getattr(realized_graph, "graph_token_usage", {}).get(
+                            "total_tokens", 0
+                        )
+                    ))
                     edge_detail_group.append(edge_details)
                     realized_graph.clear_execution_history()
                 graph_groups.append(graph_group)
                 graph_log_prob_groups.append(graph_log_prob_group)
                 correctness_groups.append(correctness_group)
+                graph_token_groups.append(graph_token_group)
                 edge_detail_groups.append(edge_detail_group)
             reference_loss = torch.mean(torch.stack(list(log_probs)))
             utility_loss, tf_summaries = graph_correctness_advantage_edge_loss(
@@ -345,6 +356,8 @@ async def main():
                 correctness_groups,
                 edge_detail_groups,
                 reference_loss,
+                graph_token_groups=graph_token_groups,
+                graph_token_cost_lambda=args.graph_token_cost_lambda,
                 edge_tanh_temperature=args.edge_tanh_temperature,
                 edge_ig_reward_lambda=edge_ig_reward_lambda,
                 edge_ig_discount_factor=args.edge_ig_discount_factor,
@@ -366,7 +379,7 @@ async def main():
                     else 0.0
                 )
                 print(
-                    "graph correctness metrics: "
+                    "graph reward metrics: "
                     f"accuracy={avg_correct:.6f}, "
                     f"avg_edges={avg_edges:.6f}, "
                     f"avg_adv_variance={avg_adv_variance:.6f}, "
@@ -405,7 +418,6 @@ async def main():
                         kle_heat_t=getattr(args, "kle_heat_t", 0.3),
                         target_spec=make_target_spec("gsm8k", true_answer),
                         ig_scorer=tf_scorer,
-                        edge_token_cost_beta=args.edge_token_cost_beta,
                     )
                     if selector_buffer is not None and is_solved:
                         selector_buffer.add_many(build_edge_selector_examples(
@@ -440,13 +452,7 @@ async def main():
                 loss_list.append(single_loss)
 
             utility_loss = torch.mean(torch.stack(loss_list))
-        reg_loss, anchor_loss, sparse_loss = refinement_regularization_loss(
-            realized_graphs,
-            utility_loss,
-            anchor_reg_weight=args.anchor_reg_weight,
-            sparsity_reg_weight=args.sparsity_reg_weight,
-        )
-        total_loss = utility_loss + reg_loss
+        total_loss = utility_loss
         if train_updates_enabled:
             optimizer.zero_grad()
             if not total_loss.requires_grad:
@@ -474,8 +480,6 @@ async def main():
         if not use_multi_graph_reward:
             print("utilities:", utilities)
         print("utility loss:", utility_loss.item())
-        print("anchor loss:", anchor_loss.item())
-        print("sparse loss:", sparse_loss.item())
         print("loss:", total_loss.item())
 
         if i_batch+1 == args.num_iterations:

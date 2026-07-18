@@ -27,7 +27,6 @@ from experiments.teacher_forcing_reward import (
     edge_information_gain_loss,
     graph_correctness_advantage_edge_loss,
 )
-from experiments.refinement_loss import refinement_regularization_loss
 from experiments.edge_training_log import (
     append_edge_training_details,
     reset_edge_training_log,
@@ -76,11 +75,10 @@ async def train(graph:Graph,
             edge_tanh_temperature: float = 1.0,
             edge_ig_reward_lambda: float = None,
             edge_ig_discount_factor: float = 0.0,
-            edge_token_cost_beta: float = 0.0,
+            graph_token_cost_lambda: float = 0.4,
+            graph_tokenizer_path: str = "/data/lyz/models/Qwen3-8B",
             graph_advantage_epsilon: float = 1e-6,
             max_concurrent_graphs: int = 10,
-            anchor_reg_weight: float = 1.0,
-            sparsity_reg_weight: float = 1.0,
           ):
     
     def infinite_data_loader() -> Iterator[pd.DataFrame]:
@@ -161,9 +159,10 @@ async def train(graph:Graph,
             for _ in range(sample_count):
                 realized_graph = copy.deepcopy(graph)
                 realized_graph.gcn = graph.gcn
+                realized_graph.node_self_projection = graph.node_self_projection
+                realized_graph.node_feature_norm = graph.node_feature_norm
                 realized_graph.mlp = graph.mlp
                 realized_graph.spatial_affinity_weight = graph.spatial_affinity_weight
-                realized_graph.refinement_weight = graph.refinement_weight
                 realized_graph.temporal_logits = graph.temporal_logits
                 group_indices.append(len(realized_graphs))
                 realized_graphs.append(realized_graph)
@@ -177,6 +176,12 @@ async def train(graph:Graph,
                         num_entropy_samples=batch_entropy_samples,
                         record_execution_history=use_semantic_edges,
                         track_grad=True,
+                        graph_tokenizer_path=(
+                            graph_tokenizer_path
+                            if use_multi_graph_reward
+                            and graph_token_cost_lambda != 0.0
+                            else None
+                        ),
                     )
                 ))
             sample_groups.append(group_indices)
@@ -195,6 +200,7 @@ async def train(graph:Graph,
             graph_groups = []
             graph_log_prob_groups = []
             correctness_groups = []
+            graph_token_groups = []
             edge_detail_groups = []
             for record_idx, (correct_answer, group_indices, input_dict, question_id) in enumerate(zip(
                 correct_answers,
@@ -208,6 +214,7 @@ async def train(graph:Graph,
                 graph_group = []
                 graph_log_prob_group = []
                 correctness_group = []
+                graph_token_group = []
                 edge_detail_group = []
                 for sample_pos, graph_idx in enumerate(group_indices):
                     raw_answer = raw_answers[graph_idx]
@@ -238,7 +245,6 @@ async def train(graph:Graph,
                             target_spec=target_spec,
                             ig_scorer=tf_scorer,
                             compute_rewards=False,
-                            edge_token_cost_beta=edge_token_cost_beta,
                         )
                     else:
                         edge_details = {}
@@ -267,11 +273,17 @@ async def train(graph:Graph,
                     graph_group.append(realized_graph)
                     graph_log_prob_group.append(log_probs[graph_idx])
                     correctness_group.append(float(record_accuracy.get()))
+                    graph_token_group.append(float(
+                        getattr(realized_graph, "graph_token_usage", {}).get(
+                            "total_tokens", 0
+                        )
+                    ))
                     edge_detail_group.append(edge_details)
                     realized_graph.clear_execution_history()
                 graph_groups.append(graph_group)
                 graph_log_prob_groups.append(graph_log_prob_group)
                 correctness_groups.append(correctness_group)
+                graph_token_groups.append(graph_token_group)
                 edge_detail_groups.append(edge_detail_group)
             reference_loss = torch.mean(torch.stack(list(log_probs)))
             utility_loss, tf_summaries = graph_correctness_advantage_edge_loss(
@@ -280,6 +292,8 @@ async def train(graph:Graph,
                 correctness_groups,
                 edge_detail_groups,
                 reference_loss,
+                graph_token_groups=graph_token_groups,
+                graph_token_cost_lambda=graph_token_cost_lambda,
                 edge_tanh_temperature=edge_tanh_temperature,
                 edge_ig_reward_lambda=resolved_edge_ig_reward_lambda,
                 edge_ig_discount_factor=edge_ig_discount_factor,
@@ -308,7 +322,7 @@ async def train(graph:Graph,
                 }
                 _append_jsonl(_GRAPH_TF_RECORD_FILE, graph_tf_summary)
                 print(
-                    "graph correctness metrics: "
+                    "graph reward metrics: "
                     f"accuracy={graph_tf_summary['accuracy']:.6f}, "
                     f"avg_edges={graph_tf_summary['avg_edges']:.6f}, "
                     f"avg_adv_variance={avg_adv_variance:.6f}, "
@@ -346,7 +360,6 @@ async def train(graph:Graph,
                         kle_heat_t=kle_heat_t,
                         target_spec=make_target_spec("mmlu", correct_answer),
                         ig_scorer=tf_scorer,
-                        edge_token_cost_beta=edge_token_cost_beta,
                     )
                     if selector_buffer is not None and correctness_reward > 0:
                         selector_buffer.add_many(build_edge_selector_examples(
@@ -384,13 +397,7 @@ async def train(graph:Graph,
                 print(f"edge entropy rewards:{edge_rewards}")
 
             utility_loss = torch.mean(torch.stack(loss_list))
-        reg_loss, anchor_loss, sparse_loss = refinement_regularization_loss(
-            realized_graphs,
-            utility_loss,
-            anchor_reg_weight=anchor_reg_weight,
-            sparsity_reg_weight=sparsity_reg_weight,
-        )
-        total_loss = utility_loss + reg_loss
+        total_loss = utility_loss
         optimizer.zero_grad()
         if not total_loss.requires_grad:
             raise RuntimeError(
@@ -417,8 +424,6 @@ async def train(graph:Graph,
         if not use_multi_graph_reward:
             print("utilities:", utilities) # [0.0, 0.0, 0.0, 1.0]
         print("utility loss:", utility_loss.item())
-        print("anchor loss:", anchor_loss.item())
-        print("sparse loss:", sparse_loss.item())
         print("loss:", total_loss.item()) # 4.6237263679504395
         print(f"Cost {Cost.instance().value}")
         print(f"PromptTokens {PromptTokens.instance().value}")

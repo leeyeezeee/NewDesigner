@@ -55,8 +55,6 @@ def parse_args():
     parser.add_argument("--nonpositive_edge_penalty", type=float, default=0.01)
     parser.add_argument("--selector_buffer_size", type=int, default=512)
     parser.add_argument("--selector_ig_tau", type=float, default=0.0)
-    parser.add_argument("--refine_rank", type=int, default=4,
-                        help="Rank used by the refined adjacency decoder.")
     add_teacher_forcing_reward_args(parser)
     parser.add_argument("--optimized_spatial", action="store_true")
     parser.add_argument("--optimized_temporal", action="store_true")

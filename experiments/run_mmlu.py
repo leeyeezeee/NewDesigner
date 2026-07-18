@@ -68,8 +68,6 @@ def parse_args():
                         help="Replay buffer capacity for selector edge samples.")
     parser.add_argument('--selector_ig_tau', type=float, default=0.0,
                         help="IG gain threshold for positive selector labels.")
-    parser.add_argument('--refine_rank', type=int, default=4,
-                        help="Rank used by the refined adjacency decoder.")
     add_teacher_forcing_reward_args(parser)
     parser.add_argument('--llm_name', type=str, default="gpt-4o",
                         help="Model name, None runs the default ChatGPT4")
@@ -107,7 +105,6 @@ async def main():
                   decision_method=decision_method,
                   optimized_spatial=args.optimized_spatial,
                   optimized_temporal=args.optimized_temporal,
-                  refine_rank=args.refine_rank,
                   **kwargs)
     download()
     dataset_train = MMLUDataset('dev')
@@ -135,11 +132,10 @@ async def main():
                     edge_tanh_temperature=args.edge_tanh_temperature,
                     edge_ig_reward_lambda=args.edge_ig_reward_lambda,
                     edge_ig_discount_factor=args.edge_ig_discount_factor,
-                    edge_token_cost_beta=args.edge_token_cost_beta,
+                    graph_token_cost_lambda=args.graph_token_cost_lambda,
+                    graph_tokenizer_path=args.graph_tokenizer_path,
                     graph_advantage_epsilon=args.graph_advantage_epsilon,
-                    max_concurrent_graphs=args.max_concurrent_graphs,
-                    anchor_reg_weight=args.anchor_reg_weight,
-                    sparsity_reg_weight=args.sparsity_reg_weight)
+                    max_concurrent_graphs=args.max_concurrent_graphs)
         save_graph_checkpoint(
             graph,
             args.checkpoint_file,

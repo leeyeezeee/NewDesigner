@@ -56,9 +56,10 @@ async def evaluate(
         for record in record_batch:
             realized_graph = copy.deepcopy(graph)
             realized_graph.gcn = graph.gcn
+            realized_graph.node_self_projection = graph.node_self_projection
+            realized_graph.node_feature_norm = graph.node_feature_norm
             realized_graph.mlp = graph.mlp
             realized_graph.spatial_affinity_weight = graph.spatial_affinity_weight
-            realized_graph.refinement_weight = graph.refinement_weight
             realized_graphs.append(realized_graph)
             input_dict = dataset.record_to_input(record)
             # print(input_dict)

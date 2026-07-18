@@ -1,6 +1,8 @@
 import asyncio
 from typing import Any
 
+from GDesigner.llm.price import track_graph_token_usage
+
 
 def make_graph_semaphore(max_concurrent_graphs: int | None) -> asyncio.Semaphore | None:
     if max_concurrent_graphs is None:
@@ -15,12 +17,22 @@ async def limited_graph_arun(
     semaphore: asyncio.Semaphore | None,
     realized_graph,
     *args: Any,
+    graph_tokenizer_path: str | None = None,
     **kwargs: Any,
 ):
+    async def execute_graph():
+        if not graph_tokenizer_path:
+            return await realized_graph.arun(*args, **kwargs)
+        with track_graph_token_usage(graph_tokenizer_path) as usage:
+            try:
+                return await realized_graph.arun(*args, **kwargs)
+            finally:
+                realized_graph.graph_token_usage = dict(usage)
+
     if semaphore is None:
-        return await realized_graph.arun(*args, **kwargs)
+        return await execute_graph()
     async with semaphore:
-        return await realized_graph.arun(*args, **kwargs)
+        return await execute_graph()
 
 
 async def limited_async_call(

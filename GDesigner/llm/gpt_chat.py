@@ -332,7 +332,7 @@ async def openai_compatible_achat(
     )
     prompt = "".join([item["content"] for item in msg])
     for output in outputs:
-        cost_count(prompt, output, model)
+        cost_count(prompt, output, model, messages=msg)
     if return_logprobs:
         generations = [
             LLMGeneration(
@@ -381,7 +381,7 @@ def openai_compatible_chat(
     )
     prompt = "".join([item["content"] for item in msg])
     for output in outputs:
-        cost_count(prompt, output, model)
+        cost_count(prompt, output, model, messages=msg)
     if return_logprobs:
         generations = [
             LLMGeneration(

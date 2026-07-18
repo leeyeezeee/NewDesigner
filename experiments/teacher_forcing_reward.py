@@ -81,25 +81,19 @@ def add_teacher_forcing_reward_args(parser) -> None:
         help="Small constant used when normalizing graph advantages.",
     )
     parser.add_argument(
-        "--anchor_reg_weight",
+        "--graph_token_cost_lambda",
         type=float,
-        default=1.0,
-        help="Weight for GDesigner refined-adjacency anchor regularization.",
-    )
-    parser.add_argument(
-        "--sparsity_reg_weight",
-        type=float,
-        default=1.0,
-        help="Weight for GDesigner refinement nuclear-norm regularization.",
-    )
-    parser.add_argument(
-        "--edge_token_cost_beta",
-        type=float,
-        default=0.0,
+        default=0.4,
         help=(
-            "Non-negative token information-bottleneck weight. Effective "
-            "edge IG is raw_ig_gain - beta * edge_token_cost; 0 disables it."
+            "Weight of the OPTIMA-style graph token cost in the graph reward. "
+            "The reward is correctness - lambda * normalized_total_tokens."
         ),
+    )
+    parser.add_argument(
+        "--graph_tokenizer_path",
+        type=str,
+        default="/data/lyz/models/Qwen3-8B",
+        help="Local tokenizer used to count each normally executed graph's tokens.",
     )
 
 
@@ -189,9 +183,6 @@ def _edge_ig_record(
             detail.get("graph_total_edge_tokens", 0)
         ),
         "edge_token_cost": float(detail.get("edge_token_cost", 0.0)),
-        "edge_token_cost_beta": float(
-            detail.get("edge_token_cost_beta", 0.0)
-        ),
         "raw_ig_gain": float(detail.get("raw_ig_gain", detail["ig_gain"])),
     }
 
@@ -279,15 +270,15 @@ def _average_edge_ig_logprob_loss(records: Sequence[Dict[str, Any]]) -> float:
     return sum(float(record["ig_loss_term"]) for record in records) / len(records)
 
 
-def _correctness_advantages(
-    correctness_scores: Sequence[float],
+def _standardized_advantages(
+    reward_scores: Sequence[float],
     *,
     advantage_epsilon: float,
 ) -> Tuple[float, List[float], float, float]:
-    if not correctness_scores:
+    if not reward_scores:
         return 0.0, [], 0.0, 0.0
 
-    scores = [float(score) for score in correctness_scores]
+    scores = [float(score) for score in reward_scores]
     baseline = sum(scores) / len(scores)
     advantages = [score - baseline for score in scores]
     variance = sum(advantage * advantage for advantage in advantages) / len(advantages)
@@ -470,12 +461,14 @@ def graph_correctness_advantage_edge_loss(
     edge_detail_groups: Sequence[Sequence[Dict[str, Dict[str, Any]]]],
     reference_loss: torch.Tensor,
     *,
+    graph_token_groups: Sequence[Sequence[float]] | None = None,
+    graph_token_cost_lambda: float = 0.4,
     edge_tanh_temperature: float = 1.0,
     edge_ig_reward_lambda: float = 0.0,
     edge_ig_discount_factor: float = 0.0,
     advantage_epsilon: float = 1e-6,
 ) -> Tuple[torch.Tensor, List[Dict[str, Any]]]:
-    """Combine correctness advantages and selected-edge IG."""
+    """Combine OPTIMA-style graph rewards and fine-grained selected-edge IG."""
     zero = reference_loss.new_tensor(0.0)
     group_losses: List[torch.Tensor] = []
     group_correctness_losses: List[torch.Tensor] = []
@@ -483,35 +476,66 @@ def graph_correctness_advantage_edge_loss(
     summaries: List[Dict[str, Any]] = []
     edge_tanh_temperature = max(float(edge_tanh_temperature), 1e-6)
     edge_ig_reward_lambda = float(edge_ig_reward_lambda)
+    graph_token_cost_lambda = float(graph_token_cost_lambda)
+    if graph_token_cost_lambda < 0.0:
+        raise ValueError(
+            "graph_token_cost_lambda must be non-negative, "
+            f"got {graph_token_cost_lambda}."
+        )
+    if graph_token_groups is None:
+        graph_token_groups = [
+            [0.0 for _ in correctness_scores]
+            for correctness_scores in correctness_groups
+        ]
     if not (
         len(graph_groups)
         == len(graph_log_prob_groups)
         == len(correctness_groups)
         == len(edge_detail_groups)
+        == len(graph_token_groups)
     ):
         raise ValueError(
             "Graph reward batches must contain the same number of groups."
         )
 
-    for graphs, graph_log_probs, correctness_scores, edge_details_list in zip(
+    for graphs, graph_log_probs, correctness_scores, edge_details_list, graph_tokens in zip(
         graph_groups,
         graph_log_prob_groups,
         correctness_groups,
         edge_detail_groups,
+        graph_token_groups,
     ):
         if not (
             len(graphs)
             == len(graph_log_probs)
             == len(correctness_scores)
             == len(edge_details_list)
+            == len(graph_tokens)
         ):
             raise ValueError(
                 "Each graph reward group must contain the same number of graphs, "
-                "full graph log-probs, correctness scores, and edge-detail maps."
+                "full graph log-probs, correctness scores, token counts, and "
+                "edge-detail maps."
             )
-        graph_rewards = [float(correctness) for correctness in correctness_scores]
+        graph_token_counts = [max(0.0, float(count)) for count in graph_tokens]
+        max_graph_tokens = max(graph_token_counts, default=0.0)
+        normalized_graph_token_costs = (
+            [count / max_graph_tokens for count in graph_token_counts]
+            if max_graph_tokens > 0.0
+            else [0.0 for _ in graph_token_counts]
+        )
+        graph_rewards = [
+            float(correctness)
+            - graph_token_cost_lambda * normalized_token_cost
+            for correctness, normalized_token_cost in zip(
+                correctness_scores,
+                normalized_graph_token_costs,
+            )
+        ]
         correctness_gate = (
-            sum(graph_rewards) / len(graph_rewards) if graph_rewards else 0.0
+            sum(float(score) for score in correctness_scores) / len(correctness_scores)
+            if correctness_scores
+            else 0.0
         )
         spatial_probability_means: List[torch.Tensor] = []
         valid_spatial_edges: List[int] = []
@@ -526,7 +550,7 @@ def graph_correctness_advantage_edge_loss(
             )
             spatial_probability_means.append(probability_mean)
             valid_spatial_edges.append(valid_edges)
-        baseline, advantages, variance, std = _correctness_advantages(
+        baseline, advantages, variance, std = _standardized_advantages(
             graph_rewards,
             advantage_epsilon=advantage_epsilon,
         )
@@ -627,6 +651,10 @@ def graph_correctness_advantage_edge_loss(
         group_losses.append(group_total_loss)
         summaries.append({
             "correctness_scores": [float(score) for score in correctness_scores],
+            "graph_token_counts": graph_token_counts,
+            "normalized_graph_token_costs": normalized_graph_token_costs,
+            "max_graph_tokens": float(max_graph_tokens),
+            "graph_token_cost_lambda": graph_token_cost_lambda,
             "graph_rewards": graph_rewards,
             "correctness_gate": float(correctness_gate),
             "mean_spatial_edge_probabilities": [
@@ -677,11 +705,26 @@ def graph_correctness_advantage_edge_loss(
         for summary in summaries
         for probability in summary["mean_spatial_edge_probabilities"]
     ]
-    correctness_objective = torch.mean(torch.stack(group_correctness_losses))
+    graph_token_counts = [
+        count
+        for summary in summaries
+        for count in summary["graph_token_counts"]
+    ]
+    normalized_graph_token_costs = [
+        cost
+        for summary in summaries
+        for cost in summary["normalized_graph_token_costs"]
+    ]
+    graph_rewards = [
+        reward
+        for summary in summaries
+        for reward in summary["graph_rewards"]
+    ]
+    graph_reward_objective = torch.mean(torch.stack(group_correctness_losses))
     edge_ig_objective = torch.mean(torch.stack(group_edge_ig_losses))
     trainable_parameters = _unique_trainable_graph_parameters(graph_groups)
-    correctness_gradient_norm = _loss_gradient_l2_norm(
-        correctness_objective,
+    graph_reward_gradient_norm = _loss_gradient_l2_norm(
+        graph_reward_objective,
         trainable_parameters,
     )
     edge_ig_gradient_norm = _loss_gradient_l2_norm(
@@ -690,10 +733,17 @@ def graph_correctness_advantage_edge_loss(
     )
     print(
         "graph gradient norms: "
-        f"correctness={correctness_gradient_norm:.6f}, "
+        f"graph_reward={graph_reward_gradient_norm:.6f}, "
         f"edge_ig={edge_ig_gradient_norm:.6f}, "
         f"avg_edges={sum(edge_counts) / len(edge_counts) if edge_counts else 0.0:.2f}, "
         f"mean_edge_probability={sum(edge_probabilities) / len(edge_probabilities) if edge_probabilities else 0.0:.6f}"
+    )
+    print(
+        "graph token reward: "
+        f"avg_total_tokens={sum(graph_token_counts) / len(graph_token_counts) if graph_token_counts else 0.0:.2f}, "
+        f"avg_normalized_cost={sum(normalized_graph_token_costs) / len(normalized_graph_token_costs) if normalized_graph_token_costs else 0.0:.6f}, "
+        f"avg_reward={sum(graph_rewards) / len(graph_rewards) if graph_rewards else 0.0:.6f}, "
+        f"lambda={graph_token_cost_lambda:.6f}"
     )
     return torch.mean(torch.stack(group_losses)), summaries
 

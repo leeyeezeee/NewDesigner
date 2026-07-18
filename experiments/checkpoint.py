@@ -41,11 +41,11 @@ def save_graph_checkpoint(
             "agent_names": list(graph.agent_names),
             "optimized_spatial": bool(graph.optimized_spatial),
             "optimized_temporal": bool(graph.optimized_temporal),
-            "refine_rank": int(graph.refine_rank),
             "gcn_state_dict": graph.gcn.state_dict(),
+            "node_self_projection_state_dict": graph.node_self_projection.state_dict(),
+            "node_feature_norm_state_dict": graph.node_feature_norm.state_dict(),
             "mlp_state_dict": graph.mlp.state_dict(),
             "spatial_affinity_weight": graph.spatial_affinity_weight.detach().cpu(),
-            "refinement_weight": graph.refinement_weight.detach().cpu(),
             "spatial_masks": graph.spatial_masks.detach().cpu(),
             "temporal_logits": graph.temporal_logits.detach().cpu(),
             "temporal_masks": graph.temporal_masks.detach().cpu(),
@@ -112,6 +112,14 @@ def load_graph_checkpoint(
 
     if "gcn_state_dict" in graph_state:
         graph.gcn.load_state_dict(graph_state["gcn_state_dict"])
+    if "node_self_projection_state_dict" in graph_state:
+        graph.node_self_projection.load_state_dict(
+            graph_state["node_self_projection_state_dict"]
+        )
+    if "node_feature_norm_state_dict" in graph_state:
+        graph.node_feature_norm.load_state_dict(
+            graph_state["node_feature_norm_state_dict"]
+        )
     if "mlp_state_dict" in graph_state:
         graph.mlp.load_state_dict(graph_state["mlp_state_dict"])
     if "gat_state_dict" in graph_state:
@@ -125,12 +133,6 @@ def load_graph_checkpoint(
             graph.spatial_affinity_weight,
             graph_state["spatial_affinity_weight"],
             "spatial_affinity_weight",
-        )
-    if "refinement_weight" in graph_state:
-        _copy_parameter(
-            graph.refinement_weight,
-            graph_state["refinement_weight"],
-            "refinement_weight",
         )
     if "temporal_logits" in graph_state:
         _copy_temporal_logits(graph, graph_state["temporal_logits"])

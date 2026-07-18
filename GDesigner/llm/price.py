@@ -1,4 +1,8 @@
 import os
+from contextlib import contextmanager
+from contextvars import ContextVar
+from functools import lru_cache
+from typing import Any, Dict, Iterator, Optional, Sequence
 
 from GDesigner.utils.globals import Cost, PromptTokens, CompletionTokens
 import tiktoken
@@ -14,7 +18,65 @@ def cal_token(model:str, text:str):
     num_tokens = len(encoder.encode(text))
     return num_tokens
 
-def cost_count(prompt, response, model_name):
+_ACTIVE_GRAPH_TOKEN_USAGE: ContextVar[Optional[Dict[str, Any]]] = ContextVar(
+    "active_graph_token_usage",
+    default=None,
+)
+
+
+@lru_cache(maxsize=4)
+def _load_local_tokenizer(tokenizer_path: str):
+    from transformers import AutoTokenizer
+
+    return AutoTokenizer.from_pretrained(
+        tokenizer_path,
+        local_files_only=True,
+        trust_remote_code=True,
+    )
+
+
+def _local_token_count(
+    tokenizer_path: str,
+    text: str,
+    *,
+    messages: Optional[Sequence[Dict[str, Any]]] = None,
+) -> int:
+    tokenizer = _load_local_tokenizer(tokenizer_path)
+    if messages is not None and hasattr(tokenizer, "apply_chat_template"):
+        token_ids = tokenizer.apply_chat_template(
+            list(messages),
+            tokenize=True,
+            add_generation_prompt=True,
+        )
+    else:
+        token_ids = tokenizer.encode(str(text), add_special_tokens=False)
+    return len(token_ids)
+
+
+@contextmanager
+def track_graph_token_usage(tokenizer_path: str) -> Iterator[Dict[str, Any]]:
+    """Track one asynchronously executed graph without mixing concurrent graphs."""
+    usage: Dict[str, Any] = {
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "total_tokens": 0,
+        "request_count": 0,
+        "tokenizer_path": str(tokenizer_path),
+    }
+    context_token = _ACTIVE_GRAPH_TOKEN_USAGE.set(usage)
+    try:
+        yield usage
+    finally:
+        _ACTIVE_GRAPH_TOKEN_USAGE.reset(context_token)
+
+
+def cost_count(
+    prompt,
+    response,
+    model_name,
+    *,
+    messages: Optional[Sequence[Dict[str, Any]]] = None,
+):
     branch: str
     prompt_len: int
     completion_len: int
@@ -48,6 +110,23 @@ def cost_count(prompt, response, model_name):
     Cost.instance().value += price
     PromptTokens.instance().value += prompt_len
     CompletionTokens.instance().value += completion_len
+
+    graph_usage = _ACTIVE_GRAPH_TOKEN_USAGE.get()
+    if graph_usage is not None:
+        tokenizer_path = str(graph_usage["tokenizer_path"])
+        graph_prompt_len = _local_token_count(
+            tokenizer_path,
+            str(prompt),
+            messages=messages,
+        )
+        graph_completion_len = _local_token_count(
+            tokenizer_path,
+            str(response),
+        )
+        graph_usage["prompt_tokens"] += graph_prompt_len
+        graph_usage["completion_tokens"] += graph_completion_len
+        graph_usage["total_tokens"] += graph_prompt_len + graph_completion_len
+        graph_usage["request_count"] += 1
 
     # print(f"Prompt Tokens: {prompt_len}, Completion Tokens: {completion_len}")
     return price, prompt_len, completion_len

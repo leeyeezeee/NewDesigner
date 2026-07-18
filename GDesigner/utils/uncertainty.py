@@ -588,15 +588,8 @@ async def edge_entropy_rewards(
     target_spec: Optional[TargetSpec] = None,
     ig_scorer: Optional[FinalAnswerScorer] = None,
     compute_rewards: bool = True,
-    edge_token_cost_beta: float = 0.0,
 ) -> Tuple[Dict[str, float], Dict[str, Dict[str, Any]]]:
     """Score each round's independently sampled spatial edges."""
-    edge_token_cost_beta = float(edge_token_cost_beta)
-    if edge_token_cost_beta < 0.0:
-        raise ValueError(
-            "edge_token_cost_beta must be non-negative, "
-            f"got {edge_token_cost_beta}."
-        )
     if not graph.edge_log_probs:
         return {}, {}
     histories: Dict[Tuple[str, int], Dict[str, Any]] = {}
@@ -854,18 +847,14 @@ async def edge_entropy_rewards(
             "graph_total_edge_tokens": int(graph_total_edge_tokens),
             "edge_token_cost": edge_token_cost,
             "round_edge_token_cost": edge_token_cost,
-            "edge_token_cost_beta": edge_token_cost_beta,
             "token_cost_scope": "realized_spatial_edges_same_round",
             "token_count_method": "message_output_tiktoken_model_or_cl100k_fallback",
         }
         if ig_gain is not None:
             raw_ig_gain = float(ig_gain)
-            effective_ig_gain = (
-                raw_ig_gain - edge_token_cost_beta * edge_token_cost
-            )
             details[key]["raw_ig_gain"] = raw_ig_gain
-            details[key]["round_ig_gain"] = effective_ig_gain
-            details[key]["ig_gain"] = effective_ig_gain
+            details[key]["round_ig_gain"] = raw_ig_gain
+            details[key]["ig_gain"] = raw_ig_gain
             details[key]["before_answer_score"] = float(before_answer_score)
             details[key]["after_answer_score"] = float(after_answer_score)
             if target_spec.mode != "execution":
