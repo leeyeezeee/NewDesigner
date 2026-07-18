@@ -45,7 +45,7 @@ def save_graph_checkpoint(
             "node_self_projection_state_dict": graph.node_self_projection.state_dict(),
             "node_feature_norm_state_dict": graph.node_feature_norm.state_dict(),
             "mlp_state_dict": graph.mlp.state_dict(),
-            "spatial_affinity_weight": graph.spatial_affinity_weight.detach().cpu(),
+            "spatial_affinity_state_dict": graph.spatial_affinity.state_dict(),
             "spatial_masks": graph.spatial_masks.detach().cpu(),
             "temporal_logits": graph.temporal_logits.detach().cpu(),
             "temporal_masks": graph.temporal_masks.detach().cpu(),
@@ -128,9 +128,15 @@ def load_graph_checkpoint(
             "cannot be loaded into the GCN/MLP policy network. Retrain or use a "
             "checkpoint containing 'gcn_state_dict' and 'mlp_state_dict'."
         )
-    if "spatial_affinity_weight" in graph_state:
+    if "spatial_affinity_state_dict" in graph_state:
+        graph.spatial_affinity.load_state_dict(
+            graph_state["spatial_affinity_state_dict"]
+        )
+    elif "spatial_affinity_weight" in graph_state:
+        # Backward compatibility for checkpoints created before the affinity
+        # decoder became a spectrally normalized Linear module.
         _copy_parameter(
-            graph.spatial_affinity_weight,
+            graph.spatial_affinity.parametrizations.weight.original,
             graph_state["spatial_affinity_weight"],
             "spatial_affinity_weight",
         )

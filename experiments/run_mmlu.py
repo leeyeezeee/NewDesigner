@@ -27,7 +27,7 @@ def parse_args():
                         choices=['DirectAnswer', 'FullConnected', 'Random', 'Chain', 'Debate', 'Layered','Star', 'Mesh',
                                  'FakeFullConnected','FakeRandom','FakeChain','FakeStar','FakeMesh','FakeAGRandom','FakeAGFull'],
                         help="Mode of operation. Default is 'FullConnected'.")
-    parser.add_argument('--lr', type=float, default=0.1,
+    parser.add_argument('--lr', type=float, default=0.001,
                         help="learning rate")
     parser.add_argument('--batch_size', type=int, default=4,
                         help="batch size")

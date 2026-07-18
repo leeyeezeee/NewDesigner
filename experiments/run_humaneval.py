@@ -58,7 +58,7 @@ def parse_args():
     parser.add_argument('--mode', type=str, default='FullConnected',
                         choices=['DirectAnswer', 'FullConnected', 'Random', 'Chain','Debate','Layered','Star'],
                         help="Mode of operation. Default is 'FullConnected'.")
-    parser.add_argument('--lr', type=float, default=0.1,help="learning rate")
+    parser.add_argument('--lr', type=float, default=0.001,help="learning rate")
     parser.add_argument('--batch_size', type=int, default=4,help="batch size")
     parser.add_argument('--num_rounds',type=int,default=2,help="Number of optimization/inference rounds for one query")
     parser.add_argument('--pruning_rate', type=float, default=0.25,
@@ -133,6 +133,7 @@ async def main():
                   **kwargs)
     graph.gcn.train()
     graph.mlp.train()
+    graph.spatial_affinity.train()
     edge_training_log_file = resolve_edge_training_log_file("humaneval")
     reset_edge_training_log(edge_training_log_file)
     optimizer_params = (
@@ -236,7 +237,7 @@ async def main():
                 realized_graph.node_self_projection = graph.node_self_projection
                 realized_graph.node_feature_norm = graph.node_feature_norm
                 realized_graph.mlp = graph.mlp
-                realized_graph.spatial_affinity_weight = graph.spatial_affinity_weight
+                realized_graph.spatial_affinity = graph.spatial_affinity
                 realized_graph.temporal_logits = graph.temporal_logits
                 group_indices.append(len(realized_graphs))
                 realized_graphs.append(realized_graph)
@@ -469,6 +470,7 @@ async def main():
                     "must still retain full-graph log-prob or IB gradients."
                 )
             total_loss.backward()
+            torch.nn.utils.clip_grad_norm_(optimizer_params, max_norm=1.0)
             optimizer.step()
             if edge_selector is not None:
                 selector_trained = (
@@ -506,6 +508,7 @@ async def main():
             accuracy = 0.0
             graph.gcn.eval()
             graph.mlp.eval()
+            graph.spatial_affinity.eval()
             reset_usage_counters()
             print("Start Eval")
             

@@ -52,7 +52,7 @@ async def train(graph:Graph,
             dataset,
             num_iters:int=100,
             num_rounds:int=1,
-            lr:float=0.1,
+            lr:float=0.001,
             batch_size:int = 4,
             use_edge_selector: bool = False,
             imp_per_iterations: int = 5,
@@ -137,6 +137,7 @@ async def train(graph:Graph,
     optimizer = torch.optim.Adam(optimizer_params, lr=lr)
     graph.gcn.train()
     graph.mlp.train()
+    graph.spatial_affinity.train()
     for i_iter in range(num_iters):
         edge_ig_measurement_enabled = i_iter >= max(
             0, int(edge_ig_warmup_iterations)
@@ -170,7 +171,7 @@ async def train(graph:Graph,
                 realized_graph.node_self_projection = graph.node_self_projection
                 realized_graph.node_feature_norm = graph.node_feature_norm
                 realized_graph.mlp = graph.mlp
-                realized_graph.spatial_affinity_weight = graph.spatial_affinity_weight
+                realized_graph.spatial_affinity = graph.spatial_affinity
                 realized_graph.temporal_logits = graph.temporal_logits
                 group_indices.append(len(realized_graphs))
                 realized_graphs.append(realized_graph)
@@ -413,6 +414,7 @@ async def train(graph:Graph,
                 "must still retain full-graph log-prob or IB gradients."
             )
         total_loss.backward()
+        torch.nn.utils.clip_grad_norm_(optimizer_params, max_norm=1.0)
         optimizer.step()
         if edge_selector is not None:
             selector_trained = (

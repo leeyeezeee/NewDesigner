@@ -1,8 +1,10 @@
 import shortuuid
+import math
 from typing import Any, List, Optional, Dict, Tuple
 from abc import ABC
 import numpy as np
 import torch
+import torch.nn.functional as F
 import asyncio
 import traceback
 
@@ -15,43 +17,10 @@ from GDesigner.llm.profile_embedding import get_sentence_embedding
 from GDesigner.llm.price import MissingRemoteTokenUsageError
 from GDesigner.gnn.gcn import GCN, MLP
 from torch_geometric.utils import dense_to_sparse
+from torch.nn.utils.parametrizations import spectral_norm
 
 def _format_exception(exc: Exception) -> str:
     return "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
-
-
-def min_max_norm(
-        tensor: torch.Tensor,
-        valid_mask: Optional[torch.Tensor] = None,
-        ) -> torch.Tensor:
-    """Map selectable affinity scores to [-1, 1]."""
-    flat_tensor = tensor.reshape(-1)
-    if valid_mask is None:
-        flat_mask = torch.ones_like(flat_tensor, dtype=torch.bool)
-    else:
-        flat_mask = valid_mask.reshape(-1).to(device=flat_tensor.device) > 0
-        if flat_mask.numel() != flat_tensor.numel():
-            raise ValueError(
-                "Affinity scores and their valid-edge mask must have the same "
-                f"number of entries; received {flat_tensor.numel()} and "
-                f"{flat_mask.numel()}."
-            )
-
-    valid_values = flat_tensor[flat_mask]
-    if valid_values.numel() == 0:
-        return torch.zeros_like(tensor)
-    min_value = valid_values.min()
-    max_value = valid_values.max()
-    if torch.isclose(max_value, min_value):
-        normalized_values = torch.zeros_like(valid_values)
-    else:
-        normalized_values = (
-            2.0 * (valid_values - min_value) / (max_value - min_value) - 1.0
-        )
-
-    normalized = torch.zeros_like(flat_tensor)
-    normalized = normalized.masked_scatter(flat_mask, normalized_values)
-    return normalized.reshape_as(tensor)
 
 
 class Graph(ABC):
@@ -153,10 +122,14 @@ class Graph(ABC):
         )
         self.node_feature_norm = torch.nn.LayerNorm(node_feature_dim)
         self.mlp = MLP(node_feature_dim, 16, self.edge_embedding_dim)
-        self.spatial_affinity_weight = torch.nn.Parameter(
-            torch.eye(self.edge_embedding_dim),
-            requires_grad=optimized_spatial,
+        affinity = torch.nn.Linear(
+            self.edge_embedding_dim,
+            self.edge_embedding_dim,
+            bias=False,
         )
+        torch.nn.init.xavier_uniform_(affinity.weight)
+        self.spatial_affinity = spectral_norm(affinity)
+        self.spatial_affinity.requires_grad_(optimized_spatial)
 
         # self.spatial_logits = torch.nn.Parameter(torch.ones(len(self.potential_spatial_edges), requires_grad=optimized_spatial) * init_spatial_logit,
         #                                          requires_grad=optimized_spatial) # trainable edge logits
@@ -170,8 +143,7 @@ class Graph(ABC):
     def spatial_parameters(self) -> List[torch.nn.Parameter]:
         parameters = list(self.node_self_projection.parameters())
         parameters.extend(self.node_feature_norm.parameters())
-        if self.spatial_affinity_weight.requires_grad:
-            parameters.append(self.spatial_affinity_weight)
+        parameters.extend(self.spatial_affinity.parameters())
         return [parameter for parameter in parameters if parameter.requires_grad]
 
     @staticmethod
@@ -292,15 +264,17 @@ class Graph(ABC):
             node_embeddings = self.node_feature_norm(
                 propagated_features + self_features
             )
-            edge_embeddings = self.mlp(node_embeddings)
-            affinity_weight = self.spatial_affinity_weight.to(
-                device=edge_embeddings.device,
-                dtype=edge_embeddings.dtype,
+            edge_embeddings = F.normalize(
+                self.mlp(node_embeddings),
+                p=2.0,
+                dim=-1,
+                eps=1e-6,
             )
-            affinity_scores = (
-                edge_embeddings @ affinity_weight @ edge_embeddings.t()
+            projected_embeddings = self.spatial_affinity(edge_embeddings)
+            affinity_scores = math.sqrt(self.edge_embedding_dim) * (
+                edge_embeddings @ projected_embeddings.t()
             )
-            self.spatial_logits = min_max_norm(affinity_scores).reshape(-1)
+            self.spatial_logits = affinity_scores.reshape(-1)
 
         if track_grad:
             _compute_spatial_logits()
@@ -498,7 +472,6 @@ class Graph(ABC):
             self,
             round:int = 0,
             temperature: float = 1.0,
-            threshold: float = None,
             track_grad: bool = True,
             ): # temperature must >= 1.0
         self.clear_spatial_connection()
@@ -516,12 +489,12 @@ class Graph(ABC):
             elif edge_mask == 1.0 and self.optimized_spatial==False:
                 out_node.add_successor(in_node,'spatial')
                 continue
-            edge_prob = torch.sigmoid(edge_logit / temperature)
-            edge_prob = edge_prob.clamp(1e-6, 1.0 - 1e-6)
-            if threshold is None:
-                edge_selected = bool(torch.rand((), device=edge_prob.device) < edge_prob)
-            else:
-                edge_selected = bool(edge_prob >= float(threshold))
+            edge_distribution = torch.distributions.Bernoulli(
+                logits=edge_logit / temperature
+            )
+            edge_sample = edge_distribution.sample()
+            edge_prob = edge_distribution.probs
+            edge_selected = bool(edge_sample.item())
             if track_grad:
                 self.edge_decisions.append({
                     "type": "spatial",
@@ -542,12 +515,12 @@ class Graph(ABC):
                     "edge_key": f"spatial:{round}:{out_node.id}->{in_node.id}",
                 }
                 if track_grad:
-                    edge_log_prob = torch.log(edge_prob)
+                    edge_log_prob = edge_distribution.log_prob(edge_sample)
                     log_probs.append(edge_log_prob)
                     edge_info["log_prob"] = edge_log_prob
                 self.edge_log_probs.append(edge_info)
             elif track_grad:
-                log_probs.append(torch.log(1 - edge_prob))
+                log_probs.append(edge_distribution.log_prob(edge_sample))
                     
         return torch.sum(torch.stack(log_probs))
     
@@ -555,7 +528,6 @@ class Graph(ABC):
             self,
             round:int = 0,
             temperature: float = 1.0,
-            threshold: float = None,
             track_grad: bool = True,
             ):  # temperature must >= 1.0
         self.clear_temporal_connection()
@@ -571,10 +543,12 @@ class Graph(ABC):
                 out_node.add_successor(in_node,'temporal')
                 continue
             
-            edge_prob = torch.sigmoid(edge_logit / temperature).clamp(1e-6, 1.0 - 1e-6)
-            if threshold:
-                edge_prob = torch.tensor(1 if edge_prob > threshold else 0)
-            edge_selected = bool(torch.rand((), device=edge_prob.device) < edge_prob)
+            edge_distribution = torch.distributions.Bernoulli(
+                logits=edge_logit / temperature
+            )
+            edge_sample = edge_distribution.sample()
+            edge_prob = edge_distribution.probs
+            edge_selected = bool(edge_sample.item())
             if track_grad:
                 self.edge_decisions.append({
                     "type": "temporal",
@@ -595,13 +569,13 @@ class Graph(ABC):
                     "edge_key": f"temporal:{round}:{out_node.id}->{in_node.id}",
                 }
                 if track_grad:
-                    edge_log_prob = torch.log(edge_prob)
+                    edge_log_prob = edge_distribution.log_prob(edge_sample)
                     log_probs.append(edge_log_prob)
                     edge_info["log_prob"] = edge_log_prob
                 self.edge_log_probs.append(edge_info)
             else:
                 if track_grad:
-                    log_probs.append(torch.log(1 - edge_prob))
+                    log_probs.append(edge_distribution.log_prob(edge_sample))
                     
         return torch.sum(torch.stack(log_probs))
 
@@ -628,7 +602,6 @@ class Graph(ABC):
         for round in range(num_rounds):
             log_probs += self.construct_spatial_connection(
                 round,
-                threshold=None if track_grad else 0.5,
                 track_grad=track_grad,
             )
             log_probs += self.construct_temporal_connection(round, track_grad=track_grad)
@@ -697,7 +670,6 @@ class Graph(ABC):
         for round in range(num_rounds):
             log_probs += self.construct_spatial_connection(
                 round,
-                threshold=None if track_grad else 0.5,
                 track_grad=track_grad,
             )
             log_probs += self.construct_temporal_connection(round, track_grad=track_grad)

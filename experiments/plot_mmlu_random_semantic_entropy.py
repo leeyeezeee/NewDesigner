@@ -731,6 +731,7 @@ def build_graph(bundle: DatasetBundle, args, agent_names: List[str]) -> Graph:
     )
     graph.gcn.eval()
     graph.mlp.eval()
+    graph.spatial_affinity.eval()
     return graph
 
 

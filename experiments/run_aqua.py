@@ -24,7 +24,7 @@ def parse_args():
         default="FullConnected",
         choices=["DirectAnswer", "FullConnected", "Random", "Chain", "Debate", "Layered", "Star"],
     )
-    parser.add_argument("--lr", type=float, default=0.1)
+    parser.add_argument("--lr", type=float, default=0.001)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--num_rounds", type=int, default=2)
     parser.add_argument("--num_iterations", type=int, default=10)
