@@ -131,6 +131,7 @@ async def main():
                     graph_softmax_temperature=args.graph_softmax_temperature,
                     edge_tanh_temperature=args.edge_tanh_temperature,
                     edge_ig_reward_lambda=args.edge_ig_reward_lambda,
+                    edge_ig_warmup_iterations=args.edge_ig_warmup_iterations,
                     edge_ig_discount_factor=args.edge_ig_discount_factor,
                     graph_token_cost_lambda=args.graph_token_cost_lambda,
                     graph_tokenizer_path=args.graph_tokenizer_path,

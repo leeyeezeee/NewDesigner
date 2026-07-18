@@ -74,6 +74,7 @@ async def train(graph:Graph,
             graph_softmax_temperature: float = 1.0,
             edge_tanh_temperature: float = 1.0,
             edge_ig_reward_lambda: float = None,
+            edge_ig_warmup_iterations: int = 2,
             edge_ig_discount_factor: float = 0.0,
             graph_token_cost_lambda: float = 0.4,
             graph_tokenizer_path: str = "/data/lyz/models/Qwen3-8B",
@@ -138,6 +139,14 @@ async def train(graph:Graph,
     graph.gcn.train()
     graph.mlp.train()
     for i_iter in range(num_iters):
+        edge_ig_measurement_enabled = i_iter >= max(
+            0, int(edge_ig_warmup_iterations)
+        )
+        iteration_edge_ig_reward_lambda = (
+            resolved_edge_ig_reward_lambda
+            if edge_ig_measurement_enabled
+            else 0.0
+        )
         print(f"Iter {i_iter}", 80*'-')
         start_ts = time.time()
         correct_answers = []
@@ -225,9 +234,10 @@ async def train(graph:Graph,
                     graph_tf_corrects.append(float(record_accuracy.get()))
                     graph_tf_edge_counts.append(realized_graph.mean_spatial_edges_per_round)
                     needs_edge_details = (
-                        bool(realized_graph.edge_log_probs)
+                        edge_ig_measurement_enabled
+                        and bool(realized_graph.edge_log_probs)
                         and (
-                            resolved_edge_ig_reward_lambda != 0.0
+                            iteration_edge_ig_reward_lambda != 0.0
                             or selector_buffer is not None
                             or record_edge_training
                         )
@@ -295,7 +305,7 @@ async def train(graph:Graph,
                 graph_token_groups=graph_token_groups,
                 graph_token_cost_lambda=graph_token_cost_lambda,
                 edge_tanh_temperature=edge_tanh_temperature,
-                edge_ig_reward_lambda=resolved_edge_ig_reward_lambda,
+                edge_ig_reward_lambda=iteration_edge_ig_reward_lambda,
                 edge_ig_discount_factor=edge_ig_discount_factor,
                 advantage_epsilon=graph_advantage_epsilon,
             )
@@ -342,9 +352,10 @@ async def train(graph:Graph,
                 edge_details = {}
                 if (
                     use_semantic_edges
+                    and edge_ig_measurement_enabled
                     and (
                         correctness_reward > 0
-                        or resolved_edge_ig_reward_lambda != 0.0
+                        or iteration_edge_ig_reward_lambda != 0.0
                         or record_edge_training
                     )
                     and bool(realized_graph.edge_log_probs)
@@ -381,13 +392,13 @@ async def train(graph:Graph,
                 }
                 utilities.append(utility)
                 single_loss = -log_prob * float(correctness_reward)
-                if resolved_edge_ig_reward_lambda != 0.0:
+                if iteration_edge_ig_reward_lambda != 0.0:
                     edge_ig_loss, edge_ig_summary = edge_information_gain_loss(
                         realized_graph,
                         edge_details,
                         log_prob,
                         edge_tanh_temperature=edge_tanh_temperature,
-                        edge_ig_reward_lambda=resolved_edge_ig_reward_lambda,
+                        edge_ig_reward_lambda=iteration_edge_ig_reward_lambda,
                         edge_ig_discount_factor=edge_ig_discount_factor,
                     )
                     single_loss = single_loss + edge_ig_loss

@@ -191,6 +191,13 @@ async def main():
 
     for i_batch in range(num_batches):
         train_updates_enabled = optimize_enabled and i_batch < args.num_iterations
+        edge_ig_measurement_enabled = (
+            train_updates_enabled
+            and i_batch >= max(0, int(args.edge_ig_warmup_iterations))
+        )
+        iteration_edge_ig_reward_lambda = (
+            edge_ig_reward_lambda if edge_ig_measurement_enabled else 0.0
+        )
         use_semantic_edges = use_semantic_edges_for_analysis and train_updates_enabled
         batch_entropy_samples = 1
         batch_edge_selector = edge_selector if (selector_trained and not train_updates_enabled) else None
@@ -292,9 +299,10 @@ async def main():
                     graph_tf_corrects.append(float(is_solved))
                     graph_tf_edge_counts.append(realized_graph.mean_spatial_edges_per_round)
                     needs_edge_details = (
-                        bool(realized_graph.edge_log_probs)
+                        edge_ig_measurement_enabled
+                        and bool(realized_graph.edge_log_probs)
                         and (
-                            edge_ig_reward_lambda != 0.0
+                            iteration_edge_ig_reward_lambda != 0.0
                             or selector_buffer is not None
                             or bool(edge_training_log_file)
                         )
@@ -359,7 +367,7 @@ async def main():
                 graph_token_groups=graph_token_groups,
                 graph_token_cost_lambda=args.graph_token_cost_lambda,
                 edge_tanh_temperature=args.edge_tanh_temperature,
-                edge_ig_reward_lambda=edge_ig_reward_lambda,
+                edge_ig_reward_lambda=iteration_edge_ig_reward_lambda,
                 edge_ig_discount_factor=args.edge_ig_discount_factor,
                 advantage_epsilon=args.graph_advantage_epsilon,
             )
@@ -400,9 +408,10 @@ async def main():
                 edge_details = {}
                 if (
                     use_semantic_edges
+                    and edge_ig_measurement_enabled
                     and (
                         is_solved
-                        or edge_ig_reward_lambda != 0.0
+                        or iteration_edge_ig_reward_lambda != 0.0
                         or bool(edge_training_log_file)
                     )
                     and bool(realized_graph.edge_log_probs)
@@ -438,13 +447,13 @@ async def main():
                 }
                 utilities.append(utility)
                 single_loss = -log_prob * float(is_solved)
-                if edge_ig_reward_lambda != 0.0:
+                if iteration_edge_ig_reward_lambda != 0.0:
                     edge_ig_loss, edge_ig_summary = edge_information_gain_loss(
                         realized_graph,
                         edge_details,
                         log_prob,
                         edge_tanh_temperature=args.edge_tanh_temperature,
-                        edge_ig_reward_lambda=edge_ig_reward_lambda,
+                        edge_ig_reward_lambda=iteration_edge_ig_reward_lambda,
                         edge_ig_discount_factor=args.edge_ig_discount_factor,
                     )
                     single_loss = single_loss + edge_ig_loss
