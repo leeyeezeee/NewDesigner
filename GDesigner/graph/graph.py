@@ -471,7 +471,7 @@ class Graph(ABC):
     def construct_spatial_connection(
             self,
             round:int = 0,
-            temperature: float = 1.0,
+            temperature: float = 2.0,
             track_grad: bool = True,
             ): # temperature must >= 1.0
         self.clear_spatial_connection()
