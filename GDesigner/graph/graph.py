@@ -16,6 +16,7 @@ from GDesigner.prompt.prompt_set_registry import PromptSetRegistry
 from GDesigner.llm.profile_embedding import (
     get_sentence_embedding,
 )
+from GDesigner.llm.gpt_chat import EmptyChatCompletionError
 from GDesigner.llm.price import MissingRemoteTokenUsageError
 from GDesigner.gnn.gcn import MLP
 from GDesigner.gnn.gat import InitialResidualGATv2Encoder
@@ -102,7 +103,7 @@ class Graph(ABC):
         self.potential_spatial_edges:List[List[str, str]] = []
         self.potential_temporal_edges:List[List[str,str]] = []
         self.edge_log_probs:List[Dict[str, Any]] = []
-        self.spatial_sampling_temperature = 2.0
+        self.spatial_sampling_temperature = 1.0
         # Every sampled Bernoulli decision, including rejected edges.  IG uses
         # edge_log_probs (selected edges only), while graph-level information
         # bottleneck regularization needs both outcomes.
@@ -841,6 +842,14 @@ class Graph(ABC):
                         break
                     except MissingRemoteTokenUsageError:
                         raise
+                    except EmptyChatCompletionError as e:
+                        print(
+                            "Empty response during execution of node "
+                            f"{current_node_id} ({current_node.role}) "
+                            f"round={round}; skipping retry.\n"
+                            f"{type(e).__name__}: {e!r}\n{_format_exception(e)}"
+                        )
+                        break
                     except Exception as e:
                         print(
                             "Error during execution of node "
@@ -919,6 +928,14 @@ class Graph(ABC):
                             ),
                             timeout=max_time,
                         ) # output is saved in the node.outputs
+                        break
+                    except EmptyChatCompletionError as e:
+                        print(
+                            "Empty response during execution of node "
+                            f"{current_node_id} ({current_node.role}) "
+                            f"round={round}; skipping retry.\n"
+                            f"{type(e).__name__}: {e!r}\n{_format_exception(e)}"
+                        )
                         break
                     except Exception as e:
                         print(
