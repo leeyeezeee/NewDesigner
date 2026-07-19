@@ -83,7 +83,7 @@ def add_teacher_forcing_reward_args(parser) -> None:
     parser.add_argument(
         "--graph_token_cost_lambda",
         type=float,
-        default=0.8,
+        default=1.0,
         help=(
             "Weight of the centered OPTIMA-style graph token cost in the graph "
             "advantage. Correctness is standardized separately."
@@ -487,7 +487,7 @@ def graph_correctness_advantage_edge_loss(
     reference_loss: torch.Tensor,
     *,
     graph_token_groups: Sequence[Sequence[float]] | None = None,
-    graph_token_cost_lambda: float = 0.8,
+    graph_token_cost_lambda: float = 1.0,
     edge_tanh_temperature: float = 1.0,
     edge_ig_reward_lambda: float = 0.0,
     edge_ig_discount_factor: float = 0.0,
