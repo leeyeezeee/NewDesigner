@@ -29,6 +29,7 @@ from experiments.teacher_forcing_reward import (
 )
 from experiments.edge_training_log import (
     append_edge_training_details,
+    append_topology_diagnostics,
     reset_edge_training_log,
     resolve_edge_training_log_file,
     resolve_question_id,
@@ -319,6 +320,12 @@ async def run_math_dataset(
                 edge_ig_reward_lambda=iteration_edge_ig_reward_lambda,
                 edge_ig_discount_factor=getattr(args, "edge_ig_discount_factor", 0.0),
                 advantage_epsilon=getattr(args, "graph_advantage_epsilon", 1e-6),
+            )
+            append_topology_diagnostics(
+                edge_training_log_file,
+                iteration=i_batch,
+                graph_groups=graph_groups,
+                reward_summaries=tf_summaries,
             )
             if graph_tf_corrects:
                 avg_correct = sum(graph_tf_corrects) / len(graph_tf_corrects)

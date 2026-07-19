@@ -1,4 +1,5 @@
 import shortuuid
+import math
 from typing import Any, List, Optional, Dict, Tuple
 from abc import ABC
 import numpy as np
@@ -12,9 +13,12 @@ import GDesigner.prompt
 from GDesigner.graph.node import Node
 from GDesigner.agents.agent_registry import AgentRegistry
 from GDesigner.prompt.prompt_set_registry import PromptSetRegistry
-from GDesigner.llm.profile_embedding import get_sentence_embedding
+from GDesigner.llm.profile_embedding import (
+    get_sentence_embedding,
+    get_sentence_embeddings,
+)
 from GDesigner.llm.price import MissingRemoteTokenUsageError
-from GDesigner.gnn.gat import ResidualGATEncoder
+from GDesigner.gnn.gat import InitialResidualGATv2Encoder
 from torch_geometric.utils import dense_to_sparse
 from torch.nn.utils.parametrizations import spectral_norm
 
@@ -98,6 +102,7 @@ class Graph(ABC):
         self.potential_spatial_edges:List[List[str, str]] = []
         self.potential_temporal_edges:List[List[str,str]] = []
         self.edge_log_probs:List[Dict[str, Any]] = []
+        self.spatial_sampling_temperature = 2.0
         # Every sampled Bernoulli decision, including rejected edges.  IG uses
         # edge_log_probs (selected edges only), while graph-level information
         # bottleneck regularization needs both outcomes.
@@ -113,8 +118,15 @@ class Graph(ABC):
         self.role_adj_matrix = self.construct_adj_matrix()
         self.features = self.construct_features()
         node_feature_dim = self.features.size(1)
-        topology_input_dim = node_feature_dim * 2
-        self.gat = ResidualGATEncoder(
+        # Graph-GRPO conditions every node by encoding the role description
+        # and task text jointly.  The GAT therefore receives one MiniLM
+        # embedding per node instead of concatenating two independently
+        # encoded 384-dimensional vectors.
+        topology_input_dim = node_feature_dim
+        self.spatial_policy_architecture = (
+            "initial_residual_gatv2_joint_role_task_2x64_4head_v3"
+        )
+        self.gat = InitialResidualGATv2Encoder(
             topology_input_dim,
             hidden_channels=self.edge_embedding_dim,
             heads=4,
@@ -229,25 +241,120 @@ class Graph(ABC):
         edge_index, edge_weight = dense_to_sparse(role_adj)
         return edge_index
     
+    def _node_profile_text(self, node: Node) -> str:
+        if node is self.decision_node:
+            return node.role
+        return self.prompt_set.get_description(node.role)
+
     def construct_features(self):
         features = []
         for node_id in self.nodes:
             node = self.nodes[node_id]
-            role = node.role
-            if node is self.decision_node:
-                profile = role
-            else:
-                profile = self.prompt_set.get_description(role)
+            profile = self._node_profile_text(node)
             feature = get_sentence_embedding(profile)
             features.append(feature)
         features = torch.tensor(np.array(features))
         return features
     
     def construct_new_features(self, query):
-        query_embedding = torch.tensor(get_sentence_embedding(query))
-        query_embedding = query_embedding.unsqueeze(0).repeat((self.num_nodes,1))
-        new_features = torch.cat((self.features,query_embedding),dim=1)
-        return new_features
+        # Match Graph-GRPO's x_i = Encoder(Role_i + Q): concatenate the
+        # texts before the frozen MiniLM encoder so role-task interactions are
+        # represented inside one 384-dimensional embedding.  Encoding the
+        # batch at once also avoids one model call per node.
+        conditioned_profiles = [
+            f"Role: {self._node_profile_text(self.nodes[node_id])}\nTask: {query}"
+            for node_id in self.nodes
+        ]
+        embeddings = get_sentence_embeddings(conditioned_profiles)
+        return torch.as_tensor(
+            np.asarray(embeddings),
+            dtype=self.features.dtype,
+            device=self.features.device,
+        )
+
+    @staticmethod
+    def _node_embedding_statistics(embeddings: torch.Tensor) -> Dict[str, float]:
+        embeddings = embeddings.detach().float()
+        node_count = int(embeddings.size(0))
+        if node_count < 2:
+            return {
+                "mean_pairwise_cosine": 1.0,
+                "std_pairwise_cosine": 0.0,
+                "mean_feature_variance": 0.0,
+            }
+        normalized = F.normalize(embeddings, p=2.0, dim=-1, eps=1e-6)
+        similarities = normalized @ normalized.t()
+        off_diagonal = ~torch.eye(
+            node_count,
+            dtype=torch.bool,
+            device=embeddings.device,
+        )
+        pairwise = similarities[off_diagonal]
+        return {
+            "mean_pairwise_cosine": float(pairwise.mean().cpu().item()),
+            "std_pairwise_cosine": float(
+                pairwise.std(unbiased=False).cpu().item()
+            ),
+            "mean_feature_variance": float(
+                embeddings.var(dim=0, unbiased=False).mean().cpu().item()
+            ),
+        }
+
+    @staticmethod
+    def _attention_statistics(
+        edge_index: torch.Tensor,
+        attention_weights: torch.Tensor,
+    ) -> Dict[str, float]:
+        weights = attention_weights.detach().float()
+        if weights.ndim == 1:
+            weights = weights.unsqueeze(-1)
+        if weights.numel() == 0:
+            return {
+                "normalized_entropy": 0.0,
+                "weight_std": 0.0,
+                "weight_min": 0.0,
+                "weight_max": 0.0,
+            }
+        target_indices = edge_index[1].detach()
+        entropies = []
+        normalized_weight_values = []
+        for target in torch.unique(target_indices):
+            target_weights = weights[target_indices == target]
+            degree = int(target_weights.size(0))
+            if degree <= 1:
+                continue
+            totals = target_weights.sum(dim=0)
+            valid_heads = totals > 1e-12
+            if not bool(valid_heads.any()):
+                continue
+            target_weights = (
+                target_weights[:, valid_heads]
+                / totals[valid_heads].unsqueeze(0)
+            )
+            entropy = -(
+                target_weights.clamp_min(1e-12)
+                * target_weights.clamp_min(1e-12).log()
+            ).sum(dim=0) / math.log(degree)
+            entropies.append(entropy)
+            normalized_weight_values.append(target_weights.reshape(-1))
+        normalized_entropy = (
+            torch.cat(entropies).mean()
+            if entropies
+            else weights.new_tensor(0.0)
+        )
+        normalized_weights = (
+            torch.cat(normalized_weight_values)
+            if normalized_weight_values
+            else weights.new_zeros(1)
+        )
+        return {
+            "normalized_entropy": float(normalized_entropy.cpu().item()),
+            "weight_std": float(
+                normalized_weights.std(unbiased=False).cpu().item()
+            ),
+            "weight_min": float(normalized_weights.min().cpu().item()),
+            "weight_max": float(normalized_weights.max().cpu().item()),
+        }
 
     def prepare_spatial_logits(
             self,
@@ -256,11 +363,15 @@ class Graph(ABC):
             ) -> None:
         def _compute_spatial_logits() -> None:
             new_features = self.construct_new_features(task)
-            node_embeddings = self.gat(new_features, self.role_adj_matrix)
+            node_embeddings, encoder_diagnostics = self.gat(
+                new_features,
+                self.role_adj_matrix,
+                return_diagnostics=True,
+            )
             if not torch.isfinite(node_embeddings).all():
                 nonfinite = int((~torch.isfinite(node_embeddings)).sum().item())
                 raise FloatingPointError(
-                    "Residual GAT produced non-finite node embeddings: "
+                    "Initial-residual GATv2 produced non-finite node embeddings: "
                     f"{nonfinite}/{node_embeddings.numel()} values."
                 )
             edge_embeddings = F.normalize(
@@ -283,6 +394,87 @@ class Graph(ABC):
                     f"{nonfinite}/{affinity_scores.numel()} values."
                 )
             self.spatial_logits = affinity_scores.reshape(-1)
+            valid_mask = self.spatial_masks.reshape(-1) > 0
+            valid_logits = self.spatial_logits[valid_mask]
+            # Keep diagnostics aligned with the actual Bernoulli sampler.
+            valid_probabilities = torch.sigmoid(
+                valid_logits / self.spatial_sampling_temperature
+            )
+            if valid_logits.numel() == 0:
+                edge_distribution_diagnostics = {
+                    "valid_edges": 0,
+                    "logit_mean": 0.0,
+                    "logit_std": 0.0,
+                    "logit_min": 0.0,
+                    "logit_max": 0.0,
+                    "probability_mean": 0.0,
+                    "probability_std": 0.0,
+                    "probability_min": 0.0,
+                    "probability_max": 0.0,
+                    "uncertain_probability_fraction": 0.0,
+                    "expected_edges": 0.0,
+                }
+            else:
+                edge_distribution_diagnostics = {
+                    "valid_edges": int(valid_logits.numel()),
+                    "logit_mean": float(valid_logits.mean().detach().cpu().item()),
+                    "logit_std": float(
+                        valid_logits.std(unbiased=False).detach().cpu().item()
+                    ),
+                    "logit_min": float(valid_logits.min().detach().cpu().item()),
+                    "logit_max": float(valid_logits.max().detach().cpu().item()),
+                    "probability_mean": float(
+                        valid_probabilities.mean().detach().cpu().item()
+                    ),
+                    "probability_std": float(
+                        valid_probabilities.std(unbiased=False).detach().cpu().item()
+                    ),
+                    "probability_min": float(
+                        valid_probabilities.min().detach().cpu().item()
+                    ),
+                    "probability_max": float(
+                        valid_probabilities.max().detach().cpu().item()
+                    ),
+                    "uncertain_probability_fraction": float(
+                        (
+                            (valid_probabilities >= 0.4)
+                            & (valid_probabilities <= 0.6)
+                        ).float().mean().detach().cpu().item()
+                    ),
+                    "expected_edges": float(
+                        valid_probabilities.sum().detach().cpu().item()
+                    ),
+                }
+            self.topology_diagnostics = {
+                "node_embeddings": {
+                    "joint_input": self._node_embedding_statistics(new_features),
+                    "projected_input": self._node_embedding_statistics(
+                        encoder_diagnostics["initial"]
+                    ),
+                    "gatv2_layer1": self._node_embedding_statistics(
+                        encoder_diagnostics["layer1"]
+                    ),
+                    "gatv2_layer2": self._node_embedding_statistics(
+                        encoder_diagnostics["layer2"]
+                    ),
+                },
+                "attention": {
+                    "gatv2_layer1": self._attention_statistics(
+                        encoder_diagnostics["attention1_edge_index"],
+                        encoder_diagnostics["attention1_weights"],
+                    ),
+                    "gatv2_layer2": self._attention_statistics(
+                        encoder_diagnostics["attention2_edge_index"],
+                        encoder_diagnostics["attention2_weights"],
+                    ),
+                },
+                "edge_distribution": edge_distribution_diagnostics,
+                "final_node_embeddings": node_embeddings.detach().cpu(),
+                "initial_residual_weight": float(
+                    encoder_diagnostics["initial_residual_weight"]
+                ),
+                "sampling_temperature": self.spatial_sampling_temperature,
+            }
 
         if track_grad:
             _compute_spatial_logits()

@@ -29,6 +29,7 @@ from experiments.teacher_forcing_reward import (
 )
 from experiments.edge_training_log import (
     append_edge_training_details,
+    append_topology_diagnostics,
     reset_edge_training_log,
     resolve_edge_training_log_file,
     resolve_question_id,
@@ -306,6 +307,12 @@ async def train(graph:Graph,
                 edge_ig_reward_lambda=iteration_edge_ig_reward_lambda,
                 edge_ig_discount_factor=edge_ig_discount_factor,
                 advantage_epsilon=graph_advantage_epsilon,
+            )
+            append_topology_diagnostics(
+                edge_training_log_path,
+                iteration=i_iter,
+                graph_groups=graph_groups,
+                reward_summaries=tf_summaries,
             )
             if graph_tf_corrects:
                 avg_adv_variance = (

@@ -1,10 +1,12 @@
 import torch
 import torch.nn.functional as F
-from torch_geometric.nn import GATConv
+from torch_geometric.nn import GATv2Conv
 
 
-class ResidualGATEncoder(torch.nn.Module):
-    """Two-layer residual GAT encoder for task-conditioned role features."""
+class InitialResidualGATv2Encoder(torch.nn.Module):
+    """Two-layer GATv2 encoder with a fixed GCNII-style initial residual."""
+
+    INITIAL_RESIDUAL_WEIGHT = 0.2
 
     def __init__(
         self,
@@ -28,7 +30,7 @@ class ResidualGATEncoder(torch.nn.Module):
             bias=False,
         )
         self.input_norm = torch.nn.LayerNorm(hidden_channels)
-        self.conv1 = GATConv(
+        self.conv1 = GATv2Conv(
             hidden_channels,
             head_channels,
             heads=heads,
@@ -37,7 +39,7 @@ class ResidualGATEncoder(torch.nn.Module):
             add_self_loops=True,
         )
         self.norm1 = torch.nn.LayerNorm(hidden_channels)
-        self.conv2 = GATConv(
+        self.conv2 = GATv2Conv(
             hidden_channels,
             head_channels,
             heads=heads,
@@ -56,15 +58,42 @@ class ResidualGATEncoder(torch.nn.Module):
         self.conv2.reset_parameters()
         self.norm2.reset_parameters()
 
-    def forward(self, x: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
-        x = self.input_norm(self.input_projection(x))
+    def forward(
+        self,
+        x: torch.Tensor,
+        edge_index: torch.Tensor,
+        *,
+        return_diagnostics: bool = False,
+    ):
+        initial = self.input_norm(self.input_projection(x))
+        alpha = self.INITIAL_RESIDUAL_WEIGHT
 
-        update = self.conv1(x, edge_index)
+        update, attention1 = self.conv1(
+            initial,
+            edge_index,
+            return_attention_weights=True,
+        )
         update = F.elu(update)
         update = F.dropout(update, p=self.dropout, training=self.training)
-        x = self.norm1(x + update)
+        layer1 = self.norm1((1.0 - alpha) * update + alpha * initial)
 
-        update = self.conv2(x, edge_index)
+        update, attention2 = self.conv2(
+            layer1,
+            edge_index,
+            return_attention_weights=True,
+        )
         update = F.elu(update)
         update = F.dropout(update, p=self.dropout, training=self.training)
-        return self.norm2(x + update)
+        layer2 = self.norm2((1.0 - alpha) * update + alpha * initial)
+        if not return_diagnostics:
+            return layer2
+        return layer2, {
+            "initial": initial.detach(),
+            "layer1": layer1.detach(),
+            "layer2": layer2.detach(),
+            "attention1_edge_index": attention1[0].detach(),
+            "attention1_weights": attention1[1].detach(),
+            "attention2_edge_index": attention2[0].detach(),
+            "attention2_weights": attention2[1].detach(),
+            "initial_residual_weight": alpha,
+        }
