@@ -104,6 +104,7 @@ class Graph(ABC):
         self.edge_decisions:List[Dict[str, Any]] = []
         self.realized_edge_counts:List[int] = []
         self.realized_spatial_edge_counts:List[int] = []
+        self.decision_node_skipped = False
         self.node_kwargs = node_kwargs if node_kwargs is not None else [{} for _ in agent_names]
         self.edge_embedding_dim = 64
         self.init_nodes() # add nodes to the self.nodes
@@ -418,6 +419,16 @@ class Graph(ABC):
     def num_nodes(self):
         return len(self.nodes)
 
+    @staticmethod
+    def _is_isolated_node(node: Node) -> bool:
+        """Return whether the realized round gives a node no incident edge."""
+        return not any((
+            node.spatial_predecessors,
+            node.spatial_successors,
+            node.temporal_predecessors,
+            node.temporal_successors,
+        ))
+
     def find_node(self, id: str):
         if id in self.nodes.keys():
             return self.nodes[id]
@@ -604,6 +615,7 @@ class Graph(ABC):
         self.edge_decisions = []
         self.realized_edge_counts = []
         self.realized_spatial_edge_counts = []
+        self.decision_node_skipped = False
         task = inputs.get("task", str(inputs)) if isinstance(inputs, dict) else str(inputs)
         self.prepare_spatial_logits(task, track_grad=track_grad)
         for round in range(num_rounds):
@@ -617,9 +629,19 @@ class Graph(ABC):
             self.realized_edge_counts.append(self.communication_edge_count)
             
             # The strict upper-triangular mask makes insertion order a valid
-            # topological order and guarantees that the appended decision node
-            # executes last even when it samples no incoming edge.
+            # topological order and guarantees that a connected decision node
+            # executes last. Fully isolated nodes do not invoke their model.
             for current_node_id, current_node in self.nodes.items():
+                if self._is_isolated_node(current_node):
+                    current_node.skip_execution(
+                        round,
+                        record_execution_history=record_execution_history,
+                    )
+                    if current_node is self.decision_node:
+                        self.decision_node_skipped = True
+                    continue
+                if current_node is self.decision_node:
+                    self.decision_node_skipped = False
                 tries = 0
                 while tries < max_tries:
                     try:
@@ -672,6 +694,7 @@ class Graph(ABC):
         self.edge_decisions = []
         self.realized_edge_counts = []
         self.realized_spatial_edge_counts = []
+        self.decision_node_skipped = False
         self.prepare_spatial_logits(input['task'], track_grad=track_grad)
 
         for round in range(num_rounds):
@@ -687,6 +710,16 @@ class Graph(ABC):
             self.realized_edge_counts.append(self.communication_edge_count)
             
             for current_node_id, current_node in self.nodes.items():
+                if self._is_isolated_node(current_node):
+                    current_node.skip_execution(
+                        round,
+                        record_execution_history=record_execution_history,
+                    )
+                    if current_node is self.decision_node:
+                        self.decision_node_skipped = True
+                    continue
+                if current_node is self.decision_node:
+                    self.decision_node_skipped = False
                 tries = 0
                 while tries < max_tries:
                     try:

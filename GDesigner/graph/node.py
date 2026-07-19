@@ -171,6 +171,7 @@ class Node(ABC):
         }
         self.execution_history.append({
             "round": round_idx,
+            "skipped": False,
             "outputs": list(self.outputs),
             "output_token_logprobs": list(self.output_token_logprobs),
             "communication_outputs": list(self.outputs),
@@ -181,6 +182,26 @@ class Node(ABC):
             "spatial_info": spatial_info_snapshot,
             "temporal_info": temporal_info_snapshot,
         })
+
+    def skip_execution(
+        self,
+        round_idx: Optional[int],
+        *,
+        record_execution_history: bool = True,
+    ) -> List[Any]:
+        """Clear this round's state without invoking the node's model."""
+        self.inputs = []
+        self.outputs = []
+        self.entropy_samples = []
+        self.output_token_logprobs = []
+        self.entropy_samples_token_logprobs = []
+        self.raw_inputs = []
+        if record_execution_history:
+            history_size = len(self.execution_history)
+            self._record_execution(round_idx, {}, {})
+            if len(self.execution_history) > history_size:
+                self.execution_history[-1]["skipped"] = True
+        return self.outputs
 
     @staticmethod
     def _as_output_and_logprob_lists(

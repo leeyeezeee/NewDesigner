@@ -282,11 +282,15 @@ async def main():
                 for sample_pos, graph_idx in enumerate(group_indices):
                     realized_graph = realized_graphs[graph_idx]
                     raw_answer = raw_answers[graph_idx]
-                    predict_answer = gsm_get_predict(raw_answer[0])
-                    try:
-                        is_solved = float(predict_answer) == float(true_answer)
-                    except (TypeError, ValueError):
+                    if realized_graph.decision_node_skipped:
+                        predict_answer = None
                         is_solved = False
+                    else:
+                        predict_answer = gsm_get_predict(raw_answer[0])
+                        try:
+                            is_solved = float(predict_answer) == float(true_answer)
+                        except (TypeError, ValueError):
+                            is_solved = False
                     graph_tf_corrects.append(float(is_solved))
                     graph_tf_edge_counts.append(realized_graph.mean_spatial_edges_per_round)
                     needs_edge_details = (
@@ -387,8 +391,12 @@ async def main():
                 )
         else:
             for graph_idx, (task, answer, log_prob, true_answer, realized_graph, input_dict, question_id) in enumerate(zip(current_batch, raw_answers, log_probs, answers, realized_graphs, input_dicts, question_ids)):
-                predict_answer = gsm_get_predict(answer[0])
-                is_solved = float(predict_answer)==float(true_answer)
+                if realized_graph.decision_node_skipped:
+                    predict_answer = None
+                    is_solved = False
+                else:
+                    predict_answer = gsm_get_predict(answer[0])
+                    is_solved = float(predict_answer)==float(true_answer)
                 total_solved = total_solved + is_solved
                 total_executed = total_executed + 1
                 accuracy = total_solved/ total_executed

@@ -218,7 +218,11 @@ async def train(graph:Graph,
                 for sample_pos, graph_idx in enumerate(group_indices):
                     raw_answer = raw_answers[graph_idx]
                     realized_graph = realized_graphs[graph_idx]
-                    record_answer = dataset.postprocess_answer(raw_answer)
+                    record_answer = (
+                        ""
+                        if realized_graph.decision_node_skipped
+                        else dataset.postprocess_answer(raw_answer)
+                    )
                     record_accuracy = Accuracy()
                     record_accuracy.update(record_answer, correct_answer)
                     graph_tf_corrects.append(float(record_accuracy.get()))
@@ -262,7 +266,11 @@ async def train(graph:Graph,
                             selector_ig_tau,
                         ))
                     if sample_pos == 0:
-                        answer = dataset.postprocess_answer(raw_answer)
+                        answer = (
+                            ""
+                            if realized_graph.decision_node_skipped
+                            else dataset.postprocess_answer(raw_answer)
+                        )
                         answers.append(answer)
                         accuracy = Accuracy()
                         accuracy.update(answer, correct_answer)
@@ -331,7 +339,11 @@ async def train(graph:Graph,
                 )
         else:
             for graph_idx, (raw_answer, log_prob, correct_answer, realized_graph, input_dict, question_id) in enumerate(zip(raw_answers, log_probs, correct_answers, realized_graphs, input_dicts, question_ids)):
-                answer = dataset.postprocess_answer(raw_answer)
+                answer = (
+                    ""
+                    if realized_graph.decision_node_skipped
+                    else dataset.postprocess_answer(raw_answer)
+                )
                 answers.append(answer)
                 assert isinstance(correct_answer, str), \
                         f"String expected but got {correct_answer} of type {type(correct_answer)} (1)"

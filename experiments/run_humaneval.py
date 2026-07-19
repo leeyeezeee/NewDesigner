@@ -283,8 +283,12 @@ async def main():
                     raw_answer = raw_answers[graph_idx]
                     if not isinstance(raw_answer,list):
                         raise TypeError(f"Expected a list for the answer, but got {type(raw_answer).__name__}")
-                    answer = raw_answer[0].lstrip("```python\n").rstrip("\n```")
-                    is_solved, _, _ = PyExecutor().execute(answer, [test], timeout=100)
+                    if realized_graph.decision_node_skipped:
+                        answer = ""
+                        is_solved = False
+                    else:
+                        answer = raw_answer[0].lstrip("```python\n").rstrip("\n```")
+                        is_solved, _, _ = PyExecutor().execute(answer, [test], timeout=100)
                     graph_tf_corrects.append(float(is_solved))
                     graph_tf_edge_counts.append(realized_graph.mean_spatial_edges_per_round)
                     needs_edge_details = (
@@ -387,8 +391,12 @@ async def main():
             for graph_idx, (task, answer, log_prob, test, realized_graph, input_dict, question_id) in enumerate(zip(current_batch, raw_answers, log_probs, tests, realized_graphs, input_dicts, question_ids)):
                 if not isinstance(answer,list):
                     raise TypeError(f"Expected a list for the answer, but got {type(answer).__name__}")
-                answer = answer[0].lstrip("```python\n").rstrip("\n```")
-                is_solved, _, _ = PyExecutor().execute(answer, [test], timeout=100)
+                if realized_graph.decision_node_skipped:
+                    answer = ""
+                    is_solved = False
+                else:
+                    answer = answer[0].lstrip("```python\n").rstrip("\n```")
+                    is_solved, _, _ = PyExecutor().execute(answer, [test], timeout=100)
                 total_solved = total_solved + is_solved
                 total_executed = total_executed + 1
                 accuracy = total_solved/ total_executed

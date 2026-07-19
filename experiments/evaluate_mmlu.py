@@ -78,8 +78,16 @@ async def evaluate(
             total_edges += realized_graph.mean_spatial_edges_per_round
             edge_samples += 1
         print(f"Batch time {time.time() - start_ts:.3f}")
-        for raw_answer, record in zip(raw_answers, record_batch):
-            answer = dataset.postprocess_answer(raw_answer)
+        for raw_answer, record, realized_graph in zip(
+            raw_answers,
+            record_batch,
+            realized_graphs,
+        ):
+            answer = (
+                ""
+                if realized_graph.decision_node_skipped
+                else dataset.postprocess_answer(raw_answer)
+            )
             correct_answer = dataset.record_to_target_answer(record)
             accuracy.update(answer, correct_answer)
         accuracy.print()

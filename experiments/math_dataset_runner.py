@@ -238,8 +238,12 @@ async def run_math_dataset(
                 for sample_pos, graph_idx in enumerate(group_indices):
                     realized_graph = realized_graphs[graph_idx]
                     answer = raw_answers[graph_idx]
-                    predict_answer = answer_parser(answer[0])
-                    is_solved = correctness_fn(predict_answer, true_answer)
+                    if realized_graph.decision_node_skipped:
+                        predict_answer = None
+                        is_solved = False
+                    else:
+                        predict_answer = answer_parser(answer[0])
+                        is_solved = correctness_fn(predict_answer, true_answer)
                     correctness_reward = float(is_solved)
                     graph_tf_corrects.append(correctness_reward)
                     graph_tf_edge_counts.append(realized_graph.mean_spatial_edges_per_round)
@@ -349,8 +353,12 @@ async def run_math_dataset(
                 input_dicts,
                 question_ids,
             )):
-                predict_answer = answer_parser(answer[0])
-                is_solved = correctness_fn(predict_answer, true_answer)
+                if realized_graph.decision_node_skipped:
+                    predict_answer = None
+                    is_solved = False
+                else:
+                    predict_answer = answer_parser(answer[0])
+                    is_solved = correctness_fn(predict_answer, true_answer)
                 correctness_reward = float(is_solved)
                 total_solved += int(is_solved)
                 total_executed += 1
