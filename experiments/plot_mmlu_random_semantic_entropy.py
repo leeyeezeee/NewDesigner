@@ -730,6 +730,7 @@ def build_graph(bundle: DatasetBundle, args, agent_names: List[str]) -> Graph:
         **kwargs,
     )
     graph.gat.eval()
+    graph.edge_mlp.eval()
     graph.spatial_affinity.eval()
     return graph
 

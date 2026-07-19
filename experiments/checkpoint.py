@@ -43,6 +43,7 @@ def save_graph_checkpoint(
             "optimized_temporal": bool(graph.optimized_temporal),
             "spatial_policy_architecture": graph.spatial_policy_architecture,
             "gat_state_dict": graph.gat.state_dict(),
+            "edge_mlp_state_dict": graph.edge_mlp.state_dict(),
             "spatial_affinity_state_dict": graph.spatial_affinity.state_dict(),
             "spatial_masks": graph.spatial_masks.detach().cpu(),
             "temporal_logits": graph.temporal_logits.detach().cpu(),
@@ -119,10 +120,16 @@ def load_graph_checkpoint(
                 "Checkpoint spatial policy architecture "
                 f"{checkpoint_architecture!r} is incompatible with the current "
                 f"architecture {expected_architecture!r}. Retrain the spatial "
-                "policy because the joint role-task encoder and initial-residual "
-                "GATv2 policy are not shape-compatible with older checkpoints."
+                "policy because the GATv2 bottleneck + MLP decoder is not "
+                "shape-compatible with older checkpoints."
             )
         graph.gat.load_state_dict(graph_state["gat_state_dict"])
+        if "edge_mlp_state_dict" not in graph_state:
+            raise ValueError(
+                "Checkpoint is missing 'edge_mlp_state_dict' for the current "
+                "GATv2 bottleneck + MLP spatial policy."
+            )
+        graph.edge_mlp.load_state_dict(graph_state["edge_mlp_state_dict"])
     elif any(
         key in graph_state
         for key in (

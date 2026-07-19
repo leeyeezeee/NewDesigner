@@ -63,6 +63,170 @@ def _mean(values) -> float:
     return sum(values) / len(values) if values else 0.0
 
 
+def _range(values) -> float:
+    values = [float(value) for value in values]
+    return max(values) - min(values) if values else 0.0
+
+
+def _mean_abs(values) -> float:
+    values = [abs(float(value)) for value in values]
+    return sum(values) / len(values) if values else 0.0
+
+
+def _pearson(left_values, right_values):
+    pairs = [
+        (float(left), float(right))
+        for left, right in zip(left_values, right_values)
+    ]
+    if len(pairs) < 2:
+        return None
+    left_mean = sum(left for left, _right in pairs) / len(pairs)
+    right_mean = sum(right for _left, right in pairs) / len(pairs)
+    left_centered = [left - left_mean for left, _right in pairs]
+    right_centered = [right - right_mean for _left, right in pairs]
+    left_variance = sum(value * value for value in left_centered)
+    right_variance = sum(value * value for value in right_centered)
+    if left_variance <= 1e-12 or right_variance <= 1e-12:
+        return None
+    covariance = sum(
+        left * right
+        for left, right in zip(left_centered, right_centered)
+    )
+    return covariance / ((left_variance * right_variance) ** 0.5)
+
+
+def _reward_sample_diagnostics(reward_summaries) -> Dict[str, Any]:
+    """Summarize whether token cost is aligned with sampled edge count."""
+    token_edge_correlations = []
+    global_edges = []
+    global_tokens = []
+    token_advantages = []
+    correctness_advantages = []
+    graph_advantages = []
+    prompt_token_ranges = []
+    normalized_token_cost_ranges = []
+    edge_ranges = []
+    sample_groups = []
+
+    for group_idx, summary in enumerate(reward_summaries or []):
+        edges = [
+            float(value)
+            for value in summary.get("mean_spatial_edges_per_round", [])
+        ]
+        tokens = [
+            float(value)
+            for value in summary.get("graph_token_counts", [])
+        ]
+        normalized_costs = [
+            float(value)
+            for value in summary.get("normalized_graph_token_costs", [])
+        ]
+        group_token_advantages = [
+            float(value)
+            for value in summary.get("token_advantages", [])
+        ]
+        group_correctness_advantages = [
+            float(value)
+            for value in summary.get("correctness_advantages", [])
+        ]
+        group_graph_advantages = [
+            float(value)
+            for value in summary.get("graph_advantages", [])
+        ]
+        correctness_scores = [
+            float(value)
+            for value in summary.get("correctness_scores", [])
+        ]
+
+        group_correlation = _pearson(edges, tokens)
+        if group_correlation is not None:
+            token_edge_correlations.append(group_correlation)
+        if edges and tokens:
+            prompt_token_ranges.append(_range(tokens))
+            edge_ranges.append(_range(edges))
+            global_edges.extend(edges)
+            global_tokens.extend(tokens)
+        if normalized_costs:
+            normalized_token_cost_ranges.append(_range(normalized_costs))
+
+        token_advantages.extend(group_token_advantages)
+        correctness_advantages.extend(group_correctness_advantages)
+        graph_advantages.extend(group_graph_advantages)
+
+        samples = []
+        sample_count = max(
+            len(edges),
+            len(tokens),
+            len(normalized_costs),
+            len(group_token_advantages),
+            len(group_correctness_advantages),
+            len(group_graph_advantages),
+            len(correctness_scores),
+        )
+        for sample_idx in range(sample_count):
+            samples.append({
+                "sample": sample_idx,
+                "sampled_edges": (
+                    edges[sample_idx] if sample_idx < len(edges) else None
+                ),
+                "prompt_tokens": (
+                    tokens[sample_idx] if sample_idx < len(tokens) else None
+                ),
+                "normalized_token_cost": (
+                    normalized_costs[sample_idx]
+                    if sample_idx < len(normalized_costs)
+                    else None
+                ),
+                "correctness": (
+                    correctness_scores[sample_idx]
+                    if sample_idx < len(correctness_scores)
+                    else None
+                ),
+                "token_advantage": (
+                    group_token_advantages[sample_idx]
+                    if sample_idx < len(group_token_advantages)
+                    else None
+                ),
+                "correctness_advantage": (
+                    group_correctness_advantages[sample_idx]
+                    if sample_idx < len(group_correctness_advantages)
+                    else None
+                ),
+                "graph_advantage": (
+                    group_graph_advantages[sample_idx]
+                    if sample_idx < len(group_graph_advantages)
+                    else None
+                ),
+            })
+        sample_groups.append({
+            "group": group_idx,
+            "token_edge_correlation": group_correlation,
+            "prompt_token_range": _range(tokens),
+            "sampled_edge_range": _range(edges),
+            "samples": samples,
+        })
+
+    global_correlation = _pearson(global_edges, global_tokens)
+    return {
+        "token_edge_correlation": (
+            _mean(token_edge_correlations)
+            if token_edge_correlations
+            else None
+        ),
+        "token_edge_correlation_valid_groups": len(token_edge_correlations),
+        "global_token_edge_correlation": global_correlation,
+        "avg_abs_token_advantage": _mean_abs(token_advantages),
+        "avg_abs_correctness_advantage": _mean_abs(correctness_advantages),
+        "avg_abs_graph_advantage": _mean_abs(graph_advantages),
+        "avg_prompt_token_range_per_group": _mean(prompt_token_ranges),
+        "avg_normalized_token_cost_range_per_group": _mean(
+            normalized_token_cost_ranges
+        ),
+        "avg_edge_range_per_group": _mean(edge_ranges),
+        "sample_groups": sample_groups,
+    }
+
+
 def _aggregate_named_statistics(graphs, section: str) -> Dict[str, Any]:
     names = set()
     for graph in graphs:
@@ -251,6 +415,9 @@ def append_topology_diagnostics(
             "avg_expected_edges": expected_edges,
             "sample_minus_expected_edges": avg_sampled_edges - expected_edges,
         },
+        "reward_sample_diagnostics": _reward_sample_diagnostics(
+            reward_summaries
+        ),
         "task_adaptation_proxy": task_adaptation_proxy,
         "reward_gradient_norms": gradient_norms,
     }

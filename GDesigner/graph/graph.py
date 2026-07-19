@@ -15,9 +15,9 @@ from GDesigner.agents.agent_registry import AgentRegistry
 from GDesigner.prompt.prompt_set_registry import PromptSetRegistry
 from GDesigner.llm.profile_embedding import (
     get_sentence_embedding,
-    get_sentence_embeddings,
 )
 from GDesigner.llm.price import MissingRemoteTokenUsageError
+from GDesigner.gnn.gcn import MLP
 from GDesigner.gnn.gat import InitialResidualGATv2Encoder
 from torch_geometric.utils import dense_to_sparse
 from torch.nn.utils.parametrizations import spectral_norm
@@ -111,27 +111,25 @@ class Graph(ABC):
         self.realized_spatial_edge_counts:List[int] = []
         self.decision_node_skipped = False
         self.node_kwargs = node_kwargs if node_kwargs is not None else [{} for _ in agent_names]
-        self.edge_embedding_dim = 64
+        self.edge_embedding_dim = 16
         self.init_nodes() # add nodes to the self.nodes
         self.node_id_to_index = {node_id: idx for idx, node_id in enumerate(self.nodes)}
         self.init_potential_edges() # add potential edges to the self.potential_spatial/temporal_edges
         self.role_adj_matrix = self.construct_adj_matrix()
         self.features = self.construct_features()
         node_feature_dim = self.features.size(1)
-        # Graph-GRPO conditions every node by encoding the role description
-        # and task text jointly.  The GAT therefore receives one MiniLM
-        # embedding per node instead of concatenating two independently
-        # encoded 384-dimensional vectors.
-        topology_input_dim = node_feature_dim
+        topology_input_dim = node_feature_dim * 2
         self.spatial_policy_architecture = (
-            "initial_residual_gatv2_joint_role_task_2x64_4head_v3"
+            "initial_residual_gatv2_concat_role_task_768_16_384_mlp16_v4"
         )
         self.gat = InitialResidualGATv2Encoder(
             topology_input_dim,
-            hidden_channels=self.edge_embedding_dim,
+            bottleneck_channels=16,
+            out_channels=node_feature_dim,
             heads=4,
             dropout=0.1,
         )
+        self.edge_mlp = MLP(node_feature_dim, 16, self.edge_embedding_dim)
         affinity = torch.nn.Linear(
             self.edge_embedding_dim,
             self.edge_embedding_dim,
@@ -152,6 +150,7 @@ class Graph(ABC):
 
     def spatial_parameters(self) -> List[torch.nn.Parameter]:
         parameters = list(self.gat.parameters())
+        parameters.extend(self.edge_mlp.parameters())
         parameters.extend(self.spatial_affinity.parameters())
         return [parameter for parameter in parameters if parameter.requires_grad]
 
@@ -257,20 +256,13 @@ class Graph(ABC):
         return features
     
     def construct_new_features(self, query):
-        # Match Graph-GRPO's x_i = Encoder(Role_i + Q): concatenate the
-        # texts before the frozen MiniLM encoder so role-task interactions are
-        # represented inside one 384-dimensional embedding.  Encoding the
-        # batch at once also avoids one model call per node.
-        conditioned_profiles = [
-            f"Role: {self._node_profile_text(self.nodes[node_id])}\nTask: {query}"
-            for node_id in self.nodes
-        ]
-        embeddings = get_sentence_embeddings(conditioned_profiles)
-        return torch.as_tensor(
-            np.asarray(embeddings),
+        query_embedding = torch.tensor(
+            get_sentence_embedding(query),
             dtype=self.features.dtype,
             device=self.features.device,
         )
+        query_embedding = query_embedding.unsqueeze(0).repeat((self.num_nodes, 1))
+        return torch.cat((self.features, query_embedding), dim=1)
 
     @staticmethod
     def _node_embedding_statistics(embeddings: torch.Tensor) -> Dict[str, float]:
@@ -375,16 +367,13 @@ class Graph(ABC):
                     f"{nonfinite}/{node_embeddings.numel()} values."
                 )
             edge_embeddings = F.normalize(
-                node_embeddings,
+                self.edge_mlp(node_embeddings),
                 p=2.0,
                 dim=-1,
                 eps=1e-6,
             )
             projected_embeddings = self.spatial_affinity(edge_embeddings)
-            # Keep the same bounded logit scale used by the 16-dimensional
-            # policy. Increasing the representation width must not silently
-            # reduce Bernoulli exploration at the default temperature.
-            affinity_scores = 4.0 * (
+            affinity_scores = math.sqrt(self.edge_embedding_dim) * (
                 edge_embeddings @ projected_embeddings.t()
             )
             if not torch.isfinite(affinity_scores).all():

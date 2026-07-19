@@ -133,6 +133,7 @@ async def main():
                   optimized_temporal=args.optimized_temporal,
                   **kwargs)
     graph.gat.train()
+    graph.edge_mlp.train()
     graph.spatial_affinity.train()
     edge_training_log_file = resolve_edge_training_log_file("humaneval")
     reset_edge_training_log(edge_training_log_file)
@@ -230,6 +231,7 @@ async def main():
             for _ in range(sample_count):
                 realized_graph = copy.deepcopy(graph)
                 realized_graph.gat = graph.gat
+                realized_graph.edge_mlp = graph.edge_mlp
                 realized_graph.spatial_affinity = graph.spatial_affinity
                 realized_graph.temporal_logits = graph.temporal_logits
                 group_indices.append(len(realized_graphs))
@@ -522,6 +524,7 @@ async def main():
             edge_samples = 0
             accuracy = 0.0
             graph.gat.eval()
+            graph.edge_mlp.eval()
             graph.spatial_affinity.eval()
             reset_usage_counters()
             print("Start Eval")

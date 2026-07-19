@@ -25,6 +25,7 @@ async def evaluate(
     print(f"Evaluating gdesigner on {dataset.__class__.__name__} split {dataset.split}")
     
     graph.gat.eval()
+    graph.edge_mlp.eval()
     graph.spatial_affinity.eval()
     accuracy = Accuracy()
     total_edges = 0
@@ -56,6 +57,7 @@ async def evaluate(
         for record in record_batch:
             realized_graph = copy.deepcopy(graph)
             realized_graph.gat = graph.gat
+            realized_graph.edge_mlp = graph.edge_mlp
             realized_graph.spatial_affinity = graph.spatial_affinity
             realized_graphs.append(realized_graph)
             input_dict = dataset.record_to_input(record)

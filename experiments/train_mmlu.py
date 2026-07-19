@@ -77,7 +77,7 @@ async def train(graph:Graph,
             edge_ig_reward_lambda: float = None,
             edge_ig_warmup_iterations: int = 2,
             edge_ig_discount_factor: float = 0.0,
-            graph_token_cost_lambda: float = 0.4,
+            graph_token_cost_lambda: float = 0.6,
             graph_advantage_epsilon: float = 1e-6,
             max_concurrent_graphs: int = 10,
           ):
@@ -133,6 +133,7 @@ async def train(graph:Graph,
         optimizer_params.append(graph.temporal_logits)
     optimizer = torch.optim.Adam(optimizer_params, lr=lr)
     graph.gat.train()
+    graph.edge_mlp.train()
     graph.spatial_affinity.train()
     for i_iter in range(num_iters):
         edge_ig_measurement_enabled = i_iter >= max(
@@ -164,6 +165,7 @@ async def train(graph:Graph,
             for _ in range(sample_count):
                 realized_graph = copy.deepcopy(graph)
                 realized_graph.gat = graph.gat
+                realized_graph.edge_mlp = graph.edge_mlp
                 realized_graph.spatial_affinity = graph.spatial_affinity
                 realized_graph.temporal_logits = graph.temporal_logits
                 group_indices.append(len(realized_graphs))
