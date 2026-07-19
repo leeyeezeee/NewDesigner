@@ -70,7 +70,7 @@ async def train(graph:Graph,
             selector_ig_tau: float = 0.0,
             use_graph_tf_reward: bool = False,
             use_graph_correctness_advantage: bool = False,
-            graph_sample_count: int = 5,
+            graph_sample_count: int = 8,
             graph_softmax_temperature: float = 1.0,
             edge_tanh_temperature: float = 1.0,
             edge_ig_reward_lambda: float = None,
@@ -127,16 +127,11 @@ async def train(graph:Graph,
         _reset_jsonl(_GRAPH_TF_RECORD_FILE)
     graph_semaphore = make_graph_semaphore(max_concurrent_graphs)
     
-    optimizer_params = (
-        list(graph.gcn.parameters())
-        + list(graph.mlp.parameters())
-        + graph.spatial_parameters()
-    )
+    optimizer_params = graph.spatial_parameters()
     if graph.optimized_temporal:
         optimizer_params.append(graph.temporal_logits)
     optimizer = torch.optim.Adam(optimizer_params, lr=lr)
-    graph.gcn.train()
-    graph.mlp.train()
+    graph.gat.train()
     graph.spatial_affinity.train()
     for i_iter in range(num_iters):
         edge_ig_measurement_enabled = i_iter >= max(
@@ -167,10 +162,7 @@ async def train(graph:Graph,
             sample_count = max(1, int(graph_sample_count)) if use_multi_graph_reward else 1
             for _ in range(sample_count):
                 realized_graph = copy.deepcopy(graph)
-                realized_graph.gcn = graph.gcn
-                realized_graph.node_self_projection = graph.node_self_projection
-                realized_graph.node_feature_norm = graph.node_feature_norm
-                realized_graph.mlp = graph.mlp
+                realized_graph.gat = graph.gat
                 realized_graph.spatial_affinity = graph.spatial_affinity
                 realized_graph.temporal_logits = graph.temporal_logits
                 group_indices.append(len(realized_graphs))
@@ -413,8 +405,16 @@ async def train(graph:Graph,
                 "Graph training loss is not differentiable. A zero-edge sample "
                 "must still retain full-graph log-prob or IB gradients."
             )
+        if not torch.isfinite(total_loss):
+            raise FloatingPointError(
+                f"Graph training loss is non-finite: {total_loss.detach().item()}."
+            )
         total_loss.backward()
-        torch.nn.utils.clip_grad_norm_(optimizer_params, max_norm=1.0)
+        torch.nn.utils.clip_grad_norm_(
+            optimizer_params,
+            max_norm=1.0,
+            error_if_nonfinite=True,
+        )
         optimizer.step()
         if edge_selector is not None:
             selector_trained = (

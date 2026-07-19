@@ -31,7 +31,7 @@ def add_teacher_forcing_reward_args(parser) -> None:
     parser.add_argument(
         "--graph_sample_count",
         type=int,
-        default=5,
+        default=8,
         help="Number of communication graphs sampled per training example.",
     )
     parser.add_argument(
@@ -147,10 +147,28 @@ def _edge_ig_coefficient(
     edge_tanh_temperature: float,
     edge_ig_reward_lambda: float,
 ) -> torch.Tensor:
+    ig_gain = float(ig_gain)
+    edge_tanh_temperature = float(edge_tanh_temperature)
+    edge_ig_reward_lambda = float(edge_ig_reward_lambda)
+    if not all(math.isfinite(value) for value in (
+        ig_gain,
+        edge_tanh_temperature,
+        edge_ig_reward_lambda,
+    )):
+        raise FloatingPointError(
+            "Edge IG coefficient received a non-finite value: "
+            f"ig_gain={ig_gain}, temperature={edge_tanh_temperature}, "
+            f"lambda={edge_ig_reward_lambda}."
+        )
+    if edge_tanh_temperature <= 0.0:
+        raise ValueError(
+            "edge_tanh_temperature must be positive, got "
+            f"{edge_tanh_temperature}."
+        )
     normalized_gain = torch.tanh(
-        log_prob.new_tensor(float(ig_gain) / edge_tanh_temperature)
+        log_prob.new_tensor(ig_gain / edge_tanh_temperature)
     )
-    return log_prob.new_tensor(float(edge_ig_reward_lambda)) * normalized_gain
+    return log_prob.new_tensor(edge_ig_reward_lambda) * normalized_gain
 
 
 def _edge_ig_record(
@@ -418,7 +436,7 @@ def _unique_trainable_graph_parameters(
     for graphs in graph_groups:
         for graph in graphs:
             candidates: List[torch.nn.Parameter] = []
-            for module_name in ("gcn", "mlp"):
+            for module_name in ("gat",):
                 module = getattr(graph, module_name, None)
                 if isinstance(module, torch.nn.Module):
                     candidates.extend(module.parameters())

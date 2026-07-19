@@ -82,18 +82,13 @@ async def run_math_dataset(
         optimized_temporal=args.optimized_temporal,
         **kwargs,
     )
-    graph.gcn.train()
-    graph.mlp.train()
+    graph.gat.train()
     graph.spatial_affinity.train()
     edge_training_log_file = resolve_edge_training_log_file(
         dataset_name,
     )
     reset_edge_training_log(edge_training_log_file)
-    optimizer_params = (
-        list(graph.gcn.parameters())
-        + list(graph.mlp.parameters())
-        + graph.spatial_parameters()
-    )
+    optimizer_params = graph.spatial_parameters()
     if graph.optimized_temporal:
         optimizer_params.append(graph.temporal_logits)
     optimizer = torch.optim.Adam(optimizer_params, lr=args.lr)
@@ -181,16 +176,13 @@ async def run_math_dataset(
             record_input_dicts.append(input_dict)
             group_indices = []
             sample_count = (
-                max(1, int(getattr(args, "graph_sample_count", 5)))
+                max(1, int(getattr(args, "graph_sample_count", 8)))
                 if (use_multi_graph_reward and train_updates_enabled)
                 else 1
             )
             for _ in range(sample_count):
                 realized_graph = copy.deepcopy(graph)
-                realized_graph.gcn = graph.gcn
-                realized_graph.node_self_projection = graph.node_self_projection
-                realized_graph.node_feature_norm = graph.node_feature_norm
-                realized_graph.mlp = graph.mlp
+                realized_graph.gat = graph.gat
                 realized_graph.spatial_affinity = graph.spatial_affinity
                 realized_graph.temporal_logits = graph.temporal_logits
                 group_indices.append(len(realized_graphs))
@@ -432,8 +424,16 @@ async def run_math_dataset(
                     "Graph training loss is not differentiable. A zero-edge sample "
                     "must still retain full-graph log-prob or IB gradients."
                 )
+            if not torch.isfinite(total_loss):
+                raise FloatingPointError(
+                    f"Graph training loss is non-finite: {total_loss.detach().item()}."
+                )
             total_loss.backward()
-            torch.nn.utils.clip_grad_norm_(optimizer_params, max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(
+                optimizer_params,
+                max_norm=1.0,
+                error_if_nonfinite=True,
+            )
             optimizer.step()
             if edge_selector is not None:
                 selector_trained = (
@@ -470,8 +470,7 @@ async def run_math_dataset(
             total_edges = 0
             edge_samples = 0
             accuracy = 0.0
-            graph.gcn.eval()
-            graph.mlp.eval()
+            graph.gat.eval()
             graph.spatial_affinity.eval()
             reset_usage_counters()
             print("Start Eval")

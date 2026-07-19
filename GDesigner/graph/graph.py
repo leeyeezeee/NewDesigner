@@ -1,5 +1,4 @@
 import shortuuid
-import math
 from typing import Any, List, Optional, Dict, Tuple
 from abc import ABC
 import numpy as np
@@ -15,7 +14,7 @@ from GDesigner.agents.agent_registry import AgentRegistry
 from GDesigner.prompt.prompt_set_registry import PromptSetRegistry
 from GDesigner.llm.profile_embedding import get_sentence_embedding
 from GDesigner.llm.price import MissingRemoteTokenUsageError
-from GDesigner.gnn.gcn import GCN, MLP
+from GDesigner.gnn.gat import ResidualGATEncoder
 from torch_geometric.utils import dense_to_sparse
 from torch.nn.utils.parametrizations import spectral_norm
 
@@ -106,7 +105,7 @@ class Graph(ABC):
         self.realized_edge_counts:List[int] = []
         self.realized_spatial_edge_counts:List[int] = []
         self.node_kwargs = node_kwargs if node_kwargs is not None else [{} for _ in agent_names]
-        self.edge_embedding_dim = 16
+        self.edge_embedding_dim = 64
         self.init_nodes() # add nodes to the self.nodes
         self.node_id_to_index = {node_id: idx for idx, node_id in enumerate(self.nodes)}
         self.init_potential_edges() # add potential edges to the self.potential_spatial/temporal_edges
@@ -114,14 +113,12 @@ class Graph(ABC):
         self.features = self.construct_features()
         node_feature_dim = self.features.size(1)
         topology_input_dim = node_feature_dim * 2
-        self.gcn = GCN(topology_input_dim, 16, node_feature_dim)
-        self.node_self_projection = torch.nn.Linear(
+        self.gat = ResidualGATEncoder(
             topology_input_dim,
-            node_feature_dim,
-            bias=False,
+            hidden_channels=self.edge_embedding_dim,
+            heads=4,
+            dropout=0.1,
         )
-        self.node_feature_norm = torch.nn.LayerNorm(node_feature_dim)
-        self.mlp = MLP(node_feature_dim, 16, self.edge_embedding_dim)
         affinity = torch.nn.Linear(
             self.edge_embedding_dim,
             self.edge_embedding_dim,
@@ -141,8 +138,7 @@ class Graph(ABC):
         self.temporal_masks = torch.nn.Parameter(fixed_temporal_masks,requires_grad=False)  # fixed edge masks
 
     def spatial_parameters(self) -> List[torch.nn.Parameter]:
-        parameters = list(self.node_self_projection.parameters())
-        parameters.extend(self.node_feature_norm.parameters())
+        parameters = list(self.gat.parameters())
         parameters.extend(self.spatial_affinity.parameters())
         return [parameter for parameter in parameters if parameter.requires_grad]
 
@@ -224,7 +220,7 @@ class Graph(ABC):
         for node_idx in range(num_nodes):
             if node_idx == decision_idx:
                 continue
-            # The GCN substrate remains fully connected around the final role;
+            # The GAT substrate remains fully connected around the final role;
             # the strict DAG mask is applied only to generated edges.
             role_adj[node_idx][decision_idx] = 1
             role_adj[decision_idx][node_idx] = 1
@@ -259,21 +255,32 @@ class Graph(ABC):
             ) -> None:
         def _compute_spatial_logits() -> None:
             new_features = self.construct_new_features(task)
-            propagated_features = self.gcn(new_features, self.role_adj_matrix)
-            self_features = self.node_self_projection(new_features)
-            node_embeddings = self.node_feature_norm(
-                propagated_features + self_features
-            )
+            node_embeddings = self.gat(new_features, self.role_adj_matrix)
+            if not torch.isfinite(node_embeddings).all():
+                nonfinite = int((~torch.isfinite(node_embeddings)).sum().item())
+                raise FloatingPointError(
+                    "Residual GAT produced non-finite node embeddings: "
+                    f"{nonfinite}/{node_embeddings.numel()} values."
+                )
             edge_embeddings = F.normalize(
-                self.mlp(node_embeddings),
+                node_embeddings,
                 p=2.0,
                 dim=-1,
                 eps=1e-6,
             )
             projected_embeddings = self.spatial_affinity(edge_embeddings)
-            affinity_scores = math.sqrt(self.edge_embedding_dim) * (
+            # Keep the same bounded logit scale used by the 16-dimensional
+            # policy. Increasing the representation width must not silently
+            # reduce Bernoulli exploration at the default temperature.
+            affinity_scores = 4.0 * (
                 edge_embeddings @ projected_embeddings.t()
             )
+            if not torch.isfinite(affinity_scores).all():
+                nonfinite = int((~torch.isfinite(affinity_scores)).sum().item())
+                raise FloatingPointError(
+                    "Spatial affinity produced non-finite edge logits: "
+                    f"{nonfinite}/{affinity_scores.numel()} values."
+                )
             self.spatial_logits = affinity_scores.reshape(-1)
 
         if track_grad:

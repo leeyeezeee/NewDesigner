@@ -41,10 +41,8 @@ def save_graph_checkpoint(
             "agent_names": list(graph.agent_names),
             "optimized_spatial": bool(graph.optimized_spatial),
             "optimized_temporal": bool(graph.optimized_temporal),
-            "gcn_state_dict": graph.gcn.state_dict(),
-            "node_self_projection_state_dict": graph.node_self_projection.state_dict(),
-            "node_feature_norm_state_dict": graph.node_feature_norm.state_dict(),
-            "mlp_state_dict": graph.mlp.state_dict(),
+            "spatial_policy_architecture": "residual_gat_2x64_4head_v1",
+            "gat_state_dict": graph.gat.state_dict(),
             "spatial_affinity_state_dict": graph.spatial_affinity.state_dict(),
             "spatial_masks": graph.spatial_masks.detach().cpu(),
             "temporal_logits": graph.temporal_logits.detach().cpu(),
@@ -110,23 +108,26 @@ def load_graph_checkpoint(
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
     graph_state = checkpoint.get("graph", {})
 
-    if "gcn_state_dict" in graph_state:
-        graph.gcn.load_state_dict(graph_state["gcn_state_dict"])
-    if "node_self_projection_state_dict" in graph_state:
-        graph.node_self_projection.load_state_dict(
-            graph_state["node_self_projection_state_dict"]
-        )
-    if "node_feature_norm_state_dict" in graph_state:
-        graph.node_feature_norm.load_state_dict(
-            graph_state["node_feature_norm_state_dict"]
-        )
-    if "mlp_state_dict" in graph_state:
-        graph.mlp.load_state_dict(graph_state["mlp_state_dict"])
     if "gat_state_dict" in graph_state:
+        graph.gat.load_state_dict(graph_state["gat_state_dict"])
+    elif any(
+        key in graph_state
+        for key in (
+            "gcn_state_dict",
+            "node_self_projection_state_dict",
+            "node_feature_norm_state_dict",
+            "mlp_state_dict",
+        )
+    ):
         raise ValueError(
-            "This checkpoint contains the retired GAT policy network and "
-            "cannot be loaded into the GCN/MLP policy network. Retrain or use a "
-            "checkpoint containing 'gcn_state_dict' and 'mlp_state_dict'."
+            "This checkpoint contains the retired GCN/MLP spatial policy and "
+            "cannot be loaded into the residual GAT policy. Retrain the spatial "
+            "policy with the current architecture."
+        )
+    else:
+        raise ValueError(
+            "Checkpoint does not contain a 'gat_state_dict' for the current "
+            "residual GAT spatial policy."
         )
     if "spatial_affinity_state_dict" in graph_state:
         graph.spatial_affinity.load_state_dict(
