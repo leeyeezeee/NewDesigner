@@ -83,10 +83,11 @@ def add_teacher_forcing_reward_args(parser) -> None:
     parser.add_argument(
         "--graph_token_cost_lambda",
         type=float,
-        default=0.5,
+        default=1.0,
         help=(
-            "Weight of the centered OPTIMA-style graph token cost in the graph "
-            "reward before computing the group advantage."
+            "Beta weight of the centered OPTIMA-style graph token advantage. "
+            "Token costs are compared only among correct graphs and are kept "
+            "separate from the standardized correctness advantage."
         ),
     )
     parser.add_argument(
@@ -487,13 +488,13 @@ def graph_correctness_advantage_edge_loss(
     reference_loss: torch.Tensor,
     *,
     graph_token_groups: Sequence[Sequence[float]] | None = None,
-    graph_token_cost_lambda: float = 0.5,
+    graph_token_cost_lambda: float = 1.0,
     edge_tanh_temperature: float = 1.0,
     edge_ig_reward_lambda: float = 0.0,
     edge_ig_discount_factor: float = 0.0,
     advantage_epsilon: float = 1e-6,
 ) -> Tuple[torch.Tensor, List[Dict[str, Any]]]:
-    """Combine standardized correctness, centered prompt-token cost, and edge IG."""
+    """Add separate correctness, correct-only token-cost, and edge-IG losses."""
     zero = reference_loss.new_tensor(0.0)
     group_losses: List[torch.Tensor] = []
     group_graph_reward_losses: List[torch.Tensor] = []
@@ -545,56 +546,100 @@ def graph_correctness_advantage_edge_loss(
                 "edge-detail maps."
             )
         graph_token_counts = [max(0.0, float(count)) for count in graph_tokens]
-        max_graph_tokens = max(graph_token_counts, default=0.0)
+        correct_graph_mask = [
+            float(score) >= 1.0 - 1e-12 for score in correctness_scores
+        ]
+        correct_graph_token_counts = [
+            count
+            for count, is_correct in zip(
+                graph_token_counts,
+                correct_graph_mask,
+            )
+            if is_correct
+        ]
+        max_graph_tokens = max(correct_graph_token_counts, default=0.0)
         normalized_graph_token_costs = (
-            [count / max_graph_tokens for count in graph_token_counts]
+            [
+                count / max_graph_tokens if is_correct else 0.0
+                for count, is_correct in zip(
+                    graph_token_counts,
+                    correct_graph_mask,
+                )
+            ]
             if max_graph_tokens > 0.0
             else [0.0 for _ in graph_token_counts]
         )
-        graph_rewards = [
-            float(correctness)
-            - graph_token_cost_lambda * normalized_token_cost
-            for correctness, normalized_token_cost in zip(
-                correctness_scores,
+        (
+            correctness_baseline,
+            correctness_advantages,
+            correctness_variance,
+            correctness_std,
+        ) = _standardized_advantages(
+            correctness_scores,
+            advantage_epsilon=advantage_epsilon,
+        )
+
+        # Token cost is a separate objective.  Compare communication cost only
+        # among correct samples from the same task; an incorrect graph must
+        # never receive a positive update merely because it is cheap.  With
+        # fewer than two correct samples there is no within-correct comparison,
+        # so the token advantage is exactly zero for the whole group.
+        correct_graph_costs = [
+            cost
+            for cost, is_correct in zip(
                 normalized_graph_token_costs,
+                correct_graph_mask,
             )
+            if is_correct
         ]
-        graph_reward_baseline, advantages, graph_reward_variance, graph_reward_std = (
-            _standardized_advantages(
-                graph_rewards,
-                advantage_epsilon=advantage_epsilon,
-            )
-        )
-        correctness_baseline = (
-            sum(float(score) for score in correctness_scores)
-            / len(correctness_scores)
-            if correctness_scores
-            else 0.0
-        )
-        correctness_advantages = [
-            float(score) - correctness_baseline
-            for score in correctness_scores
-        ]
-        correctness_variance = (
-            sum(advantage * advantage for advantage in correctness_advantages)
-            / len(correctness_advantages)
-            if correctness_advantages
-            else 0.0
-        )
-        correctness_std = math.sqrt(correctness_variance)
         token_cost_baseline = (
-            sum(normalized_graph_token_costs) / len(normalized_graph_token_costs)
-            if normalized_graph_token_costs
+            sum(correct_graph_costs) / len(correct_graph_costs)
+            if len(correct_graph_costs) >= 2
             else 0.0
         )
         centered_token_costs = [
             cost - token_cost_baseline
-            for cost in normalized_graph_token_costs
+            if is_correct and len(correct_graph_costs) >= 2
+            else 0.0
+            for cost, is_correct in zip(
+                normalized_graph_token_costs,
+                correct_graph_mask,
+            )
         ]
         token_advantages = [
             -graph_token_cost_lambda * centered_cost
             for centered_cost in centered_token_costs
         ]
+        advantages = [
+            correctness_advantage + token_advantage
+            for correctness_advantage, token_advantage in zip(
+                correctness_advantages,
+                token_advantages,
+            )
+        ]
+
+        # These raw composite rewards are retained for human-readable logging;
+        # training uses the two explicitly separated advantages above.
+        graph_rewards = [
+            float(correctness) + token_advantage
+            for correctness, token_advantage in zip(
+                correctness_scores,
+                token_advantages,
+            )
+        ]
+        graph_reward_baseline = (
+            sum(graph_rewards) / len(graph_rewards) if graph_rewards else 0.0
+        )
+        centered_graph_rewards = [
+            reward - graph_reward_baseline for reward in graph_rewards
+        ]
+        graph_reward_variance = (
+            sum(value * value for value in centered_graph_rewards)
+            / len(centered_graph_rewards)
+            if centered_graph_rewards
+            else 0.0
+        )
+        graph_reward_std = math.sqrt(graph_reward_variance)
         spatial_probability_means: List[torch.Tensor] = []
         valid_spatial_edges: List[int] = []
         mean_spatial_edges = [
@@ -624,14 +669,12 @@ def graph_correctness_advantage_edge_loss(
         used_edges = 0
 
         for (
-            graph_advantage,
             correctness_advantage,
             token_advantage,
             graph,
             graph_log_prob,
             edge_details,
         ) in zip(
-            advantages,
             correctness_advantages,
             token_advantages,
             graphs,
@@ -640,8 +683,6 @@ def graph_correctness_advantage_edge_loss(
         ):
             if not torch.is_tensor(graph_log_prob):
                 raise TypeError("Full graph log-prob must be a torch.Tensor.")
-            graph_advantage_tensor = graph_log_prob.new_tensor(float(graph_advantage))
-            graph_reward_loss = -(graph_advantage_tensor * graph_log_prob)
             correctness_loss = -(
                 graph_log_prob.new_tensor(float(correctness_advantage))
                 * graph_log_prob
@@ -650,6 +691,7 @@ def graph_correctness_advantage_edge_loss(
                 graph_log_prob.new_tensor(float(token_advantage))
                 * graph_log_prob
             )
+            graph_reward_loss = correctness_loss + token_loss
 
             discounted_gains = discounted_edge_ig_gains(
                 graph, edge_details, edge_ig_discount_factor
@@ -694,7 +736,7 @@ def graph_correctness_advantage_edge_loss(
                 if graph_edge_ig_terms
                 else zero
             )
-            per_graph_loss = graph_reward_loss + edge_ig_loss
+            per_graph_loss = correctness_loss + token_loss + edge_ig_loss
             per_graph_losses.append(per_graph_loss)
             graph_reward_losses.append(graph_reward_loss)
             correctness_losses.append(correctness_loss)
@@ -739,16 +781,24 @@ def graph_correctness_advantage_edge_loss(
             "normalized_graph_token_costs": normalized_graph_token_costs,
             "max_graph_tokens": float(max_graph_tokens),
             "graph_token_cost_lambda": graph_token_cost_lambda,
+            "graph_token_cost_beta": graph_token_cost_lambda,
             "graph_rewards": graph_rewards,
-            "graph_advantage_mode": "combined_reward_standardized",
-            "correctness_gate": float(correctness_baseline),
+            "graph_advantage_mode": (
+                "standardized_correctness_plus_correct_only_centered_token"
+            ),
+            "correctness_gate": 1.0,
             "correctness_baseline": float(correctness_baseline),
             "correctness_variance": float(correctness_variance),
             "correctness_std": float(correctness_std),
-            "standardized_correctness_advantage": False,
+            "standardized_correctness_advantage": bool(
+                correctness_std > float(advantage_epsilon)
+            ),
             "correctness_advantages": [
                 float(advantage) for advantage in correctness_advantages
             ],
+            "token_cost_comparison_mode": "correct_graphs_only",
+            "token_cost_normalization_scope": "correct_graphs_only",
+            "token_correct_graph_count": int(sum(correct_graph_mask)),
             "token_cost_baseline": float(token_cost_baseline),
             "centered_token_costs": [
                 float(cost) for cost in centered_token_costs
@@ -765,9 +815,7 @@ def graph_correctness_advantage_edge_loss(
             "graph_reward_baseline": float(graph_reward_baseline),
             "graph_reward_variance": float(graph_reward_variance),
             "graph_reward_std": float(graph_reward_std),
-            "standardized_graph_advantage": bool(
-                graph_reward_std > float(advantage_epsilon)
-            ),
+            "standardized_graph_advantage": False,
             "graph_advantages": [float(advantage) for advantage in advantages],
             "used_edges": used_edges,
             "sampled_edges": sampled_edges,
@@ -869,7 +917,7 @@ def graph_correctness_advantage_edge_loss(
         f"avg_normalized_cost={sum(normalized_graph_token_costs) / len(normalized_graph_token_costs) if normalized_graph_token_costs else 0.0:.6f}, "
         f"avg_abs_token_advantage={sum(abs(value) for value in token_advantages) / len(token_advantages) if token_advantages else 0.0:.6f}, "
         f"avg_reward={sum(graph_rewards) / len(graph_rewards) if graph_rewards else 0.0:.6f}, "
-        f"lambda={graph_token_cost_lambda:.6f}"
+        f"beta={graph_token_cost_lambda:.6f}"
     )
     return torch.mean(torch.stack(group_losses)), summaries
 
