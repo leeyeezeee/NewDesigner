@@ -26,6 +26,10 @@ class CompletionTokens(Singleton):
     def __init__(self):
         self.value = 0.0
 
+class LLMCalls(Singleton):
+    def __init__(self):
+        self.value = 0.0
+
 class Time(Singleton):
     def __init__(self):
         self.value = ""

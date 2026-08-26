@@ -1,13 +1,9 @@
 import ast
 import asyncio
 import inspect
-import math
 import re
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Sequence
-
-_LOGPROB_FLOOR = -20.0
-
 
 @dataclass
 class TargetSpec:
@@ -25,12 +21,11 @@ class ScoreResult:
     details: Dict[str, Any]
 
 
-@dataclass
-class ClusterRepresentative:
-    label: str
-    output: Any
-    count: int
-    weight: float
+def edge_key(edge_info: Dict[str, Any]) -> str:
+    return edge_info.get(
+        "edge_key",
+        f"{edge_info['type']}:{edge_info['round']}:{edge_info['source']}->{edge_info['target']}",
+    )
 
 
 def make_target_spec(
@@ -49,15 +44,6 @@ def make_target_spec(
     if dataset_key == "humaneval":
         return TargetSpec(dataset=dataset_key, mode="execution", tests=list(tests or []))
     return TargetSpec(dataset=dataset_key, mode="yesno_logprob", correct=str(correct), choices=["Yes", "No"])
-
-
-def _logsumexp(values: Sequence[float]) -> float:
-    if not values:
-        return float("-inf")
-    max_value = max(values)
-    if not math.isfinite(max_value):
-        return max_value
-    return max_value + math.log(sum(math.exp(value - max_value) for value in values))
 
 
 def _get_attr_or_key(value: Any, name: str, default: Any = None) -> Any:
@@ -119,27 +105,6 @@ def _require_choice_target(correct: Any, labels: Sequence[str]) -> str:
     return target
 
 
-def _completion_label_from_token(token: str, labels: Sequence[str]) -> Optional[str]:
-    normalized_labels = _choice_label_set(labels)
-    value = re.sub(r"^[^A-Za-z0-9]+", "", str(token).strip())
-    if not value:
-        return None
-
-    if _all_single_character_labels(labels):
-        match = re.match(r"^([A-Za-z0-9])(?:[\)\].,:;]|$)", value)
-        if match:
-            normalized = match.group(1).upper()
-            return normalized if normalized in normalized_labels else None
-        return None
-
-    for label in labels:
-        label_text = str(label).strip()
-        normalized = _normalize_label(label_text)
-        if re.match(rf"^{re.escape(label_text)}(?:[^A-Za-z0-9]|$)", value, flags=re.IGNORECASE):
-            return normalized if normalized in normalized_labels else None
-    return None
-
-
 def _extract_python_code(output: Any) -> str:
     text = str(output)
     fenced = re.search(r"```(?:python)?\s*(.*?)```", text, flags=re.DOTALL | re.IGNORECASE)
@@ -188,118 +153,8 @@ def _humaneval_assert_tests(test_source: str) -> List[str]:
     ]
 
 
-def _completion_token_logprob(logprob_item: Any) -> tuple[str, float]:
-    if isinstance(logprob_item, dict):
-        return str(logprob_item.get("token", "")), float(logprob_item.get("logprob", _LOGPROB_FLOOR))
-    return str(getattr(logprob_item, "token", "")), float(getattr(logprob_item, "logprob", _LOGPROB_FLOOR))
-
-
-def _top_logprobs_from_response(response: Any) -> List[Any]:
-    choice = response.choices[0]
-    logprobs = getattr(choice, "logprobs", None)
-    if logprobs is None and isinstance(choice, dict):
-        logprobs = choice.get("logprobs")
-    content = getattr(logprobs, "content", None) if logprobs is not None else None
-    if content is None and isinstance(logprobs, dict):
-        content = logprobs.get("content")
-    if not content:
-        return []
-    first_token = content[0]
-    top_logprobs = getattr(first_token, "top_logprobs", None)
-    if top_logprobs is None and isinstance(first_token, dict):
-        top_logprobs = first_token.get("top_logprobs")
-    return list(top_logprobs or [])
-
-
-def _merge_extra_body(base: Dict[str, Any], updates: Dict[str, Any]) -> Dict[str, Any]:
-    merged = dict(base)
-    for key, value in updates.items():
-        if isinstance(value, dict) and isinstance(merged.get(key), dict):
-            nested = dict(merged[key])
-            nested.update(value)
-            merged[key] = nested
-        else:
-            merged[key] = value
-    return merged
-
-
-def _qwen_logprob_extra_body(model: str) -> Dict[str, Any]:
-    if "qwen" not in model.lower():
-        return {}
-    return {
-        "chat_template_kwargs": {
-            "enable_thinking": False,
-        },
-    }
-
-
-def _valid_outputs_and_labels(
-    outputs: Iterable[Any],
-    cluster_labels: Optional[Sequence[str]],
-) -> tuple[List[Any], Optional[List[str]]]:
-    raw_outputs = list(outputs)
-    if cluster_labels is None:
-        return [output for output in raw_outputs if str(output).strip()], None
-
-    labels = list(cluster_labels)
-    valid_outputs = [output for output in raw_outputs if str(output).strip()]
-    if len(labels) == len(raw_outputs):
-        pairs = [
-            (output, label)
-            for output, label in zip(raw_outputs, labels)
-            if str(output).strip() and str(label).strip()
-        ]
-    elif len(labels) == len(valid_outputs):
-        pairs = [
-            (output, label)
-            for output, label in zip(valid_outputs, labels)
-            if str(label).strip()
-        ]
-    else:
-        raise ValueError(
-            "cluster_labels must align with outputs or with the non-empty outputs."
-        )
-
-    if not pairs:
-        return [], []
-    return [output for output, _ in pairs], [str(label) for _, label in pairs]
-
-
-def _cluster_representatives(
-    outputs: Sequence[Any],
-    labels: Optional[Sequence[str]],
-) -> tuple[List[ClusterRepresentative], str]:
-    if not labels:
-        total = len(outputs)
-        return [
-            ClusterRepresentative(
-                label=f"sample_{idx}",
-                output=output,
-                count=1,
-                weight=1.0 / total,
-            )
-            for idx, output in enumerate(outputs)
-        ], "mean"
-
-    cluster_order: List[str] = []
-    clusters: Dict[str, Dict[str, Any]] = {}
-    for output, label in zip(outputs, labels):
-        if label not in clusters:
-            cluster_order.append(label)
-            clusters[label] = {"output": output, "count": 0}
-        clusters[label]["count"] += 1
-
-    total = float(sum(cluster["count"] for cluster in clusters.values()))
-    representatives = [
-        ClusterRepresentative(
-            label=label,
-            output=clusters[label]["output"],
-            count=int(clusters[label]["count"]),
-            weight=float(clusters[label]["count"] / total),
-        )
-        for label in cluster_order
-    ]
-    return representatives, "cluster_weighted"
+def _valid_outputs(outputs: Iterable[Any]) -> List[Any]:
+    return [output for output in outputs if str(output).strip()]
 
 
 class FinalAnswerScorer:
@@ -312,9 +167,8 @@ class FinalAnswerScorer:
         input_data: Dict[str, Any],
         outputs: Iterable[Any],
         target_spec: TargetSpec,
-        cluster_labels: Optional[Sequence[str]] = None,
     ) -> ScoreResult:
-        output_list, labels = _valid_outputs_and_labels(outputs, cluster_labels)
+        output_list = _valid_outputs(outputs)
         if not output_list:
             raise RuntimeError("Final-answer scoring received no candidate output.")
 
@@ -334,7 +188,6 @@ class FinalAnswerScorer:
             input_data,
             output_list,
             target_spec,
-            cluster_labels=labels,
         )
 
     async def teacher_answer_logprob(
@@ -376,12 +229,11 @@ class FinalAnswerScorer:
         input_data: Dict[str, Any],
         outputs: Iterable[Any],
         target_spec: TargetSpec,
-        cluster_labels: Optional[Sequence[str]] = None,
         base_spatial_info: Optional[Dict[str, Any]] = None,
         candidate_id: str = "candidate",
         candidate_role: str = "Candidate",
     ) -> ScoreResult:
-        output_list, labels = _valid_outputs_and_labels(outputs, cluster_labels)
+        output_list = _valid_outputs(outputs)
         if not output_list:
             raise RuntimeError(
                 "Teacher-forcing edge IG received no candidate output."
@@ -449,12 +301,11 @@ class FinalAnswerScorer:
         input_data: Dict[str, Any],
         outputs: Iterable[Any],
         target_spec: TargetSpec,
-        cluster_labels: Optional[Sequence[str]] = None,
         base_spatial_info: Optional[Dict[str, Any]] = None,
         candidate_id: str = "candidate",
         candidate_role: str = "Candidate",
     ) -> ScoreResult:
-        output_list, labels = _valid_outputs_and_labels(outputs, cluster_labels)
+        output_list = _valid_outputs(outputs)
         if not output_list:
             return ScoreResult(
                 score=0.0,
@@ -462,40 +313,33 @@ class FinalAnswerScorer:
                 details={"num_outputs": 0, "error": "empty candidate outputs"},
             )
 
-        representatives, aggregation = _cluster_representatives(output_list, labels)
         scores = await asyncio.gather(*[
             self._final_agent_single_output_execution_score(
                 decision_node,
                 input_data,
-                representative.output,
+                output,
                 target_spec,
                 base_spatial_info=base_spatial_info,
                 candidate_id=candidate_id,
                 candidate_role=candidate_role,
             )
-            for representative in representatives
+            for output in output_list
         ])
-        weighted_score = sum(
-            representative.weight * float(score.score)
-            for representative, score in zip(representatives, scores)
-        )
+        mean_score = sum(float(score.score) for score in scores) / len(scores)
         return ScoreResult(
-            score=float(weighted_score),
+            score=float(mean_score),
             mode="final_agent_execution",
             details={
-                "aggregation": aggregation,
+                "aggregation": "mean",
                 "num_outputs": len(output_list),
-                "num_clusters": len(representatives),
                 "scoring_agent": "final_agent",
-                "clusters": [
+                "samples": [
                     {
-                        "label": representative.label,
-                        "count": representative.count,
-                        "weight": representative.weight,
+                        "output": str(output),
                         "score": float(score.score),
                         "details": score.details,
                     }
-                    for representative, score in zip(representatives, scores)
+                    for output, score in zip(output_list, scores)
                 ],
             },
         )

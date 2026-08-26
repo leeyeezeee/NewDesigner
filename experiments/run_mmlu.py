@@ -2,10 +2,10 @@ import sys, os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 sys.stdout.reconfigure(encoding='utf-8')
 
-import asyncio
 from typing import Union, Literal, List
 import argparse
 import random
+import time
 
 from GDesigner.graph.graph import Graph
 from datasets.mmlu_dataset import MMLUDataset
@@ -13,10 +13,20 @@ from datasets.MMLU.download import download
 from experiments.train_mmlu import train
 from experiments.evaluate_mmlu import evaluate
 from GDesigner.utils.const import GDesigner_ROOT
-from GDesigner.utils.metrics import reset_usage_counters, write_metrics_record
+from GDesigner.utils.metrics import reset_usage_counters, usage_snapshot, write_metrics_record
 from experiments.agent_backend import apply_agent_backend_args
 from experiments.checkpoint import save_graph_checkpoint
-from experiments.teacher_forcing_reward import add_teacher_forcing_reward_args
+from experiments.teacher_forcing_reward import (
+    add_teacher_forcing_reward_args,
+    experiment_summary_metadata,
+    set_experiment_seed,
+)
+from experiments.edge_training_log import (
+    reset_case_log,
+    reset_edge_training_log,
+    resolve_case_log_file,
+    resolve_edge_training_log_file,
+)
 
 
 
@@ -45,25 +55,6 @@ def parse_args():
                         help="Rate for temporal edge pruning when --optimized_temporal is set.")
     parser.add_argument('--use_edge_selector', action='store_true',
                         help="Enable final-agent teacher-logprob/execution IG selector training and selector pruning during evaluation.")
-    parser.add_argument('--num_entropy_samples', type=int, default=1,
-                        help="Deprecated for final-agent teacher-logprob IG; non-HumanEval IG scores final-agent teacher answers directly.")
-    # KLE temporarily disabled; keep this hyperparameter ready for future re-enable.
-    # parser.add_argument('--kle_heat_t', type=float, default=0.3,
-    #                     help="Heat-kernel lengthscale for KHEAT uncertainty.")
-    parser.add_argument('--semantic_judge_llm_name', type=str, default="gpt-4o-mini",
-                        help="OpenAI-compatible semantic judge model name. Independent from --llm_name.")
-    parser.add_argument('--semantic_judge_api_key', type=str, default="",
-                        help="Semantic judge API key. For local vLLM, EMPTY is usually enough.")
-    parser.add_argument('--semantic_judge_base_url', type=str, default="",
-                        help="Semantic judge OpenAI-compatible base URL. Use http://localhost:8000/v1 for local vLLM.")
-    parser.add_argument('--semantic_judge_model_path', type=str, default="",
-                        help="Optional judge model name override kept for backward compatibility.")
-    parser.add_argument('--semantic_judge_max_concurrency', type=int, default=None,
-                        help="Maximum concurrent semantic judge API requests. Defaults to SEMANTIC_JUDGE_MAX_CONCURRENCY or 64.")
-    parser.add_argument('--negative_edge_reward_scale', type=float, default=1.0,
-                        help="Scale for negative edge rewards when an edge has negative IG gain.")
-    parser.add_argument('--nonpositive_edge_penalty', type=float, default=0.01,
-                        help="Deprecated compatibility option; normalized edge rewards do not add a zero-gain penalty.")
     parser.add_argument('--selector_buffer_size', type=int, default=512,
                         help="Replay buffer capacity for selector edge samples.")
     parser.add_argument('--selector_ig_tau', type=float, default=0.0,
@@ -91,7 +82,14 @@ def parse_args():
 
 async def main():
     args = parse_args()
+    set_experiment_seed(args.seed)
     apply_agent_backend_args(args)
+    reset_usage_counters()
+    reset_edge_training_log(resolve_edge_training_log_file("mmlu"))
+    case_file = resolve_case_log_file("mmlu")
+    reset_case_log(case_file)
+    train_usage = {"cost": 0.0, "prompt_tokens": 0.0, "completion_tokens": 0.0, "llm_calls": 0.0}
+    train_wall_seconds = 0.0
 
     mode = args.mode
     decision_method = args.decision_method
@@ -105,49 +103,51 @@ async def main():
                   decision_method=decision_method,
                   optimized_spatial=args.optimized_spatial,
                   optimized_temporal=args.optimized_temporal,
+                  refine_rank=args.refine_rank,
                   **kwargs)
     download()
     dataset_train = MMLUDataset('dev')
     dataset_val = MMLUDataset('val')
     
     if args.optimized_spatial or args.optimized_temporal:
+        train_wall_start = time.time()
         edge_selector = await train(graph=graph,dataset=dataset_train,num_iters=args.num_iterations,num_rounds=args.num_rounds,
                     lr=args.lr,batch_size=args.batch_size, use_edge_selector=args.use_edge_selector,
                     imp_per_iterations=args.imp_per_iterations, pruning_rate=args.pruning_rate,
-                    num_entropy_samples=args.num_entropy_samples,
-                    # kle_heat_t=args.kle_heat_t,
-                    semantic_judge_llm_name=args.semantic_judge_llm_name,
-                    semantic_judge_api_key=args.semantic_judge_api_key,
-                    semantic_judge_base_url=args.semantic_judge_base_url,
-                    semantic_judge_model_path=args.semantic_judge_model_path,
-                    semantic_judge_max_concurrency=args.semantic_judge_max_concurrency,
-                    negative_edge_reward_scale=args.negative_edge_reward_scale,
-                    nonpositive_edge_penalty=args.nonpositive_edge_penalty,
                     selector_buffer_size=args.selector_buffer_size,
                     selector_ig_tau=args.selector_ig_tau,
                     use_graph_tf_reward=args.use_graph_tf_reward,
-                    use_graph_correctness_advantage=args.use_graph_correctness_advantage,
+                    use_graph_critic=args.use_graph_critic,
                     graph_sample_count=args.graph_sample_count,
-                    graph_softmax_temperature=args.graph_softmax_temperature,
+                    graph_critic_lr=args.graph_critic_lr,
+                    graph_critic_reward_lambda=args.graph_critic_reward_lambda,
+                    graph_critic_warmup_iterations=args.graph_critic_warmup_iterations,
                     edge_tanh_temperature=args.edge_tanh_temperature,
                     edge_ig_reward_lambda=args.edge_ig_reward_lambda,
                     edge_ig_warmup_iterations=args.edge_ig_warmup_iterations,
                     edge_ig_discount_factor=args.edge_ig_discount_factor,
-                    graph_token_cost_lambda=args.graph_token_cost_lambda,
                     graph_advantage_epsilon=args.graph_advantage_epsilon,
-                    max_concurrent_graphs=args.max_concurrent_graphs)
+                    max_concurrent_graphs=args.max_concurrent_graphs,
+                    anchor_reg_weight=args.anchor_reg_weight,
+                    sparsity_reg_weight=args.sparsity_reg_weight)
+        train_usage = usage_snapshot()
+        train_wall_seconds = time.time() - train_wall_start
         save_graph_checkpoint(
             graph,
             args.checkpoint_file,
             dataset="mmlu",
             args=args,
             edge_selector=edge_selector,
+            graph_critic=getattr(graph, "graph_critic", None),
+            graph_critic_optimizer=getattr(
+                graph, "graph_critic_optimizer", None
+            ),
         )
     else:
         edge_selector = None
 
     reset_usage_counters()
-    eval_metrics = await evaluate(graph=graph,dataset=dataset_val,num_rounds=args.num_rounds,limit_questions=limit_questions,eval_batch_size=args.batch_size,edge_selector=edge_selector,max_concurrent_graphs=args.max_concurrent_graphs)
+    eval_metrics = await evaluate(graph=graph,dataset=dataset_val,num_rounds=args.num_rounds,limit_questions=limit_questions,eval_batch_size=args.batch_size,edge_selector=edge_selector,max_concurrent_graphs=args.max_concurrent_graphs,case_file=case_file)
     score = eval_metrics["accuracy"]
     print(f"Final Eval Accuracy: {score}")
     print(f"Final Avg Edges: {eval_metrics['avg_edges']}")
@@ -158,6 +158,12 @@ async def main():
         "total_executed": eval_metrics["total_executed"],
         "avg_edges": eval_metrics["avg_edges"],
         "llm_name": args.llm_name,
+        **experiment_summary_metadata(args, "mmlu"),
+        "train_llm_calls": int(train_usage["llm_calls"]),
+        "train_prompt_tokens": int(train_usage["prompt_tokens"]),
+        "train_completion_tokens": int(train_usage["completion_tokens"]),
+        "train_cost": float(train_usage["cost"]),
+        "train_wall_seconds": float(train_wall_seconds),
     })
 
 

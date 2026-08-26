@@ -21,5 +21,6 @@ errors/
 result/
 ps_list/
 paper/
+tmp/
 HeatMap/
 __pycache__/

@@ -2,20 +2,25 @@
 # -*- coding: utf-8 -*-
 
 from pytube import YouTube
+
 from GDesigner.utils.const import GDesigner_ROOT
 
+
 def Youtube(url, has_subtitles):
-    # get video id from url
-    video_id=url.split('v=')[-1].split('&')[0]
-    # Create a YouTube object
+    video_id = url.split("v=")[-1].split("&")[0]
     youtube = YouTube(url)
-    # Get the best available video stream
-    video_stream = youtube.streams.filter(progressive=True, file_extension='mp4').order_by('resolution').desc().first()
+    video_stream = (
+        youtube.streams.filter(progressive=True, file_extension="mp4")
+        .order_by("resolution")
+        .desc()
+        .first()
+    )
     if has_subtitles:
-        # Download the video to a location
-        print('Downloading video')
-        video_stream.download(output_path="{GDesigner_ROOT}/workspace",filename=f"{video_id}.mp4")
-        print('Video downloaded successfully')
+        print("Downloading video")
+        video_stream.download(
+            output_path="{GDesigner_ROOT}/workspace",
+            filename=f"{video_id}.mp4",
+        )
+        print("Video downloaded successfully")
         return f"{GDesigner_ROOT}/workspace/{video_id}.mp4"
-    else:
-        return video_stream.url 
+    return video_stream.url

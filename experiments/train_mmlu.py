@@ -12,24 +12,31 @@ from pathlib import Path
 from GDesigner.graph.graph import Graph
 from experiments.accuracy import Accuracy
 from GDesigner.utils.globals import Cost, PromptTokens, CompletionTokens
+from GDesigner.utils.metrics import usage_delta, usage_snapshot
 from GDesigner.utils.edge_selector import (
     EdgeSelector,
     SelectorReplayBuffer,
     build_edge_selector_examples,
     train_edge_selector,
 )
-from GDesigner.utils.uncertainty import (
-    edge_entropy_rewards,
+from GDesigner.utils.ig_rewards import (
+    compute_edge_information_gain,
 )
 from GDesigner.utils.ig_scorer import FinalAnswerScorer, make_target_spec
 from experiments.graph_concurrency import limited_graph_arun, make_graph_semaphore
+from experiments.graph_critic import (
+    build_graph_critic,
+    critic_counterfactual_edge_loss,
+    score_full_graph_teacher_forcing,
+    train_graph_critic,
+)
+from experiments.refinement_loss import refinement_regularization_loss
 from experiments.teacher_forcing_reward import (
     edge_information_gain_loss,
     graph_correctness_advantage_edge_loss,
 )
 from experiments.edge_training_log import (
-    append_edge_training_details,
-    append_topology_diagnostics,
+    append_training_step,
     reset_edge_training_log,
     resolve_edge_training_log_file,
     resolve_question_id,
@@ -58,28 +65,22 @@ async def train(graph:Graph,
             use_edge_selector: bool = False,
             imp_per_iterations: int = 5,
             pruning_rate: float = 0.25,
-            num_entropy_samples: int = 1,
-            kle_heat_t: float = 0.3,
-            semantic_judge_llm_name: str = "gpt-4o-mini",
-            semantic_judge_api_key: str = "",
-            semantic_judge_base_url: str = "",
-            semantic_judge_model_path: str = "",
-            semantic_judge_max_concurrency: int = None,
-            negative_edge_reward_scale: float = 1.0,
-            nonpositive_edge_penalty: float = 0.01,
             selector_buffer_size: int = 512,
             selector_ig_tau: float = 0.0,
             use_graph_tf_reward: bool = False,
-            use_graph_correctness_advantage: bool = False,
+            use_graph_critic: bool = False,
             graph_sample_count: int = 8,
-            graph_softmax_temperature: float = 1.0,
+            graph_critic_lr: float = 1e-3,
+            graph_critic_reward_lambda: float = 0.2,
+            graph_critic_warmup_iterations: int = 2,
             edge_tanh_temperature: float = 1.0,
             edge_ig_reward_lambda: float = None,
             edge_ig_warmup_iterations: int = 2,
             edge_ig_discount_factor: float = 0.0,
-            graph_token_cost_lambda: float = 1.0,
             graph_advantage_epsilon: float = 1e-6,
             max_concurrent_graphs: int = 10,
+            anchor_reg_weight: float = 0.0,
+            sparsity_reg_weight: float = 0.0,
           ):
     
     def infinite_data_loader() -> Iterator[pd.DataFrame]:
@@ -90,28 +91,39 @@ async def train(graph:Graph,
                     yield record
     
     loader = infinite_data_loader()
-    effective_num_entropy_samples = 1
     resolved_edge_ig_reward_lambda = (
         0.0
         if edge_ig_reward_lambda is None
         else float(edge_ig_reward_lambda)
     )
-    use_multi_graph_reward = use_graph_tf_reward or use_graph_correctness_advantage
-    record_edge_training = True
+    use_multi_graph_reward = use_graph_tf_reward or use_graph_critic
+    if use_graph_critic and not graph.optimized_spatial:
+        raise ValueError("--use_graph_critic requires --optimized_spatial.")
+    if use_graph_critic and int(graph_sample_count) < 2:
+        raise ValueError("--use_graph_critic requires --graph_sample_count >= 2.")
+    graph_critic = None
+    graph_critic_optimizer = None
+    if use_graph_critic:
+        graph_critic, graph_critic_optimizer = build_graph_critic(
+            graph,
+            learning_rate=graph_critic_lr,
+        )
+    # Real edge ablation remains the default.  The critic flag switches this
+    # diagnostic-only default off, while explicit selector/IG requests still
+    # opt back into the unchanged real-ablation implementation.
+    record_edge_training = not use_graph_critic
     edge_training_log_path = resolve_edge_training_log_file("mmlu")
     reset_edge_training_log(edge_training_log_path)
-    use_semantic_edges = (
+    record_edge_ig = (
         use_edge_selector
         or resolved_edge_ig_reward_lambda != 0.0
         or record_edge_training
     )
-    batch_entropy_samples = 1
-    semantic_judge = None
     edge_selector = None
     selector_buffer = None
     selector_optimizer = None
     selector_trained = False
-    if use_edge_selector and use_semantic_edges:
+    if use_edge_selector and record_edge_ig:
         edge_selector = EdgeSelector(graph.features.size(1))
         selector_buffer = SelectorReplayBuffer(selector_buffer_size)
         selector_optimizer = torch.optim.Adam(edge_selector.parameters(), lr=1e-3)
@@ -121,11 +133,10 @@ async def train(graph:Graph,
             use_edge_selector
             or resolved_edge_ig_reward_lambda != 0.0
             or record_edge_training
+            or use_graph_critic
         )
         else None
     )
-    if use_multi_graph_reward:
-        _reset_jsonl(_GRAPH_TF_RECORD_FILE)
     graph_semaphore = make_graph_semaphore(max_concurrent_graphs)
     
     optimizer_params = graph.spatial_parameters()
@@ -153,6 +164,8 @@ async def train(graph:Graph,
         record_input_dicts = []
         question_ids = []
         sample_groups = []
+        batch_correctness: List[float] = []
+        rollout_usage_before = usage_snapshot()
 
         for i_record, record in zip(range(batch_size), loader):
             question_ids.append(resolve_question_id(
@@ -167,6 +180,7 @@ async def train(graph:Graph,
                 realized_graph.gat = graph.gat
                 realized_graph.edge_mlp = graph.edge_mlp
                 realized_graph.spatial_affinity = graph.spatial_affinity
+                realized_graph.refinement_weight = graph.refinement_weight
                 realized_graph.temporal_logits = graph.temporal_logits
                 group_indices.append(len(realized_graphs))
                 realized_graphs.append(realized_graph)
@@ -177,13 +191,8 @@ async def train(graph:Graph,
                         realized_graph,
                         input_dict,
                         num_rounds,
-                        num_entropy_samples=batch_entropy_samples,
-                        record_execution_history=use_semantic_edges,
+                        record_execution_history=record_edge_ig,
                         track_grad=True,
-                        track_graph_tokens=(
-                            use_multi_graph_reward
-                            and graph_token_cost_lambda != 0.0
-                        ),
                     )
                 ))
             sample_groups.append(group_indices)
@@ -191,6 +200,7 @@ async def train(graph:Graph,
             correct_answers.append(correct_answer)
         
         raw_results = await asyncio.gather(*answer_log_probs)
+        rollout_usage = usage_delta(rollout_usage_before, usage_snapshot())
         raw_answers, log_probs = zip(*raw_results)
         loss_list: List[torch.Tensor] = []
         utilities: List[dict] = []
@@ -202,8 +212,8 @@ async def train(graph:Graph,
             graph_groups = []
             graph_log_prob_groups = []
             correctness_groups = []
-            graph_token_groups = []
             edge_detail_groups = []
+            graph_critic_score_groups = []
             for record_idx, (correct_answer, group_indices, input_dict, question_id) in enumerate(zip(
                 correct_answers,
                 sample_groups,
@@ -216,19 +226,16 @@ async def train(graph:Graph,
                 graph_group = []
                 graph_log_prob_group = []
                 correctness_group = []
-                graph_token_group = []
                 edge_detail_group = []
+                graph_critic_score_group = []
                 for sample_pos, graph_idx in enumerate(group_indices):
                     raw_answer = raw_answers[graph_idx]
                     realized_graph = realized_graphs[graph_idx]
-                    record_answer = (
-                        ""
-                        if realized_graph.decision_node_skipped
-                        else dataset.postprocess_answer(raw_answer)
-                    )
+                    record_answer = dataset.postprocess_answer(raw_answer)
                     record_accuracy = Accuracy()
                     record_accuracy.update(record_answer, correct_answer)
                     graph_tf_corrects.append(float(record_accuracy.get()))
+                    batch_correctness.append(float(record_accuracy.get()))
                     graph_tf_edge_counts.append(realized_graph.mean_spatial_edges_per_round)
                     needs_edge_details = (
                         edge_ig_measurement_enabled
@@ -240,27 +247,14 @@ async def train(graph:Graph,
                         )
                     )
                     if needs_edge_details:
-                        _edge_rewards, edge_details = await edge_entropy_rewards(
+                        edge_details = await compute_edge_information_gain(
                             realized_graph,
-                            input_dict["task"],
                             input_dict,
-                            semantic_judge,
-                            effective_num_entropy_samples,
-                            negative_reward_scale=negative_edge_reward_scale,
-                            nonpositive_penalty=nonpositive_edge_penalty,
-                            kle_heat_t=kle_heat_t,
                             target_spec=target_spec,
-                            ig_scorer=tf_scorer,
-                            compute_rewards=False,
+                            scorer=tf_scorer,
                         )
                     else:
                         edge_details = {}
-                    if edge_training_log_path is not None:
-                        append_edge_training_details(
-                            edge_training_log_path,
-                            question_id=question_id,
-                            edge_details=edge_details,
-                        )
                     if selector_buffer is not None:
                         selector_buffer.add_many(build_edge_selector_examples(
                             realized_graph,
@@ -269,11 +263,7 @@ async def train(graph:Graph,
                             selector_ig_tau,
                         ))
                     if sample_pos == 0:
-                        answer = (
-                            ""
-                            if realized_graph.decision_node_skipped
-                            else dataset.postprocess_answer(raw_answer)
-                        )
+                        answer = dataset.postprocess_answer(raw_answer)
                         answers.append(answer)
                         accuracy = Accuracy()
                         accuracy.update(answer, correct_answer)
@@ -284,18 +274,22 @@ async def train(graph:Graph,
                     graph_group.append(realized_graph)
                     graph_log_prob_group.append(log_probs[graph_idx])
                     correctness_group.append(float(record_accuracy.get()))
-                    graph_token_group.append(float(
-                        getattr(realized_graph, "graph_token_usage", {}).get(
-                            "prompt_tokens", 0
-                        )
-                    ))
                     edge_detail_group.append(edge_details)
+                    if use_graph_critic:
+                        graph_critic_score_group.append(
+                            await score_full_graph_teacher_forcing(
+                                realized_graph,
+                                input_dict,
+                                target_spec=target_spec,
+                                scorer=tf_scorer,
+                            )
+                        )
                     realized_graph.clear_execution_history()
                 graph_groups.append(graph_group)
                 graph_log_prob_groups.append(graph_log_prob_group)
                 correctness_groups.append(correctness_group)
-                graph_token_groups.append(graph_token_group)
                 edge_detail_groups.append(edge_detail_group)
+                graph_critic_score_groups.append(graph_critic_score_group)
             reference_loss = torch.mean(torch.stack(list(log_probs)))
             utility_loss, tf_summaries = graph_correctness_advantage_edge_loss(
                 graph_groups,
@@ -303,28 +297,36 @@ async def train(graph:Graph,
                 correctness_groups,
                 edge_detail_groups,
                 reference_loss,
-                graph_token_groups=graph_token_groups,
-                graph_token_cost_lambda=graph_token_cost_lambda,
                 edge_tanh_temperature=edge_tanh_temperature,
                 edge_ig_reward_lambda=iteration_edge_ig_reward_lambda,
                 edge_ig_discount_factor=edge_ig_discount_factor,
                 advantage_epsilon=graph_advantage_epsilon,
             )
-            append_topology_diagnostics(
-                edge_training_log_path,
-                iteration=i_iter,
-                graph_groups=graph_groups,
-                reward_summaries=tf_summaries,
-            )
+            critic_reward_summary = None
+            if (
+                use_graph_critic
+                and i_iter >= max(0, int(graph_critic_warmup_iterations))
+            ):
+                critic_reward_loss, critic_reward_summary = (
+                    critic_counterfactual_edge_loss(
+                        graph_critic,
+                        graph_groups,
+                        record_input_dicts,
+                        reference_loss,
+                        reward_lambda=graph_critic_reward_lambda,
+                        tanh_temperature=edge_tanh_temperature,
+                    )
+                )
+                utility_loss = utility_loss + critic_reward_loss
             if graph_tf_corrects:
                 avg_adv_variance = (
-                    sum(summary["graph_reward_variance"] for summary in tf_summaries)
+                    sum(summary["correctness_variance"] for summary in tf_summaries)
                     / len(tf_summaries)
                     if tf_summaries
                     else 0.0
                 )
                 avg_adv_std = (
-                    sum(summary["graph_reward_std"] for summary in tf_summaries)
+                    sum(summary["correctness_std"] for summary in tf_summaries)
                     / len(tf_summaries)
                     if tf_summaries
                     else 0.0
@@ -337,7 +339,6 @@ async def train(graph:Graph,
                     "avg_adv_variance": avg_adv_variance,
                     "avg_adv_std": avg_adv_std,
                 }
-                _append_jsonl(_GRAPH_TF_RECORD_FILE, graph_tf_summary)
                 print(
                     "graph reward metrics: "
                     f"accuracy={graph_tf_summary['accuracy']:.6f}, "
@@ -348,21 +349,17 @@ async def train(graph:Graph,
                 )
         else:
             for graph_idx, (raw_answer, log_prob, correct_answer, realized_graph, input_dict, question_id) in enumerate(zip(raw_answers, log_probs, correct_answers, realized_graphs, input_dicts, question_ids)):
-                answer = (
-                    ""
-                    if realized_graph.decision_node_skipped
-                    else dataset.postprocess_answer(raw_answer)
-                )
+                answer = dataset.postprocess_answer(raw_answer)
                 answers.append(answer)
                 assert isinstance(correct_answer, str), \
                         f"String expected but got {correct_answer} of type {type(correct_answer)} (1)"
                 accuracy = Accuracy()
                 accuracy.update(answer, correct_answer)
                 correctness_reward = accuracy.get()
-                edge_rewards = {}
+                batch_correctness.append(float(correctness_reward))
                 edge_details = {}
                 if (
-                    use_semantic_edges
+                    record_edge_ig
                     and edge_ig_measurement_enabled
                     and (
                         correctness_reward > 0
@@ -371,17 +368,11 @@ async def train(graph:Graph,
                     )
                     and bool(realized_graph.edge_log_probs)
                 ):
-                    edge_rewards, edge_details = await edge_entropy_rewards(
+                    edge_details = await compute_edge_information_gain(
                         realized_graph,
-                        input_dict["task"],
                         input_dict,
-                        semantic_judge,
-                        effective_num_entropy_samples,
-                        negative_reward_scale=negative_edge_reward_scale,
-                        nonpositive_penalty=nonpositive_edge_penalty,
-                        kle_heat_t=kle_heat_t,
                         target_spec=make_target_spec("mmlu", correct_answer),
-                        ig_scorer=tf_scorer,
+                        scorer=tf_scorer,
                     )
                     if selector_buffer is not None and correctness_reward > 0:
                         selector_buffer.add_many(build_edge_selector_examples(
@@ -390,16 +381,9 @@ async def train(graph:Graph,
                             edge_details,
                             selector_ig_tau,
                         ))
-                if edge_training_log_path is not None:
-                    append_edge_training_details(
-                        edge_training_log_path,
-                        question_id=question_id,
-                        edge_details=edge_details,
-                    )
                 realized_graph.clear_execution_history()
                 utility = {
                     "correctness": correctness_reward,
-                    "edge_entropy_rewards": edge_rewards,
                 }
                 utilities.append(utility)
                 single_loss = -log_prob * float(correctness_reward)
@@ -416,15 +400,32 @@ async def train(graph:Graph,
                     utility["edge_ig_loss_summary"] = edge_ig_summary
                 loss_list.append(single_loss)
                 print(f"correct answer:{correct_answer}")
-                print(f"edge entropy rewards:{edge_rewards}")
 
             utility_loss = torch.mean(torch.stack(loss_list))
-        total_loss = utility_loss
+        reg_loss, anchor_loss, sparse_loss = refinement_regularization_loss(
+            realized_graphs,
+            utility_loss,
+            anchor_reg_weight=anchor_reg_weight,
+            sparsity_reg_weight=sparsity_reg_weight,
+        )
+        total_loss = utility_loss + reg_loss
+        append_training_step(
+            edge_training_log_path,
+            step=i_iter,
+            accuracy=sum(batch_correctness) / len(batch_correctness),
+            avg_edges=(
+                sum(item.mean_spatial_edges_per_round for item in realized_graphs)
+                / len(realized_graphs)
+            ),
+            avg_communication_tokens=(
+                rollout_usage["prompt_tokens"] + rollout_usage["completion_tokens"]
+            ) / len(realized_graphs),
+        )
         optimizer.zero_grad()
         if not total_loss.requires_grad:
             raise RuntimeError(
                 "Graph training loss is not differentiable. A zero-edge sample "
-                "must still retain full-graph log-prob or IB gradients."
+                "must still retain policy or refinement gradients."
             )
         if not torch.isfinite(total_loss):
             raise FloatingPointError(
@@ -437,6 +438,21 @@ async def train(graph:Graph,
             error_if_nonfinite=True,
         )
         optimizer.step()
+        if use_graph_critic:
+            critic_fit_summary = train_graph_critic(
+                graph_critic,
+                graph_critic_optimizer,
+                graph_groups,
+                record_input_dicts,
+                graph_critic_score_groups,
+            )
+            print(
+                "graph critic: "
+                f"mse={critic_fit_summary['loss']:.6f}, "
+                f"target_std={critic_fit_summary['target_std']:.6f}, "
+                "predicted_edges="
+                f"{int((critic_reward_summary or {}).get('edge_count', 0))}"
+            )
         if edge_selector is not None:
             selector_trained = (
                 train_edge_selector(edge_selector, selector_optimizer, selector_buffer)
@@ -455,10 +471,15 @@ async def train(graph:Graph,
         if not use_multi_graph_reward:
             print("utilities:", utilities) # [0.0, 0.0, 0.0, 1.0]
         print("utility loss:", utility_loss.item())
+        print("anchor loss:", anchor_loss.item())
+        print("nuclear sparsity loss:", sparse_loss.item())
         print("loss:", total_loss.item()) # 4.6237263679504395
         print(f"Cost {Cost.instance().value}")
         print(f"PromptTokens {PromptTokens.instance().value}")
         print(f"CompletionTokens {CompletionTokens.instance().value}")
 
+    if use_graph_critic:
+        graph.graph_critic = graph_critic
+        graph.graph_critic_optimizer = graph_critic_optimizer
     return edge_selector if selector_trained else None
         

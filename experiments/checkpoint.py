@@ -24,6 +24,8 @@ def save_graph_checkpoint(
     args: Any = None,
     optimizer: Optional[torch.optim.Optimizer] = None,
     edge_selector: Optional[torch.nn.Module] = None,
+    graph_critic: Optional[torch.nn.Module] = None,
+    graph_critic_optimizer: Optional[torch.optim.Optimizer] = None,
     metrics: Optional[Dict[str, Any]] = None,
 ) -> None:
     if not checkpoint_file:
@@ -45,6 +47,8 @@ def save_graph_checkpoint(
             "gat_state_dict": graph.gat.state_dict(),
             "edge_mlp_state_dict": graph.edge_mlp.state_dict(),
             "spatial_affinity_state_dict": graph.spatial_affinity.state_dict(),
+            "refine_rank": int(graph.refine_rank),
+            "refinement_weight": graph.refinement_weight.detach().cpu(),
             "spatial_masks": graph.spatial_masks.detach().cpu(),
             "temporal_logits": graph.temporal_logits.detach().cpu(),
             "temporal_masks": graph.temporal_masks.detach().cpu(),
@@ -56,6 +60,15 @@ def save_graph_checkpoint(
         checkpoint["optimizer_state_dict"] = optimizer.state_dict()
     if edge_selector is not None:
         checkpoint["edge_selector_state_dict"] = edge_selector.state_dict()
+    if graph_critic is not None:
+        checkpoint["graph_critic"] = {
+            "architecture": getattr(graph_critic, "architecture", None),
+            "state_dict": graph_critic.state_dict(),
+        }
+    if graph_critic_optimizer is not None:
+        checkpoint["graph_critic_optimizer_state_dict"] = (
+            graph_critic_optimizer.state_dict()
+        )
 
     torch.save(checkpoint, tmp_path)
     tmp_path.replace(output_path)
@@ -75,7 +88,6 @@ def _copy_parameter(target: torch.nn.Parameter, value: torch.Tensor, name: str) 
 def _copy_graph_mask(graph, target, value, name: str, *, spatial: bool) -> None:
     value = graph._prepare_fixed_mask(
         value,
-        graph.num_nodes - 1,
         graph.num_nodes,
         spatial=spatial,
     )
@@ -83,17 +95,7 @@ def _copy_graph_mask(graph, target, value, name: str, *, spatial: bool) -> None:
 
 
 def _copy_temporal_logits(graph, value: torch.Tensor) -> None:
-    target = graph.temporal_logits
-    if tuple(target.shape) != tuple(value.shape):
-        regular_node_count = graph.num_nodes - 1
-        if value.numel() == regular_node_count * regular_node_count:
-            expanded = target.detach().clone().view(graph.num_nodes, graph.num_nodes)
-            expanded[:regular_node_count, :regular_node_count] = value.view(
-                regular_node_count,
-                regular_node_count,
-            ).to(device=expanded.device, dtype=expanded.dtype)
-            value = expanded.reshape(-1)
-    _copy_parameter(target, value, "temporal_logits")
+    _copy_parameter(graph.temporal_logits, value, "temporal_logits")
 
 
 def load_graph_checkpoint(
@@ -101,6 +103,8 @@ def load_graph_checkpoint(
     checkpoint_file: str,
     *,
     load_optimizer: Optional[torch.optim.Optimizer] = None,
+    graph_critic: Optional[torch.nn.Module] = None,
+    load_graph_critic_optimizer: Optional[torch.optim.Optimizer] = None,
 ) -> Dict[str, Any]:
     checkpoint_path = Path(checkpoint_file)
     if not checkpoint_path.exists():
@@ -161,6 +165,16 @@ def load_graph_checkpoint(
             graph_state["spatial_affinity_weight"],
             "spatial_affinity_weight",
         )
+    if "refinement_weight" not in graph_state:
+        raise ValueError(
+            "Checkpoint is missing the G-Designer refinement matrix W. "
+            "Retrain with the low-rank refinement architecture."
+        )
+    _copy_parameter(
+        graph.refinement_weight,
+        graph_state["refinement_weight"],
+        "refinement_weight",
+    )
     if "temporal_logits" in graph_state:
         _copy_temporal_logits(graph, graph_state["temporal_logits"])
     if "spatial_masks" in graph_state:
@@ -182,6 +196,29 @@ def load_graph_checkpoint(
 
     if load_optimizer is not None and "optimizer_state_dict" in checkpoint:
         load_optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    if graph_critic is not None:
+        critic_state = checkpoint.get("graph_critic")
+        if critic_state is None:
+            raise ValueError("Checkpoint does not contain a graph critic.")
+        checkpoint_architecture = critic_state.get("architecture")
+        expected_architecture = getattr(graph_critic, "architecture", None)
+        if (
+            checkpoint_architecture is not None
+            and expected_architecture is not None
+            and checkpoint_architecture != expected_architecture
+        ):
+            raise ValueError(
+                f"Checkpoint critic architecture {checkpoint_architecture!r} "
+                f"does not match {expected_architecture!r}."
+            )
+        graph_critic.load_state_dict(critic_state["state_dict"])
+    if (
+        load_graph_critic_optimizer is not None
+        and "graph_critic_optimizer_state_dict" in checkpoint
+    ):
+        load_graph_critic_optimizer.load_state_dict(
+            checkpoint["graph_critic_optimizer_state_dict"]
+        )
 
     print(f"Loaded checkpoint: {checkpoint_path}")
     return checkpoint

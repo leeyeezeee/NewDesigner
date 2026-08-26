@@ -11,9 +11,80 @@ def resolve_edge_training_log_file(dataset: str) -> Path:
     return Path("result") / f"{dataset}_log.jsonl"
 
 
+def resolve_case_log_file(dataset: str) -> Path:
+    return Path("result") / f"{dataset}_cases.jsonl"
+
+
 def reset_edge_training_log(log_file: Path) -> None:
     log_file.parent.mkdir(parents=True, exist_ok=True)
     log_file.write_text("", encoding="utf-8")
+
+
+def reset_case_log(case_file: Path) -> None:
+    case_file.parent.mkdir(parents=True, exist_ok=True)
+    case_file.write_text("", encoding="utf-8")
+
+
+def append_training_step(
+    log_file: Path,
+    *,
+    step: int,
+    accuracy: float,
+    avg_edges: float,
+    avg_communication_tokens: float,
+) -> None:
+    """Append only the four values used by the training-dynamics plots."""
+    record = {
+        "step": int(step),
+        "accuracy": float(accuracy),
+        "avg_edges": float(avg_edges),
+        "avg_communication_tokens": float(avg_communication_tokens),
+    }
+    if record["step"] < 0:
+        raise ValueError("Training-log step must be non-negative.")
+    if not 0.0 <= record["accuracy"] <= 1.0:
+        raise ValueError("Training-log accuracy must be in [0, 1].")
+    if record["avg_edges"] < 0.0 or record["avg_communication_tokens"] < 0.0:
+        raise ValueError("Training-log edge and token counts must be non-negative.")
+    with log_file.open("a", encoding="utf-8") as file:
+        file.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def append_case_record(
+    case_file: Path,
+    *,
+    question_id: Any,
+    question: Any,
+    graph: Any,
+    final_answer: Any,
+    correct: bool,
+) -> None:
+    """Persist one real evaluation trace without duplicating received messages."""
+    agent_outputs = []
+    node_ids = list(graph.nodes)
+    for node_index, node_id in enumerate(node_ids):
+        node = graph.nodes[node_id]
+        for history in getattr(node, "execution_history", []):
+            round_idx = int(history.get("round", 0))
+            for output in history.get("outputs", []):
+                agent_outputs.append({
+                    "round": round_idx,
+                    "agent": f"A{node_index}",
+                    "role": str(getattr(node, "role", "")),
+                    "output": str(output),
+                })
+    agent_outputs.sort(
+        key=lambda item: (item["round"], int(item["agent"][1:]))
+    )
+    record = {
+        "question_id": str(question_id),
+        "question": str(question),
+        "agent_outputs": agent_outputs,
+        "final_answer": str(final_answer),
+        "correct": bool(correct),
+    }
+    with case_file.open("a", encoding="utf-8") as file:
+        file.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
 def resolve_question_id(record: Any, fallback_index: int) -> Any:
@@ -47,7 +118,6 @@ def append_edge_training_details(
             "edge": edge_id,
             "round_id": int(detail.get("round", 0)),
             "ig_gain": float(detail["ig_gain"]),
-            "edge_token_cost": float(detail.get("edge_token_cost", 0.0)),
         })
     if not edges:
         return
@@ -73,38 +143,9 @@ def _mean_abs(values) -> float:
     return sum(values) / len(values) if values else 0.0
 
 
-def _pearson(left_values, right_values):
-    pairs = [
-        (float(left), float(right))
-        for left, right in zip(left_values, right_values)
-    ]
-    if len(pairs) < 2:
-        return None
-    left_mean = sum(left for left, _right in pairs) / len(pairs)
-    right_mean = sum(right for _left, right in pairs) / len(pairs)
-    left_centered = [left - left_mean for left, _right in pairs]
-    right_centered = [right - right_mean for _left, right in pairs]
-    left_variance = sum(value * value for value in left_centered)
-    right_variance = sum(value * value for value in right_centered)
-    if left_variance <= 1e-12 or right_variance <= 1e-12:
-        return None
-    covariance = sum(
-        left * right
-        for left, right in zip(left_centered, right_centered)
-    )
-    return covariance / ((left_variance * right_variance) ** 0.5)
-
-
 def _reward_sample_diagnostics(reward_summaries) -> Dict[str, Any]:
-    """Summarize whether token cost is aligned with sampled edge count."""
-    token_edge_correlations = []
-    global_edges = []
-    global_tokens = []
-    token_advantages = []
+    """Summarize graph-level correctness advantages and sampled edge counts."""
     correctness_advantages = []
-    graph_advantages = []
-    prompt_token_ranges = []
-    normalized_token_cost_ranges = []
     edge_ranges = []
     sample_groups = []
 
@@ -113,54 +154,23 @@ def _reward_sample_diagnostics(reward_summaries) -> Dict[str, Any]:
             float(value)
             for value in summary.get("mean_spatial_edges_per_round", [])
         ]
-        tokens = [
-            float(value)
-            for value in summary.get("graph_token_counts", [])
-        ]
-        normalized_costs = [
-            float(value)
-            for value in summary.get("normalized_graph_token_costs", [])
-        ]
-        group_token_advantages = [
-            float(value)
-            for value in summary.get("token_advantages", [])
-        ]
         group_correctness_advantages = [
             float(value)
             for value in summary.get("correctness_advantages", [])
-        ]
-        group_graph_advantages = [
-            float(value)
-            for value in summary.get("graph_advantages", [])
         ]
         correctness_scores = [
             float(value)
             for value in summary.get("correctness_scores", [])
         ]
 
-        group_correlation = _pearson(edges, tokens)
-        if group_correlation is not None:
-            token_edge_correlations.append(group_correlation)
-        if edges and tokens:
-            prompt_token_ranges.append(_range(tokens))
+        if edges:
             edge_ranges.append(_range(edges))
-            global_edges.extend(edges)
-            global_tokens.extend(tokens)
-        if normalized_costs:
-            normalized_token_cost_ranges.append(_range(normalized_costs))
-
-        token_advantages.extend(group_token_advantages)
         correctness_advantages.extend(group_correctness_advantages)
-        graph_advantages.extend(group_graph_advantages)
 
         samples = []
         sample_count = max(
             len(edges),
-            len(tokens),
-            len(normalized_costs),
-            len(group_token_advantages),
             len(group_correctness_advantages),
-            len(group_graph_advantages),
             len(correctness_scores),
         )
         for sample_idx in range(sample_count):
@@ -169,22 +179,9 @@ def _reward_sample_diagnostics(reward_summaries) -> Dict[str, Any]:
                 "sampled_edges": (
                     edges[sample_idx] if sample_idx < len(edges) else None
                 ),
-                "prompt_tokens": (
-                    tokens[sample_idx] if sample_idx < len(tokens) else None
-                ),
-                "normalized_token_cost": (
-                    normalized_costs[sample_idx]
-                    if sample_idx < len(normalized_costs)
-                    else None
-                ),
                 "correctness": (
                     correctness_scores[sample_idx]
                     if sample_idx < len(correctness_scores)
-                    else None
-                ),
-                "token_advantage": (
-                    group_token_advantages[sample_idx]
-                    if sample_idx < len(group_token_advantages)
                     else None
                 ),
                 "correctness_advantage": (
@@ -192,36 +189,15 @@ def _reward_sample_diagnostics(reward_summaries) -> Dict[str, Any]:
                     if sample_idx < len(group_correctness_advantages)
                     else None
                 ),
-                "graph_advantage": (
-                    group_graph_advantages[sample_idx]
-                    if sample_idx < len(group_graph_advantages)
-                    else None
-                ),
             })
         sample_groups.append({
             "group": group_idx,
-            "token_edge_correlation": group_correlation,
-            "prompt_token_range": _range(tokens),
             "sampled_edge_range": _range(edges),
             "samples": samples,
         })
 
-    global_correlation = _pearson(global_edges, global_tokens)
     return {
-        "token_edge_correlation": (
-            _mean(token_edge_correlations)
-            if token_edge_correlations
-            else None
-        ),
-        "token_edge_correlation_valid_groups": len(token_edge_correlations),
-        "global_token_edge_correlation": global_correlation,
-        "avg_abs_token_advantage": _mean_abs(token_advantages),
         "avg_abs_correctness_advantage": _mean_abs(correctness_advantages),
-        "avg_abs_graph_advantage": _mean_abs(graph_advantages),
-        "avg_prompt_token_range_per_group": _mean(prompt_token_ranges),
-        "avg_normalized_token_cost_range_per_group": _mean(
-            normalized_token_cost_ranges
-        ),
         "avg_edge_range_per_group": _mean(edge_ranges),
         "sample_groups": sample_groups,
     }
@@ -414,6 +390,17 @@ def append_topology_diagnostics(
             "avg_sampled_edges": avg_sampled_edges,
             "avg_expected_edges": expected_edges,
             "sample_minus_expected_edges": avg_sampled_edges - expected_edges,
+        },
+        "refinement": {
+            "rank": int(getattr(graphs[0], "refine_rank", 0)),
+            "anchor_loss": _mean(
+                float(graph.refinement_anchor_loss.detach().cpu().item())
+                for graph in graphs
+            ),
+            "nuclear_norm": _mean(
+                float(graph.refinement_sparse_loss.detach().cpu().item())
+                for graph in graphs
+            ),
         },
         "reward_sample_diagnostics": _reward_sample_diagnostics(
             reward_summaries

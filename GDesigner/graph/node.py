@@ -1,8 +1,6 @@
 import shortuuid
 from typing import List, Any, Optional, Dict
 from abc import ABC, abstractmethod
-import warnings
-import asyncio
 
 from GDesigner.llm.llm import LLMGeneration
 
@@ -22,7 +20,6 @@ class Node(ABC):
         spatial_successors (List[Node]): Nodes that succeed this node in the graph.
         inputs (List[Any]): Inputs to be processed by the node.
         outputs (List[Any]): Communication outputs produced after node execution.
-        entropy_samples (List[Any]): Same-context outputs recorded for edge IG estimation.
         raw_inputs (List[Any]): The original input contains the question or math problem.
         last_memory (Dict[str,List[Any]]): Input and output of the previous timestamp.
         
@@ -62,18 +59,14 @@ class Node(ABC):
         self.temporal_successors: List[Node] = []
         self.inputs: List[Any] = []
         self.outputs: List[Any] = []
-        self.entropy_samples: List[Any] = []
         self.output_token_logprobs: List[Any] = []
-        self.entropy_samples_token_logprobs: List[Any] = []
         self.raw_inputs: List[Any] = []
         self.role = ""
         self.last_memory: Dict[str,List[Any]] = {
             'inputs': [],
             'outputs': [],
             'raw_inputs': [],
-            'entropy_samples': [],
             'output_token_logprobs': [],
-            'entropy_samples_token_logprobs': [],
         }
         self.execution_history: List[Dict[str, Any]] = []
 
@@ -123,9 +116,7 @@ class Node(ABC):
         self.last_memory['inputs'] = self.inputs
         self.last_memory['outputs'] = self.outputs
         self.last_memory['raw_inputs'] = self.raw_inputs
-        self.last_memory['entropy_samples'] = self.entropy_samples
         self.last_memory['output_token_logprobs'] = self.output_token_logprobs
-        self.last_memory['entropy_samples_token_logprobs'] = self.entropy_samples_token_logprobs
 
     def get_spatial_info(self)->Dict[str,Dict]:
         """ Return a dict that maps id to info. """
@@ -175,8 +166,6 @@ class Node(ABC):
             "outputs": list(self.outputs),
             "output_token_logprobs": list(self.output_token_logprobs),
             "communication_outputs": list(self.outputs),
-            "entropy_samples": list(self.entropy_samples),
-            "entropy_samples_token_logprobs": list(self.entropy_samples_token_logprobs),
             "spatial_predecessors": list(spatial_info.keys()),
             "temporal_predecessors": list(temporal_info.keys()),
             "spatial_info": spatial_info_snapshot,
@@ -192,9 +181,7 @@ class Node(ABC):
         """Clear this round's state without invoking the node's model."""
         self.inputs = []
         self.outputs = []
-        self.entropy_samples = []
         self.output_token_logprobs = []
-        self.entropy_samples_token_logprobs = []
         self.raw_inputs = []
         if record_execution_history:
             history_size = len(self.execution_history)
@@ -229,46 +216,23 @@ class Node(ABC):
 
     def _set_execution_outputs(
         self,
-        results: List[Any],
+        result: Any,
         logprob_token_limit: Optional[int] = None,
     ):
-        split_results = [
-            self._as_output_and_logprob_lists(result, logprob_token_limit)
-            for result in results
-        ]
-        output_groups = [outputs for outputs, _token_logprobs in split_results]
-        token_logprob_groups = [
-            token_logprobs for _outputs, token_logprobs in split_results
-        ]
-        self.entropy_samples = [
-            output
-            for output_group in output_groups
-            for output in output_group
-        ]
-        self.entropy_samples_token_logprobs = [
-            token_logprobs
-            for token_logprob_group in token_logprob_groups
-            for token_logprobs in token_logprob_group
-        ]
-        self.outputs = output_groups[0] if output_groups else []
-        self.output_token_logprobs = token_logprob_groups[0] if token_logprob_groups else []
+        self.outputs, self.output_token_logprobs = self._as_output_and_logprob_lists(
+            result,
+            logprob_token_limit,
+        )
 
     def execute(self, input:Any, **kwargs):
         round_idx = kwargs.pop("round_idx", None)
-        num_entropy_samples = kwargs.pop("num_entropy_samples", 1)
         record_execution_history = kwargs.pop("record_execution_history", True)
         logprob_token_limit = kwargs.pop("logprob_token_limit", None)
-        num_entropy_samples = max(1, int(num_entropy_samples))
         self.outputs = []
-        self.entropy_samples = []
         spatial_info:Dict[str,Dict] = self.get_spatial_info()
         temporal_info:Dict[str,Dict] = self.get_temporal_info()
-        results = [
-            self._execute(input, spatial_info, temporal_info, **kwargs)
-            for _ in range(num_entropy_samples)
-        ]
-
-        self._set_execution_outputs(results, logprob_token_limit)
+        result = self._execute(input, spatial_info, temporal_info, **kwargs)
+        self._set_execution_outputs(result, logprob_token_limit)
         if record_execution_history:
             self._record_execution(round_idx, spatial_info, temporal_info)
         return self.outputs
@@ -276,21 +240,14 @@ class Node(ABC):
 
     async def async_execute(self, input:Any, **kwargs):
         round_idx = kwargs.pop("round_idx", None)
-        num_entropy_samples = kwargs.pop("num_entropy_samples", 1)
         record_execution_history = kwargs.pop("record_execution_history", True)
         logprob_token_limit = kwargs.pop("logprob_token_limit", None)
-        num_entropy_samples = max(1, int(num_entropy_samples))
 
         self.outputs = []
-        self.entropy_samples = []
         spatial_info:Dict[str,Any] = self.get_spatial_info()
         temporal_info:Dict[str,Any] = self.get_temporal_info()
-        tasks = [
-            asyncio.create_task(self._async_execute(input, spatial_info, temporal_info, **kwargs))
-            for _ in range(num_entropy_samples)
-        ]
-        results = await asyncio.gather(*tasks, return_exceptions=False)
-        self._set_execution_outputs(results, logprob_token_limit)
+        result = await self._async_execute(input, spatial_info, temporal_info, **kwargs)
+        self._set_execution_outputs(result, logprob_token_limit)
         if record_execution_history:
             self._record_execution(round_idx, spatial_info, temporal_info)
         return self.outputs
@@ -309,3 +266,4 @@ class Node(ABC):
     def _process_inputs(self, raw_inputs:List[Any], spatial_info:Dict[str,Any], temporal_info:Dict[str,Any], **kwargs)->List[Any]:
         """ To be overriden by the descendant class """
         """ Process the raw_inputs(most of the time is a List[Dict]) """
+import warnings

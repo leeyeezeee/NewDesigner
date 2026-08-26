@@ -1,5 +1,4 @@
 import argparse
-import asyncio
 import os
 import sys
 
@@ -41,18 +40,6 @@ def parse_args():
                         help="Path to overwrite with the trained graph checkpoint.")
     parser.add_argument("--use_edge_selector", action="store_true",
                         help="Enable final-agent teacher-logprob/execution IG selector training and selector pruning during evaluation.")
-    parser.add_argument("--num_entropy_samples", type=int, default=1,
-                        help="Deprecated for final-agent teacher-logprob IG; non-HumanEval IG scores final-agent teacher answers directly.")
-    # KLE temporarily disabled; keep this hyperparameter ready for future re-enable.
-    # parser.add_argument("--kle_heat_t", type=float, default=0.3,
-    #                     help="Heat-kernel lengthscale for KHEAT uncertainty.")
-    parser.add_argument("--semantic_judge_llm_name", type=str, default="gpt-4o-mini")
-    parser.add_argument("--semantic_judge_api_key", type=str, default="")
-    parser.add_argument("--semantic_judge_base_url", type=str, default="")
-    parser.add_argument("--semantic_judge_model_path", type=str, default="")
-    parser.add_argument("--semantic_judge_max_concurrency", type=int, default=None)
-    parser.add_argument("--negative_edge_reward_scale", type=float, default=1.0)
-    parser.add_argument("--nonpositive_edge_penalty", type=float, default=0.01)
     parser.add_argument("--selector_buffer_size", type=int, default=512)
     parser.add_argument("--selector_ig_tau", type=float, default=0.0)
     add_teacher_forcing_reward_args(parser)

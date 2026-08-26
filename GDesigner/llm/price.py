@@ -1,9 +1,7 @@
 import os
-from contextlib import contextmanager
-from contextvars import ContextVar
-from typing import Any, Dict, Iterator, Optional, Tuple
+from typing import Any, Optional, Tuple
 
-from GDesigner.utils.globals import Cost, PromptTokens, CompletionTokens
+from GDesigner.utils.globals import Cost, PromptTokens, CompletionTokens, LLMCalls
 import tiktoken
 # GPT-4:  https://platform.openai.com/docs/models/gpt-4-and-gpt-4-turbo
 # GPT3.5: https://platform.openai.com/docs/models/gpt-3-5
@@ -16,12 +14,6 @@ def cal_token(model:str, text:str):
         encoder = tiktoken.get_encoding("cl100k_base")
     num_tokens = len(encoder.encode(text))
     return num_tokens
-
-_ACTIVE_GRAPH_TOKEN_USAGE: ContextVar[Optional[Dict[str, Any]]] = ContextVar(
-    "active_graph_token_usage",
-    default=None,
-)
-
 
 class MissingRemoteTokenUsageError(RuntimeError):
     """Raised when an OpenAI-compatible response omits required token usage."""
@@ -56,23 +48,6 @@ def remote_token_usage_or_raise(
     return prompt_tokens, completion_tokens
 
 
-@contextmanager
-def track_graph_token_usage() -> Iterator[Dict[str, Any]]:
-    """Track one asynchronously executed graph without mixing concurrent graphs."""
-    usage: Dict[str, Any] = {
-        "prompt_tokens": 0,
-        "completion_tokens": 0,
-        "total_tokens": 0,
-        "request_count": 0,
-        "token_source": "remote_response_usage",
-    }
-    context_token = _ACTIVE_GRAPH_TOKEN_USAGE.set(usage)
-    try:
-        yield usage
-    finally:
-        _ACTIVE_GRAPH_TOKEN_USAGE.reset(context_token)
-
-
 def cost_count(
     prompt,
     response,
@@ -86,14 +61,7 @@ def cost_count(
     completion_len: int
     price: float
 
-    graph_usage = _ACTIVE_GRAPH_TOKEN_USAGE.get()
     if prompt_tokens is None or completion_tokens is None:
-        if graph_usage is not None:
-            raise MissingRemoteTokenUsageError(
-                "Graph token tracking requires remote prompt_tokens and "
-                "completion_tokens. Local tokenization and fallback estimation "
-                "are disabled."
-            )
         prompt_len = cal_token(model_name, prompt)
         completion_len = cal_token(model_name, response)
     else:
@@ -125,12 +93,7 @@ def cost_count(
     Cost.instance().value += price
     PromptTokens.instance().value += prompt_len
     CompletionTokens.instance().value += completion_len
-
-    if graph_usage is not None:
-        graph_usage["prompt_tokens"] += prompt_len
-        graph_usage["completion_tokens"] += completion_len
-        graph_usage["total_tokens"] += prompt_len + completion_len
-        graph_usage["request_count"] += 1
+    LLMCalls.instance().value += 1
 
     # print(f"Prompt Tokens: {prompt_len}, Completion Tokens: {completion_len}")
     return price, prompt_len, completion_len
