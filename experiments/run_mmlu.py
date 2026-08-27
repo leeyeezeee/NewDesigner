@@ -41,6 +41,8 @@ def parse_args():
                         help="learning rate")
     parser.add_argument('--batch_size', type=int, default=4,
                         help="batch size")
+    parser.add_argument('--limit_questions', type=int, default=153,
+                        help="Maximum number of MMLU validation questions to evaluate. Default 153.")
     parser.add_argument('--agent_names', nargs='+', type=str, default=['AnalyzeAgent'],
                         help='Specify agent names as a list of strings')
     parser.add_argument('--agent_nums', nargs='+', type=int, default=[5],
@@ -95,7 +97,6 @@ async def main():
     decision_method = args.decision_method
     agent_names = [name for name,num in zip(args.agent_names,args.agent_nums) for _ in range(num)]
     kwargs = get_kwargs(mode,len(agent_names))
-    limit_questions = 153
     
     graph = Graph(domain=args.domain,
                   llm_name=args.llm_name,
@@ -147,7 +148,7 @@ async def main():
         edge_selector = None
 
     reset_usage_counters()
-    eval_metrics = await evaluate(graph=graph,dataset=dataset_val,num_rounds=args.num_rounds,limit_questions=limit_questions,eval_batch_size=args.batch_size,edge_selector=edge_selector,max_concurrent_graphs=args.max_concurrent_graphs,case_file=case_file)
+    eval_metrics = await evaluate(graph=graph,dataset=dataset_val,num_rounds=args.num_rounds,limit_questions=args.limit_questions,eval_batch_size=args.batch_size,edge_selector=edge_selector,max_concurrent_graphs=args.max_concurrent_graphs,case_file=case_file)
     score = eval_metrics["accuracy"]
     print(f"Final Eval Accuracy: {score}")
     print(f"Final Avg Edges: {eval_metrics['avg_edges']}")
