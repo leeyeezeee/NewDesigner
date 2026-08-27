@@ -19,6 +19,22 @@ class MissingRemoteTokenUsageError(RuntimeError):
     """Raised when an OpenAI-compatible response omits required token usage."""
 
 
+def _optional_price_per_1k(name: str) -> Optional[float]:
+    """Read an optional non-negative per-1K-token price from the environment."""
+    raw_value = os.getenv(name)
+    if raw_value is None or not raw_value.strip():
+        return None
+    try:
+        value = float(raw_value)
+    except ValueError as exc:
+        raise ValueError(
+            f"{name} must be a number or left unset; received {raw_value!r}."
+        ) from exc
+    if value < 0:
+        raise ValueError(f"{name} must be non-negative; received {value}.")
+    return value
+
+
 def remote_token_usage_or_raise(
     response: Any,
     *,
@@ -67,12 +83,22 @@ def cost_count(
     else:
         prompt_len = int(prompt_tokens)
         completion_len = int(completion_tokens)
-    custom_input_price = os.getenv("LOCAL_MODEL_INPUT_PRICE_PER_1K")
-    custom_output_price = os.getenv("LOCAL_MODEL_OUTPUT_PRICE_PER_1K")
+    custom_input_price = _optional_price_per_1k(
+        "LOCAL_MODEL_INPUT_PRICE_PER_1K"
+    )
+    custom_output_price = _optional_price_per_1k(
+        "LOCAL_MODEL_OUTPUT_PRICE_PER_1K"
+    )
+    if (custom_input_price is None) != (custom_output_price is None):
+        raise ValueError(
+            "LOCAL_MODEL_INPUT_PRICE_PER_1K and "
+            "LOCAL_MODEL_OUTPUT_PRICE_PER_1K must either both be numeric or "
+            "both be unset/blank."
+        )
     if custom_input_price is not None and custom_output_price is not None:
         branch = "custom"
-        price = prompt_len * float(custom_input_price) / 1000 + \
-            completion_len * float(custom_output_price) / 1000
+        price = prompt_len * custom_input_price / 1000 + \
+            completion_len * custom_output_price / 1000
     elif "gpt-4" in model_name and model_name in OPENAI_MODEL_INFO["gpt-4"]:
         branch = "gpt-4"
         price = prompt_len * OPENAI_MODEL_INFO[branch][model_name]["input"] /1000 + \
