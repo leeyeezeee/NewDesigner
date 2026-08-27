@@ -334,7 +334,7 @@ async def run_math_dataset(
                 reference_loss,
                 edge_tanh_temperature=getattr(args, "edge_tanh_temperature", 1.0),
                 edge_ig_reward_lambda=iteration_edge_ig_reward_lambda,
-                edge_ig_discount_factor=getattr(args, "edge_ig_discount_factor", 0.0),
+                edge_ig_discount_factor=getattr(args, "edge_ig_discount_factor", 0.2),
                 advantage_epsilon=getattr(args, "graph_advantage_epsilon", 1e-6),
             )
             critic_reward_summary = None
@@ -449,7 +449,7 @@ async def run_math_dataset(
                         log_prob,
                         edge_tanh_temperature=getattr(args, "edge_tanh_temperature", 1.0),
                         edge_ig_reward_lambda=iteration_edge_ig_reward_lambda,
-                        edge_ig_discount_factor=getattr(args, "edge_ig_discount_factor", 0.0),
+                        edge_ig_discount_factor=getattr(args, "edge_ig_discount_factor", 0.2),
                     )
                     single_loss = single_loss + edge_ig_loss
                     utility["edge_ig_loss_summary"] = edge_ig_summary

@@ -44,7 +44,8 @@ python experiments/run_gsm8k.py --mode FullConnected --batch_size 4 --agent_nums
 The optimized topology combines G-Designer's low-rank refinement regularization
 with IGPO-style teacher forcing. `--use_graph_tf_reward` enables multi-graph
 correctness advantages, while `--edge_ig_reward_lambda` adds per-edge
-teacher-forcing information gain. The refinement rank defaults to 4. The
+teacher-forcing information gain. Within-round downstream edge rewards use a
+default discount factor of 0.2. The refinement rank defaults to 4. The
 optional anchor and nuclear-norm penalties default to 0 and can be enabled with
 `--anchor_reg_weight` and `--sparsity_reg_weight`:
 

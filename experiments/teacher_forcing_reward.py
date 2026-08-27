@@ -79,8 +79,8 @@ def add_teacher_forcing_reward_args(parser) -> None:
     parser.add_argument(
         "--edge_ig_discount_factor",
         type=float,
-        default=0.0,
-        help="Within-round downstream IG discount; 0 keeps immediate IG only.",
+        default=0.2,
+        help="Within-round downstream IG discount (default: 0.2; 0 keeps immediate IG only).",
     )
     parser.add_argument(
         "--graph_advantage_epsilon",
@@ -160,6 +160,9 @@ def experiment_summary_metadata(args: Any, dataset: str) -> Dict[str, Any]:
             ),
             "edge": edge_rewards or ["none"],
             "lambda": edge_lambda,
+            "discount_factor": float(
+                getattr(args, "edge_ig_discount_factor", 0.2)
+            ),
         },
     }
 
@@ -312,7 +315,7 @@ def edge_information_gain_loss(
     *,
     edge_tanh_temperature: float = 1.0,
     edge_ig_reward_lambda: float = 0.0,
-    edge_ig_discount_factor: float = 0.0,
+    edge_ig_discount_factor: float = 0.2,
 ) -> Tuple[torch.Tensor, Dict[str, Any]]:
     """Build the selected-edge policy-gradient loss from teacher-forcing IG."""
     zero = reference_loss.new_tensor(0.0)
@@ -420,7 +423,7 @@ def graph_correctness_advantage_edge_loss(
     *,
     edge_tanh_temperature: float = 1.0,
     edge_ig_reward_lambda: float = 0.0,
-    edge_ig_discount_factor: float = 0.0,
+    edge_ig_discount_factor: float = 0.2,
     advantage_epsilon: float = 1e-6,
 ) -> Tuple[torch.Tensor, List[Dict[str, Any]]]:
     """Combine graph correctness advantages and selected-edge teacher-forcing IG."""
