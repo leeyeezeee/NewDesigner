@@ -1,5 +1,4 @@
 import torch
-import json
 from typing import Iterator
 import pandas as pd
 import numpy as np
@@ -25,6 +24,8 @@ from GDesigner.utils.ig_rewards import (
 from GDesigner.utils.ig_scorer import FinalAnswerScorer, make_target_spec
 from experiments.graph_concurrency import limited_graph_arun, make_graph_semaphore
 from experiments.graph_critic import (
+    GraphCriticReplayBuffer,
+    add_graph_critic_examples,
     build_graph_critic,
     critic_counterfactual_edge_loss,
     score_full_graph_teacher_forcing,
@@ -37,27 +38,12 @@ from experiments.teacher_forcing_reward import (
 )
 from experiments.edge_training_log import (
     append_training_step,
-    reset_edge_training_log,
-    resolve_edge_training_log_file,
     resolve_question_id,
 )
 
-_GRAPH_TF_RECORD_FILE = "mmlu_graph_tf_records.jsonl"
-
-
-def _reset_jsonl(path: str) -> None:
-    record_path = Path(path)
-    record_path.parent.mkdir(parents=True, exist_ok=True)
-    record_path.write_text("", encoding="utf-8")
-
-
-def _append_jsonl(path: str, record: dict) -> None:
-    with Path(path).open("a", encoding="utf-8") as file:
-        file.write(json.dumps(record, ensure_ascii=False) + "\n")
-
-
 async def train(graph:Graph,
             dataset,
+            edge_training_log_path: Path,
             num_iters:int=100,
             num_rounds:int=1,
             lr:float=0.001,
@@ -70,9 +56,11 @@ async def train(graph:Graph,
             use_graph_tf_reward: bool = False,
             use_graph_critic: bool = False,
             graph_sample_count: int = 8,
-            graph_critic_lr: float = 1e-3,
-            graph_critic_reward_lambda: float = 0.2,
+            graph_critic_lr: float = 0.03,
             graph_critic_warmup_iterations: int = 2,
+            graph_critic_buffer_size: int = 256,
+            graph_critic_batch_size: int = 32,
+            graph_critic_updates_per_iteration: int = 4,
             edge_tanh_temperature: float = 1.0,
             edge_ig_reward_lambda: float = None,
             edge_ig_warmup_iterations: int = 2,
@@ -101,23 +89,31 @@ async def train(graph:Graph,
         raise ValueError("--use_graph_critic requires --optimized_spatial.")
     if use_graph_critic and int(graph_sample_count) < 2:
         raise ValueError("--use_graph_critic requires --graph_sample_count >= 2.")
+    if use_graph_critic and use_edge_selector:
+        raise ValueError(
+            "--use_graph_critic replaces real edge ablation and cannot be "
+            "combined with --use_edge_selector."
+        )
     graph_critic = None
     graph_critic_optimizer = None
+    graph_critic_replay_buffer = None
     if use_graph_critic:
         graph_critic, graph_critic_optimizer = build_graph_critic(
             graph,
             learning_rate=graph_critic_lr,
         )
-    # Real edge ablation remains the default.  The critic flag switches this
-    # diagnostic-only default off, while explicit selector/IG requests still
-    # opt back into the unchanged real-ablation implementation.
-    record_edge_training = not use_graph_critic
-    edge_training_log_path = resolve_edge_training_log_file("mmlu")
-    reset_edge_training_log(edge_training_log_path)
+        graph_critic_replay_buffer = GraphCriticReplayBuffer(
+            graph_critic_buffer_size
+        )
+    # Real edge ablation remains the default. The critic flag replaces that
+    # estimator completely; the shared edge reward weight then scales Q-diffs.
+    edge_training_log_path = Path(edge_training_log_path)
     record_edge_ig = (
-        use_edge_selector
-        or resolved_edge_ig_reward_lambda != 0.0
-        or record_edge_training
+        not use_graph_critic
+        and (
+            use_edge_selector
+            or resolved_edge_ig_reward_lambda != 0.0
+        )
     )
     edge_selector = None
     selector_buffer = None
@@ -132,7 +128,6 @@ async def train(graph:Graph,
         if (
             use_edge_selector
             or resolved_edge_ig_reward_lambda != 0.0
-            or record_edge_training
             or use_graph_critic
         )
         else None
@@ -152,7 +147,7 @@ async def train(graph:Graph,
         )
         iteration_edge_ig_reward_lambda = (
             resolved_edge_ig_reward_lambda
-            if edge_ig_measurement_enabled
+            if edge_ig_measurement_enabled and not use_graph_critic
             else 0.0
         )
         print(f"Iter {i_iter}", 80*'-')
@@ -313,7 +308,7 @@ async def train(graph:Graph,
                         graph_groups,
                         record_input_dicts,
                         reference_loss,
-                        reward_lambda=graph_critic_reward_lambda,
+                        reward_lambda=resolved_edge_ig_reward_lambda,
                         tanh_temperature=edge_tanh_temperature,
                     )
                 )
@@ -439,17 +434,26 @@ async def train(graph:Graph,
         )
         optimizer.step()
         if use_graph_critic:
-            critic_fit_summary = train_graph_critic(
-                graph_critic,
-                graph_critic_optimizer,
+            added_critic_examples = add_graph_critic_examples(
+                graph_critic_replay_buffer,
                 graph_groups,
                 record_input_dicts,
                 graph_critic_score_groups,
+            )
+            critic_fit_summary = train_graph_critic(
+                graph_critic,
+                graph_critic_optimizer,
+                graph_critic_replay_buffer,
+                batch_size=graph_critic_batch_size,
+                updates=graph_critic_updates_per_iteration,
             )
             print(
                 "graph critic: "
                 f"mse={critic_fit_summary['loss']:.6f}, "
                 f"target_std={critic_fit_summary['target_std']:.6f}, "
+                f"replay={int(critic_fit_summary['buffer_size'])}, "
+                f"added={added_critic_examples}, "
+                f"updates={int(critic_fit_summary['updates'])}, "
                 "predicted_edges="
                 f"{int((critic_reward_summary or {}).get('edge_count', 0))}"
             )
@@ -481,5 +485,6 @@ async def train(graph:Graph,
     if use_graph_critic:
         graph.graph_critic = graph_critic
         graph.graph_critic_optimizer = graph_critic_optimizer
+        graph.graph_critic_replay_buffer = graph_critic_replay_buffer
     return edge_selector if selector_trained else None
         

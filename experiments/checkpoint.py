@@ -26,6 +26,7 @@ def save_graph_checkpoint(
     edge_selector: Optional[torch.nn.Module] = None,
     graph_critic: Optional[torch.nn.Module] = None,
     graph_critic_optimizer: Optional[torch.optim.Optimizer] = None,
+    graph_critic_replay_buffer: Any = None,
     metrics: Optional[Dict[str, Any]] = None,
 ) -> None:
     if not checkpoint_file:
@@ -69,6 +70,10 @@ def save_graph_checkpoint(
         checkpoint["graph_critic_optimizer_state_dict"] = (
             graph_critic_optimizer.state_dict()
         )
+    if graph_critic_replay_buffer is not None:
+        checkpoint["graph_critic_replay_buffer_state_dict"] = (
+            graph_critic_replay_buffer.state_dict()
+        )
 
     torch.save(checkpoint, tmp_path)
     tmp_path.replace(output_path)
@@ -105,6 +110,7 @@ def load_graph_checkpoint(
     load_optimizer: Optional[torch.optim.Optimizer] = None,
     graph_critic: Optional[torch.nn.Module] = None,
     load_graph_critic_optimizer: Optional[torch.optim.Optimizer] = None,
+    graph_critic_replay_buffer: Any = None,
 ) -> Dict[str, Any]:
     checkpoint_path = Path(checkpoint_file)
     if not checkpoint_path.exists():
@@ -218,6 +224,13 @@ def load_graph_checkpoint(
     ):
         load_graph_critic_optimizer.load_state_dict(
             checkpoint["graph_critic_optimizer_state_dict"]
+        )
+    if (
+        graph_critic_replay_buffer is not None
+        and "graph_critic_replay_buffer_state_dict" in checkpoint
+    ):
+        graph_critic_replay_buffer.load_state_dict(
+            checkpoint["graph_critic_replay_buffer_state_dict"]
         )
 
     print(f"Loaded checkpoint: {checkpoint_path}")

@@ -1,28 +1,26 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Sequence
+from typing import Any, Dict, Sequence, Tuple
 
 import torch
 
 
-def resolve_edge_training_log_file(dataset: str) -> Path:
-    return Path("result") / f"{dataset}_log.jsonl"
-
-
-def resolve_case_log_file(dataset: str) -> Path:
-    return Path("result") / f"{dataset}_cases.jsonl"
-
-
-def reset_edge_training_log(log_file: Path) -> None:
-    log_file.parent.mkdir(parents=True, exist_ok=True)
+def create_run_record_files(dataset: str) -> Tuple[Path, Path]:
+    """Create unique training-log and case files for one experiment run."""
+    dataset_name = str(dataset).strip().lower()
+    if not dataset_name or Path(dataset_name).name != dataset_name:
+        raise ValueError(f"Invalid dataset name for result files: {dataset!r}.")
+    output_dir = Path("result") / dataset_name
+    output_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+    log_file = output_dir / f"{dataset_name}_log_{timestamp}.jsonl"
+    case_file = output_dir / f"{dataset_name}_cases_{timestamp}.jsonl"
     log_file.write_text("", encoding="utf-8")
-
-
-def reset_case_log(case_file: Path) -> None:
-    case_file.parent.mkdir(parents=True, exist_ok=True)
     case_file.write_text("", encoding="utf-8")
+    return log_file, case_file
 
 
 def append_training_step(

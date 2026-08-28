@@ -43,20 +43,35 @@ def add_teacher_forcing_reward_args(parser) -> None:
     parser.add_argument(
         "--graph_critic_lr",
         type=float,
-        default=1e-3,
+        default=0.03,
         help="Learning rate for the independent graph critic.",
-    )
-    parser.add_argument(
-        "--graph_critic_reward_lambda",
-        type=float,
-        default=0.2,
-        help="Coefficient for critic-predicted counterfactual edge rewards.",
     )
     parser.add_argument(
         "--graph_critic_warmup_iterations",
         type=int,
         default=2,
-        help="Critic-only fitting iterations before its edge rewards affect the actor.",
+        help=(
+            "Iterations that train the critic from TF targets without letting "
+            "critic-predicted edge rewards affect the actor."
+        ),
+    )
+    parser.add_argument(
+        "--graph_critic_buffer_size",
+        type=int,
+        default=256,
+        help="Maximum number of detached graph samples retained for critic replay.",
+    )
+    parser.add_argument(
+        "--graph_critic_batch_size",
+        type=int,
+        default=32,
+        help="Number of replayed graphs in each critic regression update.",
+    )
+    parser.add_argument(
+        "--graph_critic_updates_per_iteration",
+        type=int,
+        default=4,
+        help="Number of replay-sampled critic updates after each actor update.",
     )
     parser.add_argument(
         "--max_concurrent_graphs",
@@ -74,7 +89,11 @@ def add_teacher_forcing_reward_args(parser) -> None:
         "--edge_ig_reward_lambda",
         type=float,
         default=None,
-        help="Coefficient for per-edge teacher-forcing information gain.",
+        help=(
+            "Unified coefficient for edge teacher-forcing reward. It weights "
+            "real deletion IG normally and critic-predicted deletion IG when "
+            "--use_graph_critic is enabled."
+        ),
     )
     parser.add_argument(
         "--edge_ig_discount_factor",
@@ -92,7 +111,10 @@ def add_teacher_forcing_reward_args(parser) -> None:
         "--edge_ig_warmup_iterations",
         type=int,
         default=2,
-        help="Initial iterations that skip counterfactual edge-IG calls and loss.",
+        help=(
+            "Initial iterations that skip real counterfactual edge-ablation "
+            "calls and their edge-IG loss."
+        ),
     )
     parser.add_argument(
         "--refine_rank",
@@ -130,13 +152,13 @@ def experiment_summary_metadata(args: Any, dataset: str) -> Dict[str, Any]:
     use_critic = bool(getattr(args, "use_graph_critic", False))
     use_group_advantage = bool(getattr(args, "use_graph_tf_reward", False)) or use_critic
     edge_rewards = []
-    if edge_lambda != 0.0:
+    if edge_lambda != 0.0 and not use_critic:
         edge_rewards.append(
             "execution_score_diff"
             if str(dataset).lower() == "humaneval"
             else "teacher_logprob_diff"
         )
-    if use_critic:
+    if use_critic and edge_lambda != 0.0:
         edge_rewards.append("critic_q_difference")
     optimized = bool(getattr(args, "optimized_spatial", False)) or bool(
         getattr(args, "optimized_temporal", False)

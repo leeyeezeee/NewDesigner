@@ -22,10 +22,7 @@ from experiments.teacher_forcing_reward import (
     set_experiment_seed,
 )
 from experiments.edge_training_log import (
-    reset_case_log,
-    reset_edge_training_log,
-    resolve_case_log_file,
-    resolve_edge_training_log_file,
+    create_run_record_files,
 )
 
 
@@ -87,9 +84,7 @@ async def main():
     set_experiment_seed(args.seed)
     apply_agent_backend_args(args)
     reset_usage_counters()
-    reset_edge_training_log(resolve_edge_training_log_file("mmlu"))
-    case_file = resolve_case_log_file("mmlu")
-    reset_case_log(case_file)
+    edge_training_log_file, case_file = create_run_record_files("mmlu")
     train_usage = {"cost": 0.0, "prompt_tokens": 0.0, "completion_tokens": 0.0, "llm_calls": 0.0}
     train_wall_seconds = 0.0
 
@@ -112,7 +107,9 @@ async def main():
     
     if args.optimized_spatial or args.optimized_temporal:
         train_wall_start = time.time()
-        edge_selector = await train(graph=graph,dataset=dataset_train,num_iters=args.num_iterations,num_rounds=args.num_rounds,
+        edge_selector = await train(graph=graph,dataset=dataset_train,
+                    edge_training_log_path=edge_training_log_file,
+                    num_iters=args.num_iterations,num_rounds=args.num_rounds,
                     lr=args.lr,batch_size=args.batch_size, use_edge_selector=args.use_edge_selector,
                     imp_per_iterations=args.imp_per_iterations, pruning_rate=args.pruning_rate,
                     selector_buffer_size=args.selector_buffer_size,
@@ -121,8 +118,10 @@ async def main():
                     use_graph_critic=args.use_graph_critic,
                     graph_sample_count=args.graph_sample_count,
                     graph_critic_lr=args.graph_critic_lr,
-                    graph_critic_reward_lambda=args.graph_critic_reward_lambda,
                     graph_critic_warmup_iterations=args.graph_critic_warmup_iterations,
+                    graph_critic_buffer_size=args.graph_critic_buffer_size,
+                    graph_critic_batch_size=args.graph_critic_batch_size,
+                    graph_critic_updates_per_iteration=args.graph_critic_updates_per_iteration,
                     edge_tanh_temperature=args.edge_tanh_temperature,
                     edge_ig_reward_lambda=args.edge_ig_reward_lambda,
                     edge_ig_warmup_iterations=args.edge_ig_warmup_iterations,
@@ -142,6 +141,9 @@ async def main():
             graph_critic=getattr(graph, "graph_critic", None),
             graph_critic_optimizer=getattr(
                 graph, "graph_critic_optimizer", None
+            ),
+            graph_critic_replay_buffer=getattr(
+                graph, "graph_critic_replay_buffer", None
             ),
         )
     else:

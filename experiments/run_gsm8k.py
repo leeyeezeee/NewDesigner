@@ -37,6 +37,8 @@ from datasets.gsm8k_dataset import gsm_data_process,gsm_get_predict
 from experiments.checkpoint import save_graph_checkpoint
 from experiments.graph_concurrency import limited_graph_arun, make_graph_semaphore
 from experiments.graph_critic import (
+    GraphCriticReplayBuffer,
+    add_graph_critic_examples,
     build_graph_critic,
     critic_counterfactual_edge_loss,
     score_full_graph_teacher_forcing,
@@ -53,10 +55,7 @@ from experiments.teacher_forcing_reward import (
 from experiments.edge_training_log import (
     append_case_record,
     append_training_step,
-    reset_case_log,
-    reset_edge_training_log,
-    resolve_case_log_file,
-    resolve_edge_training_log_file,
+    create_run_record_files,
     resolve_question_id,
 )
 
@@ -137,10 +136,7 @@ async def main():
     graph.gat.train()
     graph.edge_mlp.train()
     graph.spatial_affinity.train()
-    edge_training_log_file = resolve_edge_training_log_file("gsm8k")
-    reset_edge_training_log(edge_training_log_file)
-    case_log_file = resolve_case_log_file("gsm8k")
-    reset_case_log(case_log_file)
+    edge_training_log_file, case_log_file = create_run_record_files("gsm8k")
     optimizer_params = graph.spatial_parameters()
     if graph.optimized_temporal:
         optimizer_params.append(graph.temporal_logits)
@@ -159,18 +155,27 @@ async def main():
         raise ValueError("--use_graph_critic requires --optimized_spatial.")
     if use_graph_critic and int(args.graph_sample_count) < 2:
         raise ValueError("--use_graph_critic requires --graph_sample_count >= 2.")
+    if use_graph_critic and args.use_edge_selector:
+        raise ValueError(
+            "--use_graph_critic replaces real edge ablation and cannot be "
+            "combined with --use_edge_selector."
+        )
     graph_critic = None
     graph_critic_optimizer = None
+    graph_critic_replay_buffer = None
     if use_graph_critic:
         graph_critic, graph_critic_optimizer = build_graph_critic(
             graph, learning_rate=args.graph_critic_lr
         )
+        graph_critic_replay_buffer = GraphCriticReplayBuffer(
+            args.graph_critic_buffer_size
+        )
     record_edge_ig = (
         optimize_enabled
+        and not use_graph_critic
         and (
             args.use_edge_selector
             or edge_ig_reward_lambda != 0.0
-            or (bool(edge_training_log_file) and not use_graph_critic)
         )
     )
     edge_selector = None
@@ -186,7 +191,6 @@ async def main():
         if (
             args.use_edge_selector
             or edge_ig_reward_lambda != 0.0
-            or bool(edge_training_log_file)
             or use_graph_critic
         )
         else None
@@ -207,7 +211,9 @@ async def main():
             and i_batch >= max(0, int(args.edge_ig_warmup_iterations))
         )
         iteration_edge_ig_reward_lambda = (
-            edge_ig_reward_lambda if edge_ig_measurement_enabled else 0.0
+            edge_ig_reward_lambda
+            if edge_ig_measurement_enabled and not use_graph_critic
+            else 0.0
         )
         record_edge_ig_history = record_edge_ig and train_updates_enabled
         batch_edge_selector = edge_selector if (selector_trained and not train_updates_enabled) else None
@@ -378,7 +384,7 @@ async def main():
                         graph_groups,
                         record_input_dicts,
                         reference_loss,
-                        reward_lambda=args.graph_critic_reward_lambda,
+                        reward_lambda=edge_ig_reward_lambda,
                         tanh_temperature=args.edge_tanh_temperature,
                     )
                 )
@@ -517,17 +523,26 @@ async def main():
             )
             optimizer.step()
             if use_graph_critic:
-                critic_fit_summary = train_graph_critic(
-                    graph_critic,
-                    graph_critic_optimizer,
+                added_critic_examples = add_graph_critic_examples(
+                    graph_critic_replay_buffer,
                     graph_groups,
                     record_input_dicts,
                     graph_critic_score_groups,
+                )
+                critic_fit_summary = train_graph_critic(
+                    graph_critic,
+                    graph_critic_optimizer,
+                    graph_critic_replay_buffer,
+                    batch_size=args.graph_critic_batch_size,
+                    updates=args.graph_critic_updates_per_iteration,
                 )
                 print(
                     "graph critic: "
                     f"mse={critic_fit_summary['loss']:.6f}, "
                     f"target_std={critic_fit_summary['target_std']:.6f}, "
+                    f"replay={int(critic_fit_summary['buffer_size'])}, "
+                    f"added={added_critic_examples}, "
+                    f"updates={int(critic_fit_summary['updates'])}, "
                     "predicted_edges="
                     f"{int((critic_reward_summary or {}).get('edge_count', 0))}"
                 )
@@ -565,6 +580,7 @@ async def main():
                 edge_selector=edge_selector if selector_trained else None,
                 graph_critic=graph_critic,
                 graph_critic_optimizer=graph_critic_optimizer,
+                graph_critic_replay_buffer=graph_critic_replay_buffer,
                 metrics={"train_accuracy": accuracy},
             )
             total_solved = 0
