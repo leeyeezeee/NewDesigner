@@ -89,6 +89,16 @@ async def compute_edge_information_gain(
     after_outputs_cache: Dict[Tuple[str, int], List[Any]] = {}
     after_score_cache: Dict[Tuple[str, int], Any] = {}
 
+    # The external decision node normally aggregates every agent's latest
+    # answer.  Edge IG keeps that realized context fixed and replaces only the
+    # receiving agent's answer with its edge-deleted counterfactual.  This
+    # measures the receiver's marginal effect in the actual MAS context rather
+    # than scoring its answer as an isolated candidate.
+    decision_context = {
+        node_id: dict(info)
+        for node_id, info in graph.decision_node.get_spatial_info().items()
+    }
+
     for edge_info in _realized_spatial_edge_occurrences(graph, histories):
         target_id = edge_info["target"]
         source_id = edge_info["source"]
@@ -111,6 +121,8 @@ async def compute_edge_information_gain(
             continue
         before_spatial_info = dict(spatial_info)
         before_spatial_info.pop(source_id, None)
+        fixed_decision_context = dict(decision_context)
+        fixed_decision_context.pop(target_id, None)
 
         before_response_empty = False
         try:
@@ -169,7 +181,7 @@ async def compute_edge_information_gain(
                 before_score_task = scorer.teacher_answer_logprob(
                     graph.decision_node,
                     input_data,
-                    {},
+                    fixed_decision_context,
                     {},
                     target_spec,
                 )
@@ -179,18 +191,28 @@ async def compute_edge_information_gain(
                     input_data,
                     before_outputs,
                     target_spec,
+                    base_spatial_info=fixed_decision_context,
                     candidate_id=target_id,
                     candidate_role=getattr(target_node, "role", "Candidate"),
                 )
         else:
-            before_score_task = scorer.final_agent_execution_score(
-                graph.decision_node,
-                input_data,
-                before_outputs,
-                target_spec,
-                candidate_id=target_id,
-                candidate_role=getattr(target_node, "role", "Candidate"),
-            )
+            if before_response_empty:
+                before_score_task = scorer.final_agent_context_execution_score(
+                    graph.decision_node,
+                    input_data,
+                    fixed_decision_context,
+                    target_spec,
+                )
+            else:
+                before_score_task = scorer.final_agent_execution_score(
+                    graph.decision_node,
+                    input_data,
+                    before_outputs,
+                    target_spec,
+                    base_spatial_info=fixed_decision_context,
+                    candidate_id=target_id,
+                    candidate_role=getattr(target_node, "role", "Candidate"),
+                )
 
         if after_cache_key in after_score_cache:
             before_score = await before_score_task
@@ -217,6 +239,7 @@ async def compute_edge_information_gain(
                     input_data,
                     after_outputs,
                     target_spec,
+                    base_spatial_info=fixed_decision_context,
                     candidate_id=target_id,
                     candidate_role=getattr(target_node, "role", "Candidate"),
                 )
@@ -226,6 +249,7 @@ async def compute_edge_information_gain(
                     input_data,
                     after_outputs,
                     target_spec,
+                    base_spatial_info=fixed_decision_context,
                     candidate_id=target_id,
                     candidate_role=getattr(target_node, "role", "Candidate"),
                 )
@@ -260,9 +284,9 @@ async def compute_edge_information_gain(
                 "after_teacher_logprob": after_answer_score,
                 "teacher_forcing_agent": "final_agent",
                 "teacher_forcing_context": (
-                    "counterfactual_no_candidate_vs_local_candidate"
+                    "fixed_full_context_without_target"
                     if before_response_empty
-                    else "local_candidate_output"
+                    else "fixed_full_context_target_replacement"
                 ),
                 "teacher_forcing_candidate_role": getattr(target_node, "role", ""),
             })
@@ -270,6 +294,11 @@ async def compute_edge_information_gain(
             details[key].update({
                 "ig_mode": "final_agent_execution_score_diff",
                 "scoring_agent": "final_agent",
+                "execution_context": (
+                    "fixed_full_context_without_target"
+                    if before_response_empty
+                    else "fixed_full_context_target_replacement"
+                ),
                 "execution_candidate_role": getattr(target_node, "role", ""),
             })
 

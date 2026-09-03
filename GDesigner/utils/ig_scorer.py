@@ -344,6 +344,28 @@ class FinalAnswerScorer:
             },
         )
 
+    async def final_agent_context_execution_score(
+        self,
+        decision_node,
+        input_data: Dict[str, Any],
+        spatial_info: Dict[str, Any],
+        target_spec: TargetSpec,
+    ) -> ScoreResult:
+        """Execute and score the final agent with a fixed multi-agent context."""
+        generated = decision_node._async_execute(input_data, spatial_info, {})
+        if inspect.isawaitable(generated):
+            generated = await generated
+        score = await asyncio.to_thread(self._execution_score, generated, target_spec)
+        return ScoreResult(
+            score=float(score),
+            mode="final_agent_execution",
+            details={
+                "scoring_agent": "final_agent",
+                "num_context_outputs": len(spatial_info),
+                "final_agent_output": str(generated),
+            },
+        )
+
     async def _final_agent_single_output_execution_score(
         self,
         decision_node,
