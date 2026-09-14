@@ -3,13 +3,19 @@ from __future__ import annotations
 import json
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Sequence, Tuple
+from typing import Any, Dict, Optional, Sequence, Tuple
 
 import torch
 
 
-def create_run_record_files(dataset: str) -> Tuple[Path, Path]:
+def create_run_record_files(
+    dataset: str,
+    *,
+    enabled: bool = True,
+) -> Tuple[Optional[Path], Optional[Path]]:
     """Create unique training-log and case files for one experiment run."""
+    if not enabled:
+        return None, None
     dataset_name = str(dataset).strip().lower()
     if not dataset_name or Path(dataset_name).name != dataset_name:
         raise ValueError(f"Invalid dataset name for result files: {dataset!r}.")
@@ -24,14 +30,16 @@ def create_run_record_files(dataset: str) -> Tuple[Path, Path]:
 
 
 def append_training_step(
-    log_file: Path,
+    log_file: Optional[Path],
     *,
     step: int,
     accuracy: float,
     avg_edges: float,
     avg_communication_tokens: float,
 ) -> None:
-    """Append only the four values used by the training-dynamics plots."""
+    """Append numerical fields used to plot graph training progress."""
+    if log_file is None:
+        return
     record = {
         "step": int(step),
         "accuracy": float(accuracy),
@@ -49,7 +57,7 @@ def append_training_step(
 
 
 def append_case_record(
-    case_file: Path,
+    case_file: Optional[Path],
     *,
     question_id: Any,
     question: Any,
@@ -58,6 +66,8 @@ def append_case_record(
     correct: bool,
 ) -> None:
     """Persist one real evaluation trace without duplicating received messages."""
+    if case_file is None:
+        return
     agent_outputs = []
     node_ids = list(graph.nodes)
     for node_index, node_id in enumerate(node_ids):
@@ -100,12 +110,12 @@ def resolve_question_id(record: Any, fallback_index: int) -> Any:
 
 
 def append_edge_training_details(
-    log_file: Path,
+    log_file: Optional[Path],
     *,
     question_id: Any,
     edge_details: Dict[str, Dict[str, Any]],
 ) -> None:
-    if not edge_details:
+    if log_file is None or not edge_details:
         return
     edges = []
     for detail in edge_details.values():
@@ -291,13 +301,15 @@ def _task_adaptation_proxies(graph_groups) -> Dict[str, Any]:
 
 
 def append_topology_diagnostics(
-    log_file: Path,
+    log_file: Optional[Path],
     *,
     iteration: int,
     graph_groups: Sequence[Sequence[Any]],
     reward_summaries: Sequence[Dict[str, Any]],
 ) -> None:
     """Append one compact topology-policy diagnostic record per iteration."""
+    if log_file is None:
+        return
     graphs = [graph for group in graph_groups for graph in group]
     if not graphs:
         return

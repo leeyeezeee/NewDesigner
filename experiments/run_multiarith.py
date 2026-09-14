@@ -8,7 +8,10 @@ sys.stdout.reconfigure(encoding="utf-8")
 from datasets.gsm8k_dataset import gsm_get_predict, multiarith_data_process
 from GDesigner.tools.reader.readers import JSONReader
 from GDesigner.utils.const import GDesigner_ROOT
-from experiments.teacher_forcing_reward import add_teacher_forcing_reward_args
+from experiments.teacher_forcing_reward import (
+    add_full_graph_reward_ablation_args,
+    add_teacher_forcing_reward_args,
+)
 from math_dataset_runner import numeric_correct, run_math_dataset
 
 
@@ -38,11 +41,8 @@ def parse_args():
     parser.add_argument("--metrics_file", type=str, default="result/multiarith.jsonl")
     parser.add_argument("--checkpoint_file", type=str, default="result/checkpoints/multiarith.pt",
                         help="Path to overwrite with the trained graph checkpoint.")
-    parser.add_argument("--use_edge_selector", action="store_true",
-                        help="Enable final-agent teacher-logprob/execution IG selector training and selector pruning during evaluation.")
-    parser.add_argument("--selector_buffer_size", type=int, default=512)
-    parser.add_argument("--selector_ig_tau", type=float, default=0.0)
     add_teacher_forcing_reward_args(parser)
+    add_full_graph_reward_ablation_args(parser)
     parser.add_argument("--optimized_spatial", action="store_true")
     parser.add_argument("--optimized_temporal", action="store_true")
     args = parser.parse_args()

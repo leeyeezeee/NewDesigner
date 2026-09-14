@@ -23,10 +23,6 @@ def save_graph_checkpoint(
     dataset: str,
     args: Any = None,
     optimizer: Optional[torch.optim.Optimizer] = None,
-    edge_selector: Optional[torch.nn.Module] = None,
-    graph_critic: Optional[torch.nn.Module] = None,
-    graph_critic_optimizer: Optional[torch.optim.Optimizer] = None,
-    graph_critic_replay_buffer: Any = None,
     metrics: Optional[Dict[str, Any]] = None,
 ) -> None:
     if not checkpoint_file:
@@ -59,21 +55,6 @@ def save_graph_checkpoint(
     }
     if optimizer is not None:
         checkpoint["optimizer_state_dict"] = optimizer.state_dict()
-    if edge_selector is not None:
-        checkpoint["edge_selector_state_dict"] = edge_selector.state_dict()
-    if graph_critic is not None:
-        checkpoint["graph_critic"] = {
-            "architecture": getattr(graph_critic, "architecture", None),
-            "state_dict": graph_critic.state_dict(),
-        }
-    if graph_critic_optimizer is not None:
-        checkpoint["graph_critic_optimizer_state_dict"] = (
-            graph_critic_optimizer.state_dict()
-        )
-    if graph_critic_replay_buffer is not None:
-        checkpoint["graph_critic_replay_buffer_state_dict"] = (
-            graph_critic_replay_buffer.state_dict()
-        )
 
     torch.save(checkpoint, tmp_path)
     tmp_path.replace(output_path)
@@ -108,9 +89,6 @@ def load_graph_checkpoint(
     checkpoint_file: str,
     *,
     load_optimizer: Optional[torch.optim.Optimizer] = None,
-    graph_critic: Optional[torch.nn.Module] = None,
-    load_graph_critic_optimizer: Optional[torch.optim.Optimizer] = None,
-    graph_critic_replay_buffer: Any = None,
 ) -> Dict[str, Any]:
     checkpoint_path = Path(checkpoint_file)
     if not checkpoint_path.exists():
@@ -202,36 +180,6 @@ def load_graph_checkpoint(
 
     if load_optimizer is not None and "optimizer_state_dict" in checkpoint:
         load_optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-    if graph_critic is not None:
-        critic_state = checkpoint.get("graph_critic")
-        if critic_state is None:
-            raise ValueError("Checkpoint does not contain a graph critic.")
-        checkpoint_architecture = critic_state.get("architecture")
-        expected_architecture = getattr(graph_critic, "architecture", None)
-        if (
-            checkpoint_architecture is not None
-            and expected_architecture is not None
-            and checkpoint_architecture != expected_architecture
-        ):
-            raise ValueError(
-                f"Checkpoint critic architecture {checkpoint_architecture!r} "
-                f"does not match {expected_architecture!r}."
-            )
-        graph_critic.load_state_dict(critic_state["state_dict"])
-    if (
-        load_graph_critic_optimizer is not None
-        and "graph_critic_optimizer_state_dict" in checkpoint
-    ):
-        load_graph_critic_optimizer.load_state_dict(
-            checkpoint["graph_critic_optimizer_state_dict"]
-        )
-    if (
-        graph_critic_replay_buffer is not None
-        and "graph_critic_replay_buffer_state_dict" in checkpoint
-    ):
-        graph_critic_replay_buffer.load_state_dict(
-            checkpoint["graph_critic_replay_buffer_state_dict"]
-        )
 
     print(f"Loaded checkpoint: {checkpoint_path}")
     return checkpoint

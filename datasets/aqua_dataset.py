@@ -160,12 +160,11 @@ def _fix_a_slash_b(string):
 
 
 def _remove_right_units(string):
+    # Qwen answers often contain multiple \\text{ ... } units.
+    # Keep the leading numeric/choice fragment; do not require exactly one split.
     if "\\text{ " in string:
-        splits = string.split("\\text{ ")
-        assert len(splits) == 2
-        return splits[0]
-    else:
-        return string
+        return string.split("\\text{ ", 1)[0]
+    return string
 
 
 def _strip_string(string):

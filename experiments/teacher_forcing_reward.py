@@ -1,12 +1,16 @@
 import math
 import random
-from typing import Any, Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
 
 from experiments.agent_backend import add_agent_backend_args
-from GDesigner.utils.ig_scorer import edge_key
+from GDesigner.utils.ig_scorer import (
+    FinalAnswerScorer,
+    TargetSpec,
+    edge_key,
+)
 
 
 def add_teacher_forcing_reward_args(parser) -> None:
@@ -32,48 +36,6 @@ def add_teacher_forcing_reward_args(parser) -> None:
         help="Number of communication graphs sampled per training example.",
     )
     parser.add_argument(
-        "--use_graph_critic",
-        action="store_true",
-        help=(
-            "Use the optional lightweight GCN critic to approximate selected "
-            "edge deletion rewards. Disabled by default; real edge ablation "
-            "remains the default implementation."
-        ),
-    )
-    parser.add_argument(
-        "--graph_critic_lr",
-        type=float,
-        default=0.03,
-        help="Learning rate for the independent graph critic.",
-    )
-    parser.add_argument(
-        "--graph_critic_warmup_iterations",
-        type=int,
-        default=2,
-        help=(
-            "Iterations that train the critic from TF targets without letting "
-            "critic-predicted edge rewards affect the actor."
-        ),
-    )
-    parser.add_argument(
-        "--graph_critic_buffer_size",
-        type=int,
-        default=256,
-        help="Maximum number of detached graph samples retained for critic replay.",
-    )
-    parser.add_argument(
-        "--graph_critic_batch_size",
-        type=int,
-        default=32,
-        help="Number of replayed graphs in each critic regression update.",
-    )
-    parser.add_argument(
-        "--graph_critic_updates_per_iteration",
-        type=int,
-        default=4,
-        help="Number of replay-sampled critic updates after each actor update.",
-    )
-    parser.add_argument(
         "--max_concurrent_graphs",
         type=int,
         default=10,
@@ -90,9 +52,8 @@ def add_teacher_forcing_reward_args(parser) -> None:
         type=float,
         default=None,
         help=(
-            "Unified coefficient for edge teacher-forcing reward. It weights "
-            "real deletion IG normally and critic-predicted deletion IG when "
-            "--use_graph_critic is enabled."
+            "Coefficient for the real edge-deletion teacher-forcing "
+            "information-gain reward."
         ),
     )
     parser.add_argument(
@@ -136,6 +97,28 @@ def add_teacher_forcing_reward_args(parser) -> None:
     )
 
 
+def add_full_graph_reward_ablation_args(parser) -> None:
+    """Add the AQuA/GSM8K full-graph TF ablation options."""
+    parser.add_argument(
+        "--full_graph_tf_reward_lambda",
+        type=float,
+        default=0.0,
+        help=(
+            "Weight for the within-question full-graph teacher-forcing "
+            "advantage. This assigns one graph reward through the summed "
+            "graph log-prob without deleting individual edges."
+        ),
+    )
+    parser.add_argument(
+        "--disable_run_logs",
+        action="store_true",
+        help=(
+            "Do not create timestamped training-step or evaluation-case logs. "
+            "The aggregate metrics_file is still appended."
+        ),
+    )
+
+
 def set_experiment_seed(seed: int) -> None:
     seed = int(seed)
     random.seed(seed)
@@ -145,30 +128,61 @@ def set_experiment_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
+async def score_full_graph_teacher_forcing(
+    graph,
+    input_data: Dict[str, Any],
+    *,
+    target_spec: TargetSpec,
+    scorer: FinalAnswerScorer,
+) -> float:
+    """Score the realized full multi-agent graph against the target."""
+    if target_spec.mode == "execution":
+        result = await scorer.score_outputs(
+            graph.decision_node,
+            input_data,
+            graph.decision_node.outputs,
+            target_spec,
+        )
+    else:
+        result = await scorer.teacher_answer_logprob(
+            graph.decision_node,
+            input_data,
+            graph.decision_node.get_spatial_info(),
+            graph.decision_node.get_temporal_info(),
+            target_spec,
+        )
+    score = float(result.score)
+    if not math.isfinite(score):
+        raise FloatingPointError(
+            f"Non-finite full-graph teacher-forcing score: {score}."
+        )
+    return score
+
+
 def experiment_summary_metadata(args: Any, dataset: str) -> Dict[str, Any]:
     """Describe the reward actually enabled by the parsed runtime arguments."""
     edge_lambda_value = getattr(args, "edge_ig_reward_lambda", None)
     edge_lambda = 0.0 if edge_lambda_value is None else float(edge_lambda_value)
-    use_critic = bool(getattr(args, "use_graph_critic", False))
-    use_group_advantage = bool(getattr(args, "use_graph_tf_reward", False)) or use_critic
+    full_graph_tf_lambda = float(
+        getattr(args, "full_graph_tf_reward_lambda", 0.0)
+    )
+    use_group_advantage = bool(getattr(args, "use_graph_tf_reward", False))
     edge_rewards = []
-    if edge_lambda != 0.0 and not use_critic:
+    if edge_lambda != 0.0:
         edge_rewards.append(
             "execution_score_diff"
             if str(dataset).lower() == "humaneval"
             else "teacher_logprob_diff"
         )
-    if use_critic and edge_lambda != 0.0:
-        edge_rewards.append("critic_q_difference")
     optimized = bool(getattr(args, "optimized_spatial", False)) or bool(
         getattr(args, "optimized_temporal", False)
     )
     if not optimized:
         method = f"fixed_{getattr(args, 'mode', 'unknown')}"
-    elif use_critic:
-        method = "optimized_graph_critic"
     elif edge_rewards:
         method = "optimized_graph_edge_ig"
+    elif full_graph_tf_lambda != 0.0:
+        method = "optimized_graph_full_tf"
     else:
         method = "optimized_graph"
     return {
@@ -182,6 +196,12 @@ def experiment_summary_metadata(args: Any, dataset: str) -> Dict[str, Any]:
             ),
             "edge": edge_rewards or ["none"],
             "lambda": edge_lambda,
+            "full_graph_tf": (
+                "standardized_teacher_logprob"
+                if full_graph_tf_lambda != 0.0
+                else "none"
+            ),
+            "full_graph_tf_lambda": full_graph_tf_lambda,
             "discount_factor": float(
                 getattr(args, "edge_ig_discount_factor", 0.2)
             ),
@@ -447,8 +467,10 @@ def graph_correctness_advantage_edge_loss(
     edge_ig_reward_lambda: float = 0.0,
     edge_ig_discount_factor: float = 0.2,
     advantage_epsilon: float = 1e-6,
+    graph_tf_score_groups: Optional[Sequence[Sequence[float]]] = None,
+    full_graph_tf_reward_lambda: float = 0.0,
 ) -> Tuple[torch.Tensor, List[Dict[str, Any]]]:
-    """Combine graph correctness advantages and selected-edge teacher-forcing IG."""
+    """Combine correctness, full-graph TF, and optional per-edge IG rewards."""
     if not (
         len(graph_groups)
         == len(graph_log_prob_groups)
@@ -456,17 +478,35 @@ def graph_correctness_advantage_edge_loss(
         == len(edge_detail_groups)
     ):
         raise ValueError("Graph reward batches must contain equal group counts.")
+    if graph_tf_score_groups is not None and (
+        len(graph_tf_score_groups) != len(graph_groups)
+    ):
+        raise ValueError(
+            "Full-graph TF reward batches must match graph reward groups."
+        )
+    full_graph_tf_reward_lambda = float(full_graph_tf_reward_lambda)
+    if full_graph_tf_reward_lambda != 0.0 and graph_tf_score_groups is None:
+        raise ValueError(
+            "Full-graph TF scores are required when their reward lambda is non-zero."
+        )
 
     zero = reference_loss.new_tensor(0.0)
     group_losses: List[torch.Tensor] = []
     group_correctness_losses: List[torch.Tensor] = []
+    group_graph_tf_losses: List[torch.Tensor] = []
     group_edge_ig_losses: List[torch.Tensor] = []
     summaries: List[Dict[str, Any]] = []
-    for graphs, graph_log_probs, scores, edge_details_list in zip(
+    resolved_tf_score_groups = (
+        graph_tf_score_groups
+        if graph_tf_score_groups is not None
+        else [() for _ in graph_groups]
+    )
+    for graphs, graph_log_probs, scores, edge_details_list, graph_tf_scores in zip(
         graph_groups,
         graph_log_prob_groups,
         correctness_groups,
         edge_detail_groups,
+        resolved_tf_score_groups,
     ):
         if not (
             len(graphs)
@@ -475,12 +515,27 @@ def graph_correctness_advantage_edge_loss(
             == len(edge_details_list)
         ):
             raise ValueError("Each graph reward group must have aligned samples.")
+        if graph_tf_scores and len(graph_tf_scores) != len(graphs):
+            raise ValueError(
+                "Each full-graph TF score group must align with graph samples."
+            )
 
         baseline, advantages, variance, std = _standardized_advantages(
             scores, advantage_epsilon=advantage_epsilon
         )
+        if graph_tf_scores:
+            tf_baseline, tf_advantages, tf_variance, tf_std = (
+                _standardized_advantages(
+                    graph_tf_scores,
+                    advantage_epsilon=advantage_epsilon,
+                )
+            )
+        else:
+            tf_baseline, tf_variance, tf_std = (0.0, 0.0, 0.0)
+            tf_advantages = [0.0] * len(graphs)
         per_graph_losses = []
         correctness_losses = []
+        graph_tf_losses = []
         edge_ig_losses = []
         edge_ig_records = []
         edge_ig_coefficients = []
@@ -488,13 +543,23 @@ def graph_correctness_advantage_edge_loss(
         missing_log_prob = 0
         missing_detail = 0
         missing_ig_gain = 0
-        for advantage, graph, graph_log_prob, edge_details in zip(
-            advantages, graphs, graph_log_probs, edge_details_list
+        for advantage, tf_advantage, graph, graph_log_prob, edge_details in zip(
+            advantages,
+            tf_advantages,
+            graphs,
+            graph_log_probs,
+            edge_details_list,
         ):
             if not torch.is_tensor(graph_log_prob):
                 raise TypeError("Full graph log-prob must be a torch.Tensor.")
             correctness_loss = -(
                 graph_log_prob.new_tensor(float(advantage)) * graph_log_prob
+            )
+            graph_tf_loss = -(
+                graph_log_prob.new_tensor(
+                    full_graph_tf_reward_lambda * float(tf_advantage)
+                )
+                * graph_log_prob
             )
             ig_loss, ig_summary = edge_information_gain_loss(
                 graph,
@@ -504,8 +569,9 @@ def graph_correctness_advantage_edge_loss(
                 edge_ig_reward_lambda=edge_ig_reward_lambda,
                 edge_ig_discount_factor=edge_ig_discount_factor,
             )
-            per_graph_losses.append(correctness_loss + ig_loss)
+            per_graph_losses.append(correctness_loss + graph_tf_loss + ig_loss)
             correctness_losses.append(correctness_loss)
+            graph_tf_losses.append(graph_tf_loss)
             edge_ig_losses.append(ig_loss)
             edge_ig_records.extend(ig_summary.get("edge_ig_records", []))
             if ig_summary.get("used_edges", 0):
@@ -523,6 +589,9 @@ def graph_correctness_advantage_edge_loss(
         group_correctness_losses.append(
             torch.mean(torch.stack(correctness_losses)) if correctness_losses else zero
         )
+        group_graph_tf_losses.append(
+            torch.mean(torch.stack(graph_tf_losses)) if graph_tf_losses else zero
+        )
         group_edge_ig_losses.append(
             torch.mean(torch.stack(edge_ig_losses)) if edge_ig_losses else zero
         )
@@ -532,6 +601,15 @@ def graph_correctness_advantage_edge_loss(
             "correctness_variance": float(variance),
             "correctness_std": float(std),
             "correctness_advantages": [float(value) for value in advantages],
+            "full_graph_tf_scores": [
+                float(value) for value in graph_tf_scores
+            ],
+            "full_graph_tf_baseline": float(tf_baseline),
+            "full_graph_tf_variance": float(tf_variance),
+            "full_graph_tf_std": float(tf_std),
+            "full_graph_tf_advantages": [
+                float(value) for value in tf_advantages
+            ],
             "mean_spatial_edges_per_round": [
                 float(getattr(graph, "mean_spatial_edges_per_round", 0.0))
                 for graph in graphs
@@ -559,12 +637,16 @@ def graph_correctness_advantage_edge_loss(
     correctness_norm = _loss_gradient_l2_norm(
         torch.mean(torch.stack(group_correctness_losses)), parameters
     )
+    graph_tf_norm = _loss_gradient_l2_norm(
+        torch.mean(torch.stack(group_graph_tf_losses)), parameters
+    )
     edge_ig_norm = _loss_gradient_l2_norm(
         torch.mean(torch.stack(group_edge_ig_losses)), parameters
     )
     for summary in summaries:
         summary["batch_gradient_norms"] = {
             "correctness": correctness_norm,
+            "full_graph_tf": graph_tf_norm,
             "edge_ig": edge_ig_norm,
         }
     edge_counts = [
@@ -575,6 +657,7 @@ def graph_correctness_advantage_edge_loss(
     print(
         "graph gradient norms: "
         f"correctness={correctness_norm:.6f}, "
+        f"full_graph_tf={graph_tf_norm:.6f}, "
         f"edge_ig={edge_ig_norm:.6f}, "
         f"avg_edges={sum(edge_counts) / len(edge_counts) if edge_counts else 0.0:.2f}"
     )

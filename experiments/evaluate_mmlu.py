@@ -19,7 +19,6 @@ async def evaluate(
         num_rounds:int = 1,
         limit_questions: Optional[int] = None,
         eval_batch_size: int = 4,
-        edge_selector = None,
         max_concurrent_graphs: int = 10,
         case_file = None,
         ) -> Dict[str, Any]:
@@ -72,7 +71,6 @@ async def evaluate(
                     num_rounds,
                     record_execution_history=case_file is not None,
                     track_grad=False,
-                    edge_selector=edge_selector,
                 )
             ))
         raw_results = await asyncio.gather(*answer_log_probs)

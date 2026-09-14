@@ -17,6 +17,7 @@ from GDesigner.utils.metrics import reset_usage_counters, usage_snapshot, write_
 from experiments.agent_backend import apply_agent_backend_args
 from experiments.checkpoint import save_graph_checkpoint
 from experiments.teacher_forcing_reward import (
+    add_full_graph_reward_ablation_args,
     add_teacher_forcing_reward_args,
     experiment_summary_metadata,
     set_experiment_seed,
@@ -52,13 +53,8 @@ def parse_args():
                         help="Number of optimization/inference rounds for one query.")
     parser.add_argument('--pruning_rate', type=float, default=0.25,
                         help="Rate for temporal edge pruning when --optimized_temporal is set.")
-    parser.add_argument('--use_edge_selector', action='store_true',
-                        help="Enable final-agent teacher-logprob/execution IG selector training and selector pruning during evaluation.")
-    parser.add_argument('--selector_buffer_size', type=int, default=512,
-                        help="Replay buffer capacity for selector edge samples.")
-    parser.add_argument('--selector_ig_tau', type=float, default=0.0,
-                        help="IG gain threshold for positive selector labels.")
     add_teacher_forcing_reward_args(parser)
+    add_full_graph_reward_ablation_args(parser)
     parser.add_argument('--llm_name', type=str, default="gpt-4o",
                         help="Model name, None runs the default ChatGPT4")
     parser.add_argument('--domain', type=str, default="mmlu",
@@ -107,23 +103,16 @@ async def main():
     
     if args.optimized_spatial or args.optimized_temporal:
         train_wall_start = time.time()
-        edge_selector = await train(graph=graph,dataset=dataset_train,
+        await train(graph=graph,dataset=dataset_train,
                     edge_training_log_path=edge_training_log_file,
                     num_iters=args.num_iterations,num_rounds=args.num_rounds,
-                    lr=args.lr,batch_size=args.batch_size, use_edge_selector=args.use_edge_selector,
+                    lr=args.lr,batch_size=args.batch_size,
                     imp_per_iterations=args.imp_per_iterations, pruning_rate=args.pruning_rate,
-                    selector_buffer_size=args.selector_buffer_size,
-                    selector_ig_tau=args.selector_ig_tau,
                     use_graph_tf_reward=args.use_graph_tf_reward,
-                    use_graph_critic=args.use_graph_critic,
                     graph_sample_count=args.graph_sample_count,
-                    graph_critic_lr=args.graph_critic_lr,
-                    graph_critic_warmup_iterations=args.graph_critic_warmup_iterations,
-                    graph_critic_buffer_size=args.graph_critic_buffer_size,
-                    graph_critic_batch_size=args.graph_critic_batch_size,
-                    graph_critic_updates_per_iteration=args.graph_critic_updates_per_iteration,
                     edge_tanh_temperature=args.edge_tanh_temperature,
                     edge_ig_reward_lambda=args.edge_ig_reward_lambda,
+                    full_graph_tf_reward_lambda=args.full_graph_tf_reward_lambda,
                     edge_ig_warmup_iterations=args.edge_ig_warmup_iterations,
                     edge_ig_discount_factor=args.edge_ig_discount_factor,
                     graph_advantage_epsilon=args.graph_advantage_epsilon,
@@ -137,20 +126,9 @@ async def main():
             args.checkpoint_file,
             dataset="mmlu",
             args=args,
-            edge_selector=edge_selector,
-            graph_critic=getattr(graph, "graph_critic", None),
-            graph_critic_optimizer=getattr(
-                graph, "graph_critic_optimizer", None
-            ),
-            graph_critic_replay_buffer=getattr(
-                graph, "graph_critic_replay_buffer", None
-            ),
         )
-    else:
-        edge_selector = None
-
     reset_usage_counters()
-    eval_metrics = await evaluate(graph=graph,dataset=dataset_val,num_rounds=args.num_rounds,limit_questions=args.limit_questions,eval_batch_size=args.batch_size,edge_selector=edge_selector,max_concurrent_graphs=args.max_concurrent_graphs,case_file=case_file)
+    eval_metrics = await evaluate(graph=graph,dataset=dataset_val,num_rounds=args.num_rounds,limit_questions=args.limit_questions,eval_batch_size=args.batch_size,max_concurrent_graphs=args.max_concurrent_graphs,case_file=case_file)
     score = eval_metrics["accuracy"]
     print(f"Final Eval Accuracy: {score}")
     print(f"Final Avg Edges: {eval_metrics['avg_edges']}")

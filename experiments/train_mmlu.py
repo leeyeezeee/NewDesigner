@@ -12,29 +12,16 @@ from GDesigner.graph.graph import Graph
 from experiments.accuracy import Accuracy
 from GDesigner.utils.globals import Cost, PromptTokens, CompletionTokens
 from GDesigner.utils.metrics import usage_delta, usage_snapshot
-from GDesigner.utils.edge_selector import (
-    EdgeSelector,
-    SelectorReplayBuffer,
-    build_edge_selector_examples,
-    train_edge_selector,
-)
 from GDesigner.utils.ig_rewards import (
     compute_edge_information_gain,
 )
 from GDesigner.utils.ig_scorer import FinalAnswerScorer, make_target_spec
 from experiments.graph_concurrency import limited_graph_arun, make_graph_semaphore
-from experiments.graph_critic import (
-    GraphCriticReplayBuffer,
-    add_graph_critic_examples,
-    build_graph_critic,
-    critic_counterfactual_edge_loss,
-    score_full_graph_teacher_forcing,
-    train_graph_critic,
-)
 from experiments.refinement_loss import refinement_regularization_loss
 from experiments.teacher_forcing_reward import (
     edge_information_gain_loss,
     graph_correctness_advantage_edge_loss,
+    score_full_graph_teacher_forcing,
 )
 from experiments.edge_training_log import (
     append_training_step,
@@ -48,21 +35,13 @@ async def train(graph:Graph,
             num_rounds:int=1,
             lr:float=0.001,
             batch_size:int = 4,
-            use_edge_selector: bool = False,
             imp_per_iterations: int = 5,
             pruning_rate: float = 0.25,
-            selector_buffer_size: int = 512,
-            selector_ig_tau: float = 0.0,
             use_graph_tf_reward: bool = False,
-            use_graph_critic: bool = False,
             graph_sample_count: int = 8,
-            graph_critic_lr: float = 0.03,
-            graph_critic_warmup_iterations: int = 2,
-            graph_critic_buffer_size: int = 256,
-            graph_critic_batch_size: int = 32,
-            graph_critic_updates_per_iteration: int = 4,
             edge_tanh_temperature: float = 1.0,
             edge_ig_reward_lambda: float = None,
+            full_graph_tf_reward_lambda: float = 0.0,
             edge_ig_warmup_iterations: int = 2,
             edge_ig_discount_factor: float = 0.2,
             graph_advantage_epsilon: float = 1e-6,
@@ -84,51 +63,21 @@ async def train(graph:Graph,
         if edge_ig_reward_lambda is None
         else float(edge_ig_reward_lambda)
     )
-    use_multi_graph_reward = use_graph_tf_reward or use_graph_critic
-    if use_graph_critic and not graph.optimized_spatial:
-        raise ValueError("--use_graph_critic requires --optimized_spatial.")
-    if use_graph_critic and int(graph_sample_count) < 2:
-        raise ValueError("--use_graph_critic requires --graph_sample_count >= 2.")
-    if use_graph_critic and use_edge_selector:
-        raise ValueError(
-            "--use_graph_critic replaces real edge ablation and cannot be "
-            "combined with --use_edge_selector."
-        )
-    graph_critic = None
-    graph_critic_optimizer = None
-    graph_critic_replay_buffer = None
-    if use_graph_critic:
-        graph_critic, graph_critic_optimizer = build_graph_critic(
-            graph,
-            learning_rate=graph_critic_lr,
-        )
-        graph_critic_replay_buffer = GraphCriticReplayBuffer(
-            graph_critic_buffer_size
-        )
-    # Real edge ablation remains the default. The critic flag replaces that
-    # estimator completely; the shared edge reward weight then scales Q-diffs.
-    edge_training_log_path = Path(edge_training_log_path)
-    record_edge_ig = (
-        not use_graph_critic
-        and (
-            use_edge_selector
-            or resolved_edge_ig_reward_lambda != 0.0
-        )
+    full_graph_tf_reward_lambda = float(full_graph_tf_reward_lambda)
+    use_multi_graph_reward = (
+        use_graph_tf_reward or full_graph_tf_reward_lambda != 0.0
     )
-    edge_selector = None
-    selector_buffer = None
-    selector_optimizer = None
-    selector_trained = False
-    if use_edge_selector and record_edge_ig:
-        edge_selector = EdgeSelector(graph.features.size(1))
-        selector_buffer = SelectorReplayBuffer(selector_buffer_size)
-        selector_optimizer = torch.optim.Adam(edge_selector.parameters(), lr=1e-3)
+    if full_graph_tf_reward_lambda != 0.0 and int(graph_sample_count) < 2:
+        raise ValueError(
+            "--full_graph_tf_reward_lambda requires --graph_sample_count >= 2."
+        )
+    edge_training_log_path = Path(edge_training_log_path)
+    record_edge_ig = resolved_edge_ig_reward_lambda != 0.0
     tf_scorer = (
         FinalAnswerScorer()
         if (
-            use_edge_selector
-            or resolved_edge_ig_reward_lambda != 0.0
-            or use_graph_critic
+            resolved_edge_ig_reward_lambda != 0.0
+            or full_graph_tf_reward_lambda != 0.0
         )
         else None
     )
@@ -147,7 +96,7 @@ async def train(graph:Graph,
         )
         iteration_edge_ig_reward_lambda = (
             resolved_edge_ig_reward_lambda
-            if edge_ig_measurement_enabled and not use_graph_critic
+            if edge_ig_measurement_enabled
             else 0.0
         )
         print(f"Iter {i_iter}", 80*'-')
@@ -208,7 +157,7 @@ async def train(graph:Graph,
             graph_log_prob_groups = []
             correctness_groups = []
             edge_detail_groups = []
-            graph_critic_score_groups = []
+            graph_tf_score_groups = []
             for record_idx, (correct_answer, group_indices, input_dict, question_id) in enumerate(zip(
                 correct_answers,
                 sample_groups,
@@ -222,7 +171,7 @@ async def train(graph:Graph,
                 graph_log_prob_group = []
                 correctness_group = []
                 edge_detail_group = []
-                graph_critic_score_group = []
+                graph_tf_score_group = []
                 for sample_pos, graph_idx in enumerate(group_indices):
                     raw_answer = raw_answers[graph_idx]
                     realized_graph = realized_graphs[graph_idx]
@@ -233,13 +182,8 @@ async def train(graph:Graph,
                     batch_correctness.append(float(record_accuracy.get()))
                     graph_tf_edge_counts.append(realized_graph.mean_spatial_edges_per_round)
                     needs_edge_details = (
-                        edge_ig_measurement_enabled
+                        iteration_edge_ig_reward_lambda != 0.0
                         and bool(realized_graph.edge_log_probs)
-                        and (
-                            iteration_edge_ig_reward_lambda != 0.0
-                            or selector_buffer is not None
-                            or record_edge_training
-                        )
                     )
                     if needs_edge_details:
                         edge_details = await compute_edge_information_gain(
@@ -250,13 +194,15 @@ async def train(graph:Graph,
                         )
                     else:
                         edge_details = {}
-                    if selector_buffer is not None:
-                        selector_buffer.add_many(build_edge_selector_examples(
-                            realized_graph,
-                            input_dict["task"],
-                            edge_details,
-                            selector_ig_tau,
-                        ))
+                    if full_graph_tf_reward_lambda != 0.0:
+                        graph_tf_score_group.append(
+                            await score_full_graph_teacher_forcing(
+                                realized_graph,
+                                input_dict,
+                                target_spec=target_spec,
+                                scorer=tf_scorer,
+                            )
+                        )
                     if sample_pos == 0:
                         answer = dataset.postprocess_answer(raw_answer)
                         answers.append(answer)
@@ -270,21 +216,12 @@ async def train(graph:Graph,
                     graph_log_prob_group.append(log_probs[graph_idx])
                     correctness_group.append(float(record_accuracy.get()))
                     edge_detail_group.append(edge_details)
-                    if use_graph_critic:
-                        graph_critic_score_group.append(
-                            await score_full_graph_teacher_forcing(
-                                realized_graph,
-                                input_dict,
-                                target_spec=target_spec,
-                                scorer=tf_scorer,
-                            )
-                        )
                     realized_graph.clear_execution_history()
                 graph_groups.append(graph_group)
                 graph_log_prob_groups.append(graph_log_prob_group)
                 correctness_groups.append(correctness_group)
                 edge_detail_groups.append(edge_detail_group)
-                graph_critic_score_groups.append(graph_critic_score_group)
+                graph_tf_score_groups.append(graph_tf_score_group)
             reference_loss = torch.mean(torch.stack(list(log_probs)))
             utility_loss, tf_summaries = graph_correctness_advantage_edge_loss(
                 graph_groups,
@@ -296,23 +233,9 @@ async def train(graph:Graph,
                 edge_ig_reward_lambda=iteration_edge_ig_reward_lambda,
                 edge_ig_discount_factor=edge_ig_discount_factor,
                 advantage_epsilon=graph_advantage_epsilon,
+                graph_tf_score_groups=graph_tf_score_groups,
+                full_graph_tf_reward_lambda=full_graph_tf_reward_lambda,
             )
-            critic_reward_summary = None
-            if (
-                use_graph_critic
-                and i_iter >= max(0, int(graph_critic_warmup_iterations))
-            ):
-                critic_reward_loss, critic_reward_summary = (
-                    critic_counterfactual_edge_loss(
-                        graph_critic,
-                        graph_groups,
-                        record_input_dicts,
-                        reference_loss,
-                        reward_lambda=resolved_edge_ig_reward_lambda,
-                        tanh_temperature=edge_tanh_temperature,
-                    )
-                )
-                utility_loss = utility_loss + critic_reward_loss
             if graph_tf_corrects:
                 avg_adv_variance = (
                     sum(summary["correctness_variance"] for summary in tf_summaries)
@@ -354,13 +277,7 @@ async def train(graph:Graph,
                 batch_correctness.append(float(correctness_reward))
                 edge_details = {}
                 if (
-                    record_edge_ig
-                    and edge_ig_measurement_enabled
-                    and (
-                        correctness_reward > 0
-                        or iteration_edge_ig_reward_lambda != 0.0
-                        or record_edge_training
-                    )
+                    iteration_edge_ig_reward_lambda != 0.0
                     and bool(realized_graph.edge_log_probs)
                 ):
                     edge_details = await compute_edge_information_gain(
@@ -369,13 +286,6 @@ async def train(graph:Graph,
                         target_spec=make_target_spec("mmlu", correct_answer),
                         scorer=tf_scorer,
                     )
-                    if selector_buffer is not None and correctness_reward > 0:
-                        selector_buffer.add_many(build_edge_selector_examples(
-                            realized_graph,
-                            input_dict["task"],
-                            edge_details,
-                            selector_ig_tau,
-                        ))
                 realized_graph.clear_execution_history()
                 utility = {
                     "correctness": correctness_reward,
@@ -404,18 +314,6 @@ async def train(graph:Graph,
             sparsity_reg_weight=sparsity_reg_weight,
         )
         total_loss = utility_loss + reg_loss
-        append_training_step(
-            edge_training_log_path,
-            step=i_iter,
-            accuracy=sum(batch_correctness) / len(batch_correctness),
-            avg_edges=(
-                sum(item.mean_spatial_edges_per_round for item in realized_graphs)
-                / len(realized_graphs)
-            ),
-            avg_communication_tokens=(
-                rollout_usage["prompt_tokens"] + rollout_usage["completion_tokens"]
-            ) / len(realized_graphs),
-        )
         optimizer.zero_grad()
         if not total_loss.requires_grad:
             raise RuntimeError(
@@ -433,35 +331,18 @@ async def train(graph:Graph,
             error_if_nonfinite=True,
         )
         optimizer.step()
-        if use_graph_critic:
-            added_critic_examples = add_graph_critic_examples(
-                graph_critic_replay_buffer,
-                graph_groups,
-                record_input_dicts,
-                graph_critic_score_groups,
-            )
-            critic_fit_summary = train_graph_critic(
-                graph_critic,
-                graph_critic_optimizer,
-                graph_critic_replay_buffer,
-                batch_size=graph_critic_batch_size,
-                updates=graph_critic_updates_per_iteration,
-            )
-            print(
-                "graph critic: "
-                f"mse={critic_fit_summary['loss']:.6f}, "
-                f"target_std={critic_fit_summary['target_std']:.6f}, "
-                f"replay={int(critic_fit_summary['buffer_size'])}, "
-                f"added={added_critic_examples}, "
-                f"updates={int(critic_fit_summary['updates'])}, "
-                "predicted_edges="
-                f"{int((critic_reward_summary or {}).get('edge_count', 0))}"
-            )
-        if edge_selector is not None:
-            selector_trained = (
-                train_edge_selector(edge_selector, selector_optimizer, selector_buffer)
-                or selector_trained
-            )
+        append_training_step(
+            edge_training_log_path,
+            step=i_iter,
+            accuracy=sum(batch_correctness) / len(batch_correctness),
+            avg_edges=(
+                sum(item.mean_spatial_edges_per_round for item in realized_graphs)
+                / len(realized_graphs)
+            ),
+            avg_communication_tokens=(
+                rollout_usage["prompt_tokens"] + rollout_usage["completion_tokens"]
+            ) / len(realized_graphs),
+        )
         if (
             graph.optimized_temporal
             and (i_iter + 1) % imp_per_iterations == 0
@@ -482,9 +363,3 @@ async def train(graph:Graph,
         print(f"PromptTokens {PromptTokens.instance().value}")
         print(f"CompletionTokens {CompletionTokens.instance().value}")
 
-    if use_graph_critic:
-        graph.graph_critic = graph_critic
-        graph.graph_critic_optimizer = graph_critic_optimizer
-        graph.graph_critic_replay_buffer = graph_critic_replay_buffer
-    return edge_selector if selector_trained else None
-        

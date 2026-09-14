@@ -94,15 +94,6 @@ class Graph(ABC):
         self.spatial_sampling_temperature = 1.0
         self.realized_edge_counts:List[int] = []
         self.realized_spatial_edge_counts:List[int] = []
-        # Preserve the realized agent-only graph from every communication
-        # round.  The optional graph critic consumes these detached snapshots;
-        # the execution and edge-ablation paths continue to use live edges.
-        self.realized_spatial_adjacencies:List[torch.Tensor] = []
-        # Raw role + question features produced immediately before the actor
-        # GAT.  The optional critic reuses this detached tensor and never calls
-        # the frozen sentence encoder a second time.
-        self.task_conditioned_feature_task:Optional[str] = None
-        self.task_conditioned_features:Optional[torch.Tensor] = None
         self.node_kwargs = node_kwargs if node_kwargs is not None else [{} for _ in agent_names]
         self.edge_embedding_dim = 16
         self.init_nodes() # add nodes to the self.nodes
@@ -332,8 +323,6 @@ class Graph(ABC):
             ) -> None:
         def _compute_spatial_logits() -> None:
             new_features = self.construct_new_features(task)
-            self.task_conditioned_feature_task = str(task)
-            self.task_conditioned_features = new_features.detach()
             node_embeddings, encoder_diagnostics = self.gat(
                 new_features,
                 self.role_adj_matrix,
@@ -522,82 +511,6 @@ class Graph(ABC):
         self.spatial_edge_probabilities = probabilities.reshape(-1)
         return torch.logit(probabilities).reshape(-1)
 
-    def edge_selector_task_embedding(self, task: str) -> torch.Tensor:
-        return torch.tensor(np.array(get_sentence_embedding(task)), dtype=torch.float32)
-
-    def edge_selector_feature(
-            self,
-            task: str,
-            source_id: str,
-            target_id: str,
-            task_embedding: Optional[torch.Tensor] = None,
-            ) -> torch.Tensor:
-        task_embedding = task_embedding if task_embedding is not None else self.edge_selector_task_embedding(task)
-        source_role_embedding = self.features[self.node_id_to_index[source_id]]
-        target_role_embedding = self.features[self.node_id_to_index[target_id]]
-        return torch.cat([
-            task_embedding.float(),
-            source_role_embedding.detach().float(),
-            target_role_embedding.detach().float(),
-        ])
-
-    def apply_edge_selector(self, task: str, edge_selector, round_idx: int) -> None:
-        if edge_selector is None:
-            return
-
-        selected_edges = [
-            edge_info
-            for edge_info in self.edge_log_probs
-            if edge_info.get("round") == round_idx
-        ]
-        if not selected_edges:
-            return
-
-        was_training = edge_selector.training
-        edge_selector.eval()
-        device = next(edge_selector.parameters()).device
-        task_embedding = self.edge_selector_task_embedding(task)
-        with torch.no_grad():
-            valid_edges = []
-            feature_rows = []
-            for edge_info in selected_edges:
-                source_id = edge_info["source"]
-                target_id = edge_info["target"]
-                if source_id not in self.nodes or target_id not in self.nodes:
-                    continue
-                valid_edges.append(edge_info)
-                feature_rows.append(self.edge_selector_feature(
-                    task,
-                    source_id,
-                    target_id,
-                    task_embedding=task_embedding,
-                ))
-            if not valid_edges:
-                if was_training:
-                    edge_selector.train()
-                return
-
-            features = torch.stack(feature_rows).to(device)
-            keep_probabilities = torch.sigmoid(edge_selector(features)).view(-1)
-            keep_samples = torch.bernoulli(keep_probabilities).bool()
-            for edge_info, keep_probability, keep_sample in zip(
-                    valid_edges,
-                    keep_probabilities.cpu(),
-                    keep_samples.cpu(),
-                    ):
-                keep = bool(keep_sample.item())
-                edge_info["selector_probability"] = float(keep_probability.item())
-                edge_info["selector_keep"] = keep
-                if not keep:
-                    source_id = edge_info["source"]
-                    target_id = edge_info["target"]
-                    self.find_node(source_id).remove_successor(
-                        self.find_node(target_id),
-                        edge_info["type"],
-                    )
-        if was_training:
-            edge_selector.train()
-        
     @property
     def spatial_adj_matrix(self):
         matrix = np.zeros((len(self.nodes), len(self.nodes)))
@@ -855,7 +768,6 @@ class Graph(ABC):
                   max_time: int = 600,
                   record_execution_history: bool = True,
                   track_grad: bool = True,
-                  edge_selector = None,
                   record_node_logprobs: bool = False,
                   node_logprob_token_limit: Optional[int] = None,
                   record_decision_logprobs: bool = False,) -> List[Any]:
@@ -864,7 +776,6 @@ class Graph(ABC):
         self.edge_log_probs = []
         self.realized_edge_counts = []
         self.realized_spatial_edge_counts = []
-        self.realized_spatial_adjacencies = []
         task = inputs.get("task", str(inputs)) if isinstance(inputs, dict) else str(inputs)
         self.prepare_spatial_logits(task, track_grad=track_grad)
         for round in range(num_rounds):
@@ -873,10 +784,6 @@ class Graph(ABC):
                 track_grad=track_grad,
             )
             log_probs += self.construct_temporal_connection(round, track_grad=track_grad)
-            self.apply_edge_selector(task, edge_selector, round)
-            self.realized_spatial_adjacencies.append(
-                torch.as_tensor(self.spatial_adj_matrix, dtype=torch.float32)
-            )
             self.realized_spatial_edge_counts.append(self.num_edges)
             self.realized_edge_counts.append(self.communication_edge_count)
             
@@ -950,7 +857,6 @@ class Graph(ABC):
                   max_time: int = 600,
                   record_execution_history: bool = True,
                   track_grad: bool = True,
-                  edge_selector = None,
                   record_node_logprobs: bool = False,
                   node_logprob_token_limit: Optional[int] = None,
                   record_decision_logprobs: bool = False,) -> List[Any]:
@@ -959,7 +865,6 @@ class Graph(ABC):
         self.edge_log_probs = []
         self.realized_edge_counts = []
         self.realized_spatial_edge_counts = []
-        self.realized_spatial_adjacencies = []
         self.prepare_spatial_logits(input['task'], track_grad=track_grad)
 
         for round in range(num_rounds):
@@ -968,12 +873,6 @@ class Graph(ABC):
                 track_grad=track_grad,
             )
             log_probs += self.construct_temporal_connection(round, track_grad=track_grad)
-            self.apply_edge_selector(
-                input.get("task", str(input)), edge_selector, round
-            )
-            self.realized_spatial_adjacencies.append(
-                torch.as_tensor(self.spatial_adj_matrix, dtype=torch.float32)
-            )
             self.realized_spatial_edge_counts.append(self.num_edges)
             self.realized_edge_counts.append(self.communication_edge_count)
             
