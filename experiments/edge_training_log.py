@@ -36,6 +36,7 @@ def append_training_step(
     accuracy: float,
     avg_edges: float,
     avg_communication_tokens: float,
+    graph_reward_summaries: Optional[Sequence[Dict[str, Any]]] = None,
 ) -> None:
     """Append numerical fields used to plot graph training progress."""
     if log_file is None:
@@ -46,6 +47,20 @@ def append_training_step(
         "avg_edges": float(avg_edges),
         "avg_communication_tokens": float(avg_communication_tokens),
     }
+    if graph_reward_summaries is not None:
+        # Preserve per-question costs and component gradient norms for auditing
+        # the reward scale, without duplicating the detailed edge-ablation traces.
+        fields = (
+            "correctness_scores", "correctness_advantages", "rollout_prompt_tokens",
+            "normalized_prompt_token_costs", "prompt_token_cost_beta",
+            "token_aware_utilities", "token_aware_advantages",
+            "graph_advantage_normalization", "full_graph_tf_advantages",
+            "batch_gradient_norms",
+        )
+        record["graph_rewards"] = [
+            {key: summary[key] for key in fields}
+            for summary in graph_reward_summaries
+        ]
     if record["step"] < 0:
         raise ValueError("Training-log step must be non-negative.")
     if not 0.0 <= record["accuracy"] <= 1.0:

@@ -2,6 +2,7 @@ import os
 from typing import Any, Optional, Tuple
 
 from GDesigner.utils.globals import Cost, PromptTokens, CompletionTokens, LLMCalls
+from GDesigner.utils.rollout_usage import record_rollout_prompt_tokens
 import tiktoken
 # GPT-4:  https://platform.openai.com/docs/models/gpt-4-and-gpt-4-turbo
 # GPT3.5: https://platform.openai.com/docs/models/gpt-3-5
@@ -120,6 +121,7 @@ def cost_count(
     PromptTokens.instance().value += prompt_len
     CompletionTokens.instance().value += completion_len
     LLMCalls.instance().value += 1
+    record_rollout_prompt_tokens(prompt_len)
 
     # print(f"Prompt Tokens: {prompt_len}, Completion Tokens: {completion_len}")
     return price, prompt_len, completion_len

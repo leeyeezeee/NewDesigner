@@ -43,11 +43,34 @@ python experiments/run_gsm8k.py --mode FullConnected --batch_size 4 --agent_nums
 
 The optimized topology combines G-Designer's low-rank refinement regularization
 with IGPO-style teacher forcing. `--use_graph_tf_reward` enables multi-graph
-correctness advantages, while `--edge_ig_reward_lambda` adds per-edge
+mean-centered graph advantages, while `--edge_ig_reward_lambda` adds per-edge
 teacher-forcing information gain. Within-round downstream edge rewards use a
 default discount factor of 0.2. The refinement rank defaults to 4. The
 optional anchor and nuclear-norm penalties default to 0 and can be enabled with
 `--anchor_reg_weight` and `--sparsity_reg_weight`:
+
+Graph utility is `u_k = correctness_k - beta * T_k / max_l(T_l)`, with the
+maximum taken only over samples of the same question. The graph advantage is
+`u_k - mean_l(u_l)`; it is **not** divided by the group standard deviation.
+`--prompt_token_cost_beta` defaults to **0.1**. Positive beta enables grouped
+training (`--graph_sample_count`, default 8, must be at least 2). Set beta to 0
+to disable cost; `--use_graph_tf_reward` still enables centered correctness
+advantages in that case. Without either group option or full-graph TF, the
+existing single-sample correctness path is retained.
+
+`T_k` counts prompt tokens from normal execution of all rounds and the final
+decision agent. Concurrent graphs have separate counters; completion tokens and
+extra TF/edge-ablation calls do not enter this penalty. An all-zero token group
+has zero cost. Training logs include per-graph token counts, utilities, advantages,
+and separate gradient norms for correctness, prompt cost, full-graph TF, and IG.
+The existing `avg_communication_tokens` metric still counts prompt + completion.
+
+Edge IG still uses `lambda * tanh(discounted_IG / temperature)` and is summed over
+selected edges. The graph log-probability is itself a sum over sampled decisions
+(including rejected/absent edges sampled with action 0), so its graph advantage
+already acts on each decision. No additional edge-count division is applied.
+The optional full-graph TF ablation remains separately standardized and defaults
+to weight 0; its behavior and the edge-IG settings are unchanged.
 
 Edge values are measured with real edge ablation. The
 `--edge_ig_warmup_iterations` setting skips those ablation calls during the

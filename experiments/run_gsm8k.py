@@ -37,6 +37,7 @@ from experiments.teacher_forcing_reward import (
     edge_information_gain_loss,
     experiment_summary_metadata,
     graph_correctness_advantage_edge_loss,
+    resolve_graph_reward_sampling,
     score_full_graph_teacher_forcing,
     set_experiment_seed,
 )
@@ -135,13 +136,11 @@ async def main():
         else float(raw_edge_ig_reward_lambda)
     )
     full_graph_tf_reward_lambda = float(args.full_graph_tf_reward_lambda)
-    use_multi_graph_reward = (
-        use_graph_tf_reward or full_graph_tf_reward_lambda != 0.0
+    prompt_token_cost_beta = float(args.prompt_token_cost_beta)
+    use_multi_graph_reward = resolve_graph_reward_sampling(
+        use_graph_tf_reward, full_graph_tf_reward_lambda,
+        prompt_token_cost_beta, args.graph_sample_count,
     )
-    if full_graph_tf_reward_lambda != 0.0 and int(args.graph_sample_count) < 2:
-        raise ValueError(
-            "--full_graph_tf_reward_lambda requires --graph_sample_count >= 2."
-        )
     optimize_enabled = args.optimized_spatial or args.optimized_temporal
     record_edge_ig = (
         optimize_enabled
@@ -322,6 +321,7 @@ async def main():
                 edge_ig_reward_lambda=iteration_edge_ig_reward_lambda,
                 edge_ig_discount_factor=args.edge_ig_discount_factor,
                 advantage_epsilon=args.graph_advantage_epsilon,
+                prompt_token_cost_beta=prompt_token_cost_beta,
                 graph_tf_score_groups=graph_tf_score_groups,
                 full_graph_tf_reward_lambda=full_graph_tf_reward_lambda,
             )
@@ -449,6 +449,7 @@ async def main():
                 avg_communication_tokens=(
                     rollout_usage["prompt_tokens"] + rollout_usage["completion_tokens"]
                 ) / len(realized_graphs),
+                graph_reward_summaries=tf_summaries if use_multi_graph_reward else None,
             )
             if (
                 graph.optimized_temporal

@@ -116,6 +116,7 @@ async def main():
                     edge_ig_warmup_iterations=args.edge_ig_warmup_iterations,
                     edge_ig_discount_factor=args.edge_ig_discount_factor,
                     graph_advantage_epsilon=args.graph_advantage_epsilon,
+                    prompt_token_cost_beta=args.prompt_token_cost_beta,
                     max_concurrent_graphs=args.max_concurrent_graphs,
                     anchor_reg_weight=args.anchor_reg_weight,
                     sparsity_reg_weight=args.sparsity_reg_weight)

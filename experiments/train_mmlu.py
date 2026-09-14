@@ -21,6 +21,7 @@ from experiments.refinement_loss import refinement_regularization_loss
 from experiments.teacher_forcing_reward import (
     edge_information_gain_loss,
     graph_correctness_advantage_edge_loss,
+    resolve_graph_reward_sampling,
     score_full_graph_teacher_forcing,
 )
 from experiments.edge_training_log import (
@@ -45,6 +46,7 @@ async def train(graph:Graph,
             edge_ig_warmup_iterations: int = 2,
             edge_ig_discount_factor: float = 0.2,
             graph_advantage_epsilon: float = 1e-6,
+            prompt_token_cost_beta: float = 0.1,
             max_concurrent_graphs: int = 10,
             anchor_reg_weight: float = 0.0,
             sparsity_reg_weight: float = 0.0,
@@ -64,13 +66,10 @@ async def train(graph:Graph,
         else float(edge_ig_reward_lambda)
     )
     full_graph_tf_reward_lambda = float(full_graph_tf_reward_lambda)
-    use_multi_graph_reward = (
-        use_graph_tf_reward or full_graph_tf_reward_lambda != 0.0
+    use_multi_graph_reward = resolve_graph_reward_sampling(
+        use_graph_tf_reward, full_graph_tf_reward_lambda,
+        prompt_token_cost_beta, graph_sample_count,
     )
-    if full_graph_tf_reward_lambda != 0.0 and int(graph_sample_count) < 2:
-        raise ValueError(
-            "--full_graph_tf_reward_lambda requires --graph_sample_count >= 2."
-        )
     edge_training_log_path = Path(edge_training_log_path)
     record_edge_ig = resolved_edge_ig_reward_lambda != 0.0
     tf_scorer = (
@@ -233,6 +232,7 @@ async def train(graph:Graph,
                 edge_ig_reward_lambda=iteration_edge_ig_reward_lambda,
                 edge_ig_discount_factor=edge_ig_discount_factor,
                 advantage_epsilon=graph_advantage_epsilon,
+                prompt_token_cost_beta=prompt_token_cost_beta,
                 graph_tf_score_groups=graph_tf_score_groups,
                 full_graph_tf_reward_lambda=full_graph_tf_reward_lambda,
             )
@@ -342,6 +342,7 @@ async def train(graph:Graph,
             avg_communication_tokens=(
                 rollout_usage["prompt_tokens"] + rollout_usage["completion_tokens"]
             ) / len(realized_graphs),
+            graph_reward_summaries=tf_summaries if use_multi_graph_reward else None,
         )
         if (
             graph.optimized_temporal

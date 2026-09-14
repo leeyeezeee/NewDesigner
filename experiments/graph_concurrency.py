@@ -1,6 +1,8 @@
 import asyncio
 from typing import Any
 
+from GDesigner.utils.rollout_usage import collect_rollout_usage
+
 def make_graph_semaphore(max_concurrent_graphs: int | None) -> asyncio.Semaphore | None:
     if max_concurrent_graphs is None:
         return None
@@ -17,7 +19,13 @@ async def limited_graph_arun(
     **kwargs: Any,
 ):
     async def execute_graph():
-        return await realized_graph.arun(*args, **kwargs)
+        # Scope ends before TF/edge-ablation scoring. Include the regular final
+        # decision call, but never another concurrently executing graph's usage.
+        realized_graph.rollout_prompt_tokens = None
+        with collect_rollout_usage() as usage:
+            result = await realized_graph.arun(*args, **kwargs)
+        realized_graph.rollout_prompt_tokens = usage.prompt_tokens
+        return result
 
     if semaphore is None:
         return await execute_graph()

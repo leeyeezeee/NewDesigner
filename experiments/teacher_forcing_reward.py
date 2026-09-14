@@ -25,7 +25,7 @@ def add_teacher_forcing_reward_args(parser) -> None:
         "--use_graph_tf_reward",
         action="store_true",
         help=(
-            "Use multi-sampled final-answer correctness advantages. Per-edge "
+            "Use mean-centered multi-sampled graph utilities. Per-edge "
             "teacher-forcing IG is enabled with --edge_ig_reward_lambda."
         ),
     )
@@ -34,6 +34,16 @@ def add_teacher_forcing_reward_args(parser) -> None:
         type=int,
         default=8,
         help="Number of communication graphs sampled per training example.",
+    )
+    parser.add_argument(
+        "--prompt_token_cost_beta",
+        type=float,
+        default=0.1,
+        help=(
+            "Graph utility is correctness minus beta * rollout prompt tokens / "
+            "the within-question maximum. Positive beta enables grouped sampling "
+            "and requires graph_sample_count >= 2; 0 disables the token penalty."
+        ),
     )
     parser.add_argument(
         "--max_concurrent_graphs",
@@ -66,7 +76,7 @@ def add_teacher_forcing_reward_args(parser) -> None:
         "--graph_advantage_epsilon",
         type=float,
         default=1e-6,
-        help="Small constant used when standardizing correctness advantages.",
+        help="Small constant for the optional full-graph TF advantage standardization.",
     )
     parser.add_argument(
         "--edge_ig_warmup_iterations",
@@ -128,6 +138,22 @@ def set_experiment_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
+def resolve_graph_reward_sampling(
+    use_graph_tf_reward: bool,
+    full_graph_tf_reward_lambda: float,
+    prompt_token_cost_beta: float,
+    graph_sample_count: int,
+) -> bool:
+    beta = float(prompt_token_cost_beta)
+    if not math.isfinite(beta) or beta < 0.0:
+        raise ValueError("prompt_token_cost_beta must be finite and non-negative.")
+    if beta > 0.0 and int(graph_sample_count) < 2:
+        raise ValueError("--prompt_token_cost_beta > 0 requires --graph_sample_count >= 2.")
+    if full_graph_tf_reward_lambda != 0.0 and int(graph_sample_count) < 2:
+        raise ValueError("--full_graph_tf_reward_lambda requires --graph_sample_count >= 2.")
+    return bool(use_graph_tf_reward or full_graph_tf_reward_lambda != 0.0 or beta > 0.0)
+
+
 async def score_full_graph_teacher_forcing(
     graph,
     input_data: Dict[str, Any],
@@ -166,7 +192,13 @@ def experiment_summary_metadata(args: Any, dataset: str) -> Dict[str, Any]:
     full_graph_tf_lambda = float(
         getattr(args, "full_graph_tf_reward_lambda", 0.0)
     )
-    use_group_advantage = bool(getattr(args, "use_graph_tf_reward", False))
+    token_beta = float(getattr(args, "prompt_token_cost_beta", 0.1))
+    use_group_advantage = resolve_graph_reward_sampling(
+        bool(getattr(args, "use_graph_tf_reward", False)),
+        full_graph_tf_lambda,
+        token_beta,
+        int(getattr(args, "graph_sample_count", 8)),
+    )
     edge_rewards = []
     if edge_lambda != 0.0:
         edge_rewards.append(
@@ -190,10 +222,13 @@ def experiment_summary_metadata(args: Any, dataset: str) -> Dict[str, Any]:
         "seed": int(getattr(args, "seed", 42)),
         "reward": {
             "graph": (
-                "standardized_correctness"
+                "centered_correctness_minus_prompt_token_cost"
                 if use_group_advantage
                 else "binary_correctness"
             ),
+            "prompt_token_cost_beta": token_beta,
+            "prompt_token_cost_normalization": "within_question_max",
+            "prompt_token_cost_scope": "regular_rollout_including_final_decision",
             "edge": edge_rewards or ["none"],
             "lambda": edge_lambda,
             "full_graph_tf": (
@@ -338,16 +373,47 @@ def _standardized_advantages(
     *,
     advantage_epsilon: float,
 ) -> Tuple[float, List[float], float, float]:
+    baseline, advantages, variance, std = _centered_advantages(reward_scores)
+    if std > float(advantage_epsilon):
+        advantages = [value / std for value in advantages]
+    return baseline, advantages, variance, std
+
+
+def _centered_advantages(
+    reward_scores: Sequence[float],
+) -> Tuple[float, List[float], float, float]:
     if not reward_scores:
         return 0.0, [], 0.0, 0.0
     scores = [float(score) for score in reward_scores]
+    if not all(math.isfinite(score) for score in scores):
+        raise FloatingPointError("Non-finite graph reward.")
     baseline = sum(scores) / len(scores)
     advantages = [score - baseline for score in scores]
     variance = sum(value * value for value in advantages) / len(advantages)
     std = math.sqrt(variance)
-    if std > float(advantage_epsilon):
-        advantages = [value / std for value in advantages]
     return baseline, advantages, variance, std
+
+
+def token_aware_graph_utilities(
+    correctness_scores: Sequence[float],
+    prompt_tokens: Sequence[float],
+    beta: float,
+) -> Tuple[List[float], List[float]]:
+    """Return normalized prompt costs and utilities, without std rescaling."""
+    beta = float(beta)
+    if not math.isfinite(beta) or beta < 0.0:
+        raise ValueError("prompt_token_cost_beta must be finite and non-negative.")
+    if len(correctness_scores) != len(prompt_tokens):
+        raise ValueError("Prompt-token counts must align with graph correctness scores.")
+    tokens = [float(value) for value in prompt_tokens]
+    if not all(math.isfinite(value) and value >= 0.0 for value in tokens):
+        raise ValueError("Rollout prompt-token counts must be finite and non-negative.")
+    maximum = max(tokens, default=0.0)
+    costs = [value / maximum if maximum > 0.0 else 0.0 for value in tokens]
+    utilities = [float(score) - beta * cost for score, cost in zip(correctness_scores, costs)]
+    if not all(math.isfinite(value) for value in utilities):
+        raise FloatingPointError("Non-finite token-aware graph utility.")
+    return costs, utilities
 
 
 def edge_information_gain_loss(
@@ -469,8 +535,12 @@ def graph_correctness_advantage_edge_loss(
     advantage_epsilon: float = 1e-6,
     graph_tf_score_groups: Optional[Sequence[Sequence[float]]] = None,
     full_graph_tf_reward_lambda: float = 0.0,
+    prompt_token_cost_beta: float = 0.1,
 ) -> Tuple[torch.Tensor, List[Dict[str, Any]]]:
-    """Combine correctness, full-graph TF, and optional per-edge IG rewards."""
+    """Combine centered token-aware utility with unchanged graph TF and edge IG."""
+    prompt_token_cost_beta = float(prompt_token_cost_beta)
+    if not math.isfinite(prompt_token_cost_beta) or prompt_token_cost_beta < 0.0:
+        raise ValueError("prompt_token_cost_beta must be finite and non-negative.")
     if not (
         len(graph_groups)
         == len(graph_log_prob_groups)
@@ -493,6 +563,7 @@ def graph_correctness_advantage_edge_loss(
     zero = reference_loss.new_tensor(0.0)
     group_losses: List[torch.Tensor] = []
     group_correctness_losses: List[torch.Tensor] = []
+    group_token_cost_losses: List[torch.Tensor] = []
     group_graph_tf_losses: List[torch.Tensor] = []
     group_edge_ig_losses: List[torch.Tensor] = []
     summaries: List[Dict[str, Any]] = []
@@ -520,8 +591,20 @@ def graph_correctness_advantage_edge_loss(
                 "Each full-graph TF score group must align with graph samples."
             )
 
-        baseline, advantages, variance, std = _standardized_advantages(
-            scores, advantage_epsilon=advantage_epsilon
+        if prompt_token_cost_beta > 0.0 and len(graphs) < 2:
+            raise ValueError("Token-aware graph advantages require at least two samples.")
+        prompt_tokens = [getattr(graph, "rollout_prompt_tokens", None) for graph in graphs]
+        if prompt_token_cost_beta > 0.0 and any(value is None for value in prompt_tokens):
+            raise ValueError("Missing per-graph rollout prompt-token accounting.")
+        normalized_costs, utility_scores = token_aware_graph_utilities(
+            scores,
+            [0.0 if value is None else value for value in prompt_tokens],
+            prompt_token_cost_beta,
+        )
+        baseline, advantages, variance, std = _centered_advantages(scores)
+        cost_baseline, cost_advantages, _, _ = _centered_advantages(normalized_costs)
+        utility_baseline, utility_advantages, utility_variance, utility_std = (
+            _centered_advantages(utility_scores)
         )
         if graph_tf_scores:
             tf_baseline, tf_advantages, tf_variance, tf_std = (
@@ -535,6 +618,7 @@ def graph_correctness_advantage_edge_loss(
             tf_advantages = [0.0] * len(graphs)
         per_graph_losses = []
         correctness_losses = []
+        token_cost_losses = []
         graph_tf_losses = []
         edge_ig_losses = []
         edge_ig_records = []
@@ -543,8 +627,9 @@ def graph_correctness_advantage_edge_loss(
         missing_log_prob = 0
         missing_detail = 0
         missing_ig_gain = 0
-        for advantage, tf_advantage, graph, graph_log_prob, edge_details in zip(
+        for advantage, cost_advantage, tf_advantage, graph, graph_log_prob, edge_details in zip(
             advantages,
+            cost_advantages,
             tf_advantages,
             graphs,
             graph_log_probs,
@@ -554,6 +639,12 @@ def graph_correctness_advantage_edge_loss(
                 raise TypeError("Full graph log-prob must be a torch.Tensor.")
             correctness_loss = -(
                 graph_log_prob.new_tensor(float(advantage)) * graph_log_prob
+            )
+            # Together these are -(u_k - mean(u)) * log pi(G_k). Keep
+            # components separate only to measure their gradient magnitudes.
+            token_cost_loss = (
+                graph_log_prob.new_tensor(prompt_token_cost_beta * float(cost_advantage))
+                * graph_log_prob
             )
             graph_tf_loss = -(
                 graph_log_prob.new_tensor(
@@ -569,8 +660,9 @@ def graph_correctness_advantage_edge_loss(
                 edge_ig_reward_lambda=edge_ig_reward_lambda,
                 edge_ig_discount_factor=edge_ig_discount_factor,
             )
-            per_graph_losses.append(correctness_loss + graph_tf_loss + ig_loss)
+            per_graph_losses.append(correctness_loss + token_cost_loss + graph_tf_loss + ig_loss)
             correctness_losses.append(correctness_loss)
+            token_cost_losses.append(token_cost_loss)
             graph_tf_losses.append(graph_tf_loss)
             edge_ig_losses.append(ig_loss)
             edge_ig_records.extend(ig_summary.get("edge_ig_records", []))
@@ -589,6 +681,9 @@ def graph_correctness_advantage_edge_loss(
         group_correctness_losses.append(
             torch.mean(torch.stack(correctness_losses)) if correctness_losses else zero
         )
+        group_token_cost_losses.append(
+            torch.mean(torch.stack(token_cost_losses)) if token_cost_losses else zero
+        )
         group_graph_tf_losses.append(
             torch.mean(torch.stack(graph_tf_losses)) if graph_tf_losses else zero
         )
@@ -601,6 +696,16 @@ def graph_correctness_advantage_edge_loss(
             "correctness_variance": float(variance),
             "correctness_std": float(std),
             "correctness_advantages": [float(value) for value in advantages],
+            "rollout_prompt_tokens": prompt_tokens,
+            "normalized_prompt_token_costs": normalized_costs,
+            "prompt_token_cost_beta": prompt_token_cost_beta,
+            "prompt_token_cost_baseline": cost_baseline,
+            "token_aware_utilities": utility_scores,
+            "token_aware_baseline": utility_baseline,
+            "token_aware_variance": utility_variance,
+            "token_aware_std": utility_std,
+            "token_aware_advantages": utility_advantages,
+            "graph_advantage_normalization": "mean_center_only",
             "full_graph_tf_scores": [
                 float(value) for value in graph_tf_scores
             ],
@@ -637,6 +742,9 @@ def graph_correctness_advantage_edge_loss(
     correctness_norm = _loss_gradient_l2_norm(
         torch.mean(torch.stack(group_correctness_losses)), parameters
     )
+    token_cost_norm = _loss_gradient_l2_norm(
+        torch.mean(torch.stack(group_token_cost_losses)), parameters
+    )
     graph_tf_norm = _loss_gradient_l2_norm(
         torch.mean(torch.stack(group_graph_tf_losses)), parameters
     )
@@ -646,6 +754,7 @@ def graph_correctness_advantage_edge_loss(
     for summary in summaries:
         summary["batch_gradient_norms"] = {
             "correctness": correctness_norm,
+            "prompt_token_cost": token_cost_norm,
             "full_graph_tf": graph_tf_norm,
             "edge_ig": edge_ig_norm,
         }
@@ -657,6 +766,7 @@ def graph_correctness_advantage_edge_loss(
     print(
         "graph gradient norms: "
         f"correctness={correctness_norm:.6f}, "
+        f"prompt_token_cost={token_cost_norm:.6f}, "
         f"full_graph_tf={graph_tf_norm:.6f}, "
         f"edge_ig={edge_ig_norm:.6f}, "
         f"avg_edges={sum(edge_counts) / len(edge_counts) if edge_counts else 0.0:.2f}"
