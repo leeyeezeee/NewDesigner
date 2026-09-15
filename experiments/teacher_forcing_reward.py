@@ -91,19 +91,21 @@ def add_teacher_forcing_reward_args(parser) -> None:
         "--refine_rank",
         type=int,
         default=4,
-        help="Rank of the G-Designer Z W Z^T refinement decoder.",
+        help="Deprecated compatibility option; the direct-affinity decoder ignores rank.",
     )
     parser.add_argument(
         "--anchor_reg_weight",
         type=float,
         default=0.0,
-        help="Weight of the G-Designer sketch/anchor Frobenius penalty.",
+        choices=[0.0],
+        help="Legacy refinement option; must remain 0 with the direct-affinity decoder.",
     )
     parser.add_argument(
         "--sparsity_reg_weight",
         type=float,
         default=0.0,
-        help="Weight of the nuclear-norm penalty on refinement matrix W.",
+        choices=[0.0],
+        help="Legacy refinement option; must remain 0 with the direct-affinity decoder.",
     )
 
 

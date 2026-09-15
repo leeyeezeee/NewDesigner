@@ -28,7 +28,7 @@ Download MMLU, HumanEval and GSM8K datasets from MMLU, HumanEval and GSM8K. And 
 ### Run GDesigner on MMLU by running the following scripts
 
 ```bash
-python experiments/run_mmlu.py --mode FullConnected --batch_size 4 --agent_nums 6 --num_iterations 10 --num_rounds 1 --optimized_spatial
+python experiments/run_mmlu.py --mode FullConnected --batch_size 4 --agent_nums 6 --num_iterations 30 --num_rounds 1 --optimized_spatial
 ```
 
 The above code verifies the experimental results of the `mmlu` dataset under different topologies.
@@ -38,16 +38,31 @@ We also provide experimental code for other datasets and topologies.You can refe
 For example, if you want to verify the results on the `gsm8k` dataset, you can execute the following command
 
 ```bash
-python experiments/run_gsm8k.py --mode FullConnected --batch_size 4 --agent_nums 4 --num_iterations 10 --num_rounds 1 --optimized_spatial
+python experiments/run_gsm8k.py --mode FullConnected --batch_size 4 --agent_nums 4 --num_iterations 30 --num_rounds 1 --optimized_spatial
 ```
 
-The optimized topology combines G-Designer's low-rank refinement regularization
-with IGPO-style teacher forcing. `--use_graph_tf_reward` enables multi-graph
-mean-centered graph advantages, while `--edge_ig_reward_lambda` adds per-edge
-teacher-forcing information gain. Within-round downstream edge rewards use a
-default discount factor of 0.2. The refinement rank defaults to 4. The
-optional anchor and nuclear-norm penalties default to 0 and can be enabled with
-`--anchor_reg_weight` and `--sparsity_reg_weight`:
+The optimized spatial topology samples Bernoulli decisions directly from the
+existing task-conditioned, directed affinity logits. It does not apply SVD,
+low-rank projection, or probability clipping. `--refine_rank` is accepted only
+for compatibility and has no effect; `--anchor_reg_weight` and
+`--sparsity_reg_weight` must remain 0. Old low-rank checkpoints require
+retraining because the decoder's probability mapping has changed.
+
+All six dataset entry points default to **30 optimizer updates**
+(`--num_iterations 30`), not 30 epochs. With batch size 4 and 8 graph samples,
+this means 120 question positions and 960 graph rollouts. The non-MMLU runners
+reserve the first 10 batches for training (`--train_split_batches 10`) and
+always evaluate on the same remaining full batches. Thirty updates cycle over
+that fixed training prefix three times, so the training/evaluation sample split
+matches the original 10-update default. Incomplete trailing batches remain
+excluded as before. `--num_iterations` changes the update budget only; it no
+longer changes the evaluation subset. MMLU continues to use dev for training
+and val for evaluation. If an earlier run used a different training boundary,
+set `--train_split_batches` to that historical number of batches.
+
+`--use_graph_tf_reward` enables multi-graph mean-centered graph advantages,
+while `--edge_ig_reward_lambda` adds per-edge teacher-forcing information gain.
+Within-round downstream edge rewards retain a default discount factor of 0.2.
 
 Graph utility is `u_k = correctness_k - beta * T_k / max_l(T_l)`, with the
 maximum taken only over samples of the same question. The graph advantage is
@@ -67,7 +82,7 @@ The existing `avg_communication_tokens` metric still counts prompt + completion.
 
 Edge IG still uses `lambda * tanh(discounted_IG / temperature)` and is summed over
 selected edges. The graph log-probability is itself a sum over sampled decisions
-(including rejected/absent edges sampled with action 0), so its graph advantage
+(including absent edges sampled with action 0), so its graph advantage
 already acts on each decision. No additional edge-count division is applied.
 The optional full-graph TF ablation remains separately standardized and defaults
 to weight 0; its behavior and the edge-IG settings are unchanged.
@@ -84,8 +99,13 @@ The dataset summary remains the append-only `result/<dataset>.jsonl` file.
 
 Only agent nodes belong to the learned adjacency matrices. After all agent
 rounds finish, an external decision node receives every agent's latest answer
-and produces the final result. The effective refinement rank is capped below
-the number of agent nodes so the decoder remains genuinely low-rank.
+and produces the final result. Rank no longer restricts the spatial decoder.
+
+Temporal optimization remains opt-in via `--optimized_temporal`. By default,
+temporal logits do not require gradients and are excluded from the optimizer.
+The existing fixed temporal branch still checks spatial reachability, so its
+realized edge set can vary with the spatial graph even though its parameters
+are not learned. This temporal behavior is unchanged.
 
 As in the original G-Designer implementation, the default FullConnected mask
 makes every non-self agent direction eligible. Edges are considered

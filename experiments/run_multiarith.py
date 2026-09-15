@@ -8,6 +8,7 @@ sys.stdout.reconfigure(encoding="utf-8")
 from datasets.gsm8k_dataset import gsm_get_predict, multiarith_data_process
 from GDesigner.tools.reader.readers import JSONReader
 from GDesigner.utils.const import GDesigner_ROOT
+from experiments.training_schedule import add_training_split_args
 from experiments.teacher_forcing_reward import (
     add_full_graph_reward_ablation_args,
     add_teacher_forcing_reward_args,
@@ -29,7 +30,7 @@ def parse_args():
     parser.add_argument("--lr", type=float, default=0.001)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--num_rounds", type=int, default=2)
-    parser.add_argument("--num_iterations", type=int, default=10)
+    parser.add_argument("--num_iterations", type=int, default=30)
     parser.add_argument("--imp_per_iterations", type=int, default=5,
                         help="Prune temporal edges every few iterations when --optimized_temporal is set.")
     parser.add_argument("--pruning_rate", type=float, default=0.25,
@@ -42,6 +43,7 @@ def parse_args():
     parser.add_argument("--checkpoint_file", type=str, default="result/checkpoints/multiarith.pt",
                         help="Path to overwrite with the trained graph checkpoint.")
     add_teacher_forcing_reward_args(parser)
+    add_training_split_args(parser)
     add_full_graph_reward_ablation_args(parser)
     parser.add_argument("--optimized_spatial", action="store_true")
     parser.add_argument("--optimized_temporal", action="store_true")

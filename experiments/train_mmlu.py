@@ -32,7 +32,7 @@ from experiments.edge_training_log import (
 async def train(graph:Graph,
             dataset,
             edge_training_log_path: Path,
-            num_iters:int=100,
+            num_iters:int=30,
             num_rounds:int=1,
             lr:float=0.001,
             batch_size:int = 4,
@@ -123,7 +123,6 @@ async def train(graph:Graph,
                 realized_graph.gat = graph.gat
                 realized_graph.edge_mlp = graph.edge_mlp
                 realized_graph.spatial_affinity = graph.spatial_affinity
-                realized_graph.refinement_weight = graph.refinement_weight
                 realized_graph.temporal_logits = graph.temporal_logits
                 group_indices.append(len(realized_graphs))
                 realized_graphs.append(realized_graph)

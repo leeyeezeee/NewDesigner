@@ -104,7 +104,7 @@ class Graph(ABC):
         node_feature_dim = self.features.size(1)
         topology_input_dim = node_feature_dim * 2
         self.spatial_policy_architecture = (
-            "initial_residual_gatv2_affinity_low_rank_dynamic_cycle_external_decision_v7"
+            "initial_residual_gatv2_direct_affinity_dynamic_cycle_external_decision_v8"
         )
         self.gat = InitialResidualGATv2Encoder(
             topology_input_dim,
@@ -123,21 +123,9 @@ class Graph(ABC):
         self.spatial_affinity = spectral_norm(affinity)
         self.spatial_affinity.requires_grad_(optimized_spatial)
 
-        # Keep the task-conditioned affinity decoder and refine its sketched
-        # adjacency with the low-rank decoder from G-Designer Eq. (14).
-        self.anchor_spatial_matrix = fixed_spatial_masks.reshape(
-            agent_node_count,
-            agent_node_count,
-        ).float()
-        # Keep the decoder genuinely low-rank. Once the external decision node
-        # is removed, allowing rank == agent_node_count would initialize
-        # Z W Z^T as the identity and collapse every off-diagonal agent edge.
-        max_refine_rank = max(1, agent_node_count - 1)
-        self.refine_rank = min(max(1, int(refine_rank)), max_refine_rank)
-        self.refinement_weight = torch.nn.Parameter(
-            torch.eye(self.refine_rank),
-            requires_grad=optimized_spatial,
-        )
+        # Retain the legacy rank argument for command-line compatibility only.
+        # Direct affinity logits have no SVD refinement or trainable matrix W.
+        self.refine_rank = 0
         self.refinement_anchor_loss = torch.tensor(0.0)
         self.refinement_sparse_loss = torch.tensor(0.0)
         self.spatial_edge_probabilities: Optional[torch.Tensor] = None
@@ -155,8 +143,6 @@ class Graph(ABC):
         parameters = list(self.gat.parameters())
         parameters.extend(self.edge_mlp.parameters())
         parameters.extend(self.spatial_affinity.parameters())
-        if self.refinement_weight.requires_grad:
-            parameters.append(self.refinement_weight)
         return [parameter for parameter in parameters if parameter.requires_grad]
 
     @staticmethod
@@ -350,7 +336,7 @@ class Graph(ABC):
                     "Spatial affinity produced non-finite edge logits: "
                     f"{nonfinite}/{affinity_scores.numel()} values."
                 )
-            self.spatial_logits = self._refine_spatial_logits(affinity_scores)
+            self.spatial_logits = self._affinity_spatial_logits(affinity_scores)
             valid_mask = self.spatial_masks.reshape(-1) > 0
             valid_logits = self.spatial_logits[valid_mask]
             valid_probabilities = self.spatial_edge_probabilities[valid_mask]
@@ -436,80 +422,22 @@ class Graph(ABC):
             with torch.no_grad():
                 _compute_spatial_logits()
 
-    def _reset_refinement_losses(
-            self,
-            reference: Optional[torch.Tensor] = None,
-            ) -> None:
-        if reference is None:
-            reference = self.refinement_weight
-        self.refinement_anchor_loss = reference.new_tensor(0.0)
-        self.refinement_sparse_loss = reference.new_tensor(0.0)
-
-    def _refine_spatial_logits(
+    def _affinity_spatial_logits(
             self,
             raw_spatial_logits: torch.Tensor,
             ) -> torch.Tensor:
-        """Apply the G-Designer low-rank refinement decoder.
-
-        ``spatial_affinity`` remains the task-conditioned affinity matrix.  A
-        separate ``refinement_weight`` parameter is used as W in Z W Z^T so
-        the two learned matrices cannot accidentally overwrite one another.
-        """
-        raw_matrix = raw_spatial_logits.reshape(self.num_nodes, self.num_nodes)
-        mask = self.spatial_masks.reshape(self.num_nodes, self.num_nodes).to(
-            device=raw_matrix.device,
-            dtype=raw_matrix.dtype,
-        )
-        # G-Designer's sketch is dense; the execution mask defines which
-        # refined entries may become communication edges.
-        dense_sketched_adj = torch.sigmoid(
-            raw_matrix / max(float(self.spatial_sampling_temperature), 1e-6)
-        )
-
-        if not self.optimized_spatial:
-            self._reset_refinement_losses(raw_matrix)
-            probabilities = (dense_sketched_adj * mask).clamp(
-                1e-6,
-                1.0 - 1e-6,
-            )
-            self.spatial_edge_probabilities = probabilities.reshape(-1)
-            return torch.logit(probabilities).reshape(-1)
-
-        anchor_adj = self.anchor_spatial_matrix.to(
-            device=raw_matrix.device,
-            dtype=raw_matrix.dtype,
-        )
-        rank = min(self.refine_rank, self.num_nodes)
-        left_singular_vectors, _, _ = torch.linalg.svd(
-            dense_sketched_adj,
-            full_matrices=False,
-        )
-        basis = left_singular_vectors[:, :rank]
-        refinement_weight = self.refinement_weight[:rank, :rank].to(
-            device=raw_matrix.device,
-            dtype=raw_matrix.dtype,
-        )
-        refined_adj = basis @ refinement_weight @ basis.t()
-
-        self.refinement_anchor_loss = (
-            0.5
-            * torch.linalg.matrix_norm(
-                dense_sketched_adj - refined_adj,
-                ord="fro",
-            ).pow(2)
-            + 0.5
-            * torch.linalg.matrix_norm(
-                anchor_adj - refined_adj,
-                ord="fro",
-            ).pow(2)
-        )
-        self.refinement_sparse_loss = torch.linalg.svdvals(
-            refinement_weight
-        ).sum()
-
-        probabilities = (refined_adj * mask).clamp(1e-6, 1.0 - 1e-6)
-        self.spatial_edge_probabilities = probabilities.reshape(-1)
-        return torch.logit(probabilities).reshape(-1)
+        """Pass directed affinity logits to Bernoulli without probability clipping."""
+        temperature = float(self.spatial_sampling_temperature)
+        if not math.isfinite(temperature) or temperature <= 0.0:
+            raise ValueError("Spatial sampling temperature must be finite and positive.")
+        logits = raw_spatial_logits.reshape(-1) / temperature
+        # Probabilities are diagnostics only. Sampling consumes logits directly;
+        # construct_spatial_connection enforces masks and dynamic cycle checks.
+        mask = self.spatial_masks.reshape(-1).to(device=logits.device) > 0
+        self.spatial_edge_probabilities = torch.sigmoid(logits) * mask
+        self.refinement_anchor_loss = logits.new_tensor(0.0)
+        self.refinement_sparse_loss = logits.new_tensor(0.0)
+        return logits
 
     @property
     def spatial_adj_matrix(self):

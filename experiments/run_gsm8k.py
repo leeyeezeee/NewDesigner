@@ -31,6 +31,7 @@ from datasets.gsm8k_dataset import gsm_data_process,gsm_get_predict
 from experiments.checkpoint import save_graph_checkpoint
 from experiments.graph_concurrency import limited_graph_arun, make_graph_semaphore
 from experiments.refinement_loss import refinement_regularization_loss
+from experiments.training_schedule import add_training_split_args, fixed_split_schedule
 from experiments.teacher_forcing_reward import (
     add_full_graph_reward_ablation_args,
     add_teacher_forcing_reward_args,
@@ -73,8 +74,9 @@ def parse_args():
     parser.add_argument('--imp_per_iterations', type=int, default=5,
                         help="Prune temporal edges every few iterations when --optimized_temporal is set.")
     add_teacher_forcing_reward_args(parser)
+    add_training_split_args(parser)
     add_full_graph_reward_ablation_args(parser)
-    parser.add_argument('--num_iterations', type=int, default=10,help="The num of training iterations.")
+    parser.add_argument('--num_iterations', type=int, default=30,help="The num of training iterations.")
     parser.add_argument('--domain', type=str, default="gsm8k",help="Domain (the same as dataset name), default 'gsm8k'")
     parser.add_argument('--agent_names', nargs='+', type=str, default=['MathSolver'],
                         help='Specify agent names as a list of strings')
@@ -103,6 +105,12 @@ async def main():
     reset_usage_counters()
     dataset = JSONLReader.parse_file(args.dataset_json)
     dataset = gsm_data_process(dataset)
+    optimize_enabled = args.optimized_spatial or args.optimized_temporal
+    train_split_batches = int(getattr(args, "train_split_batches", 10))
+    schedule = fixed_split_schedule(
+        len(dataset), args.batch_size, args.num_iterations,
+        train_split_batches=train_split_batches, optimize_enabled=optimize_enabled,
+    )
     current_time = Time.instance().value or time.strftime("%Y-%m-%d-%H-%M-%S", time.localtime())
     Time.instance().value = current_time
 
@@ -141,7 +149,6 @@ async def main():
         use_graph_tf_reward, full_graph_tf_reward_lambda,
         prompt_token_cost_beta, args.graph_sample_count,
     )
-    optimize_enabled = args.optimized_spatial or args.optimized_temporal
     record_edge_ig = (
         optimize_enabled
         and edge_ig_reward_lambda != 0.0
@@ -156,15 +163,18 @@ async def main():
     )
     graph_semaphore = make_graph_semaphore(args.max_concurrent_graphs)
 
-    num_batches = int(len(dataset)/args.batch_size)
     total_solved, total_executed = (0, 0)
     total_edges, edge_samples = (0, 0)
     accuracy = 0.0
     train_usage = {"cost": 0.0, "prompt_tokens": 0.0, "completion_tokens": 0.0, "llm_calls": 0.0}
     train_wall_start = time.time()
 
-    for i_batch in range(num_batches):
-        train_updates_enabled = optimize_enabled and i_batch < args.num_iterations
+    if not optimize_enabled or args.num_iterations == 0:
+        graph.gat.eval()
+        graph.edge_mlp.eval()
+        graph.spatial_affinity.eval()
+
+    for i_batch, (dataset_batch_idx, train_updates_enabled) in enumerate(schedule):
         edge_ig_measurement_enabled = (
             train_updates_enabled
             and i_batch >= max(0, int(args.edge_ig_warmup_iterations))
@@ -187,14 +197,14 @@ async def main():
         batch_correctness: List[float] = []
         rollout_usage_before = usage_snapshot()
 
-        current_batch = dataloader(dataset,args.batch_size,i_batch)
+        current_batch = dataloader(dataset,args.batch_size,dataset_batch_idx)
         if current_batch is None:
             print("No more data available.")
             break
 
         for i_record, record in enumerate(current_batch):
             question_ids.append(resolve_question_id(
-                record, i_batch * args.batch_size + i_record
+                record, dataset_batch_idx * args.batch_size + i_record
             ))
             task = record["task"]
             answer = record["answer"]
@@ -212,7 +222,6 @@ async def main():
                 realized_graph.gat = graph.gat
                 realized_graph.edge_mlp = graph.edge_mlp
                 realized_graph.spatial_affinity = graph.spatial_affinity
-                realized_graph.refinement_weight = graph.refinement_weight
                 realized_graph.temporal_logits = graph.temporal_logits
                 group_indices.append(len(realized_graphs))
                 realized_graphs.append(realized_graph)
@@ -468,7 +477,7 @@ async def main():
         print("nuclear sparsity loss:", sparse_loss.item())
         print("loss:", total_loss.item())
 
-        if i_batch+1 == args.num_iterations:
+        if train_updates_enabled and i_batch+1 == args.num_iterations:
             train_usage = usage_snapshot()
             train_wall_seconds = time.time() - train_wall_start
             save_graph_checkpoint(
@@ -508,6 +517,11 @@ async def main():
         "avg_edges": avg_edges,
         "llm_name": args.llm_name,
         **experiment_summary_metadata(args, "gsm8k"),
+        "train_split_batches": train_split_batches,
+        "train_split_questions": train_split_batches * args.batch_size,
+        "eval_split_questions": (len(dataset) // args.batch_size - train_split_batches) * args.batch_size,
+        "dropped_tail_questions": len(dataset) % args.batch_size,
+        "optimizer_updates": args.num_iterations if optimize_enabled else 0,
         "train_llm_calls": int(train_usage["llm_calls"]),
         "train_prompt_tokens": int(train_usage["prompt_tokens"]),
         "train_completion_tokens": int(train_usage["completion_tokens"]),

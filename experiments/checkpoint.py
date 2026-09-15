@@ -44,8 +44,6 @@ def save_graph_checkpoint(
             "gat_state_dict": graph.gat.state_dict(),
             "edge_mlp_state_dict": graph.edge_mlp.state_dict(),
             "spatial_affinity_state_dict": graph.spatial_affinity.state_dict(),
-            "refine_rank": int(graph.refine_rank),
-            "refinement_weight": graph.refinement_weight.detach().cpu(),
             "spatial_masks": graph.spatial_masks.detach().cpu(),
             "temporal_logits": graph.temporal_logits.detach().cpu(),
             "temporal_masks": graph.temporal_masks.detach().cpu(),
@@ -100,16 +98,13 @@ def load_graph_checkpoint(
     if "gat_state_dict" in graph_state:
         checkpoint_architecture = graph_state.get("spatial_policy_architecture")
         expected_architecture = graph.spatial_policy_architecture
-        if (
-            checkpoint_architecture is not None
-            and checkpoint_architecture != expected_architecture
-        ):
+        if checkpoint_architecture != expected_architecture:
             raise ValueError(
                 "Checkpoint spatial policy architecture "
                 f"{checkpoint_architecture!r} is incompatible with the current "
                 f"architecture {expected_architecture!r}. Retrain the spatial "
-                "policy because the GATv2 bottleneck + MLP decoder is not "
-                "shape-compatible with older checkpoints."
+                "policy: the direct-affinity decoder changes edge probabilities "
+                "and cannot resume a low-rank or unversioned checkpoint."
             )
         graph.gat.load_state_dict(graph_state["gat_state_dict"])
         if "edge_mlp_state_dict" not in graph_state:
@@ -149,16 +144,6 @@ def load_graph_checkpoint(
             graph_state["spatial_affinity_weight"],
             "spatial_affinity_weight",
         )
-    if "refinement_weight" not in graph_state:
-        raise ValueError(
-            "Checkpoint is missing the G-Designer refinement matrix W. "
-            "Retrain with the low-rank refinement architecture."
-        )
-    _copy_parameter(
-        graph.refinement_weight,
-        graph_state["refinement_weight"],
-        "refinement_weight",
-    )
     if "temporal_logits" in graph_state:
         _copy_temporal_logits(graph, graph_state["temporal_logits"])
     if "spatial_masks" in graph_state:

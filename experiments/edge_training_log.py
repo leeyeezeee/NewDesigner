@@ -417,6 +417,7 @@ def append_topology_diagnostics(
             "sample_minus_expected_edges": avg_sampled_edges - expected_edges,
         },
         "refinement": {
+            "enabled": False,
             "rank": int(getattr(graphs[0], "refine_rank", 0)),
             "anchor_loss": _mean(
                 float(graph.refinement_anchor_loss.detach().cpu().item())

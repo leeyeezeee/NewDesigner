@@ -45,8 +45,8 @@ def parse_args():
                         help='Specify agent names as a list of strings')
     parser.add_argument('--agent_nums', nargs='+', type=int, default=[5],
                         help='Specify the number of agents for each name in agent_names')
-    parser.add_argument('--num_iterations', type=int, default=10,
-                        help="Number of optimization iterations. Default 10.")
+    parser.add_argument('--num_iterations', type=int, default=30,
+                        help="Number of optimization iterations. Default 30.")
     parser.add_argument('--imp_per_iterations', type=int, default=5,
                         help="Prune temporal edges every few iterations when --optimized_temporal is set.")
     parser.add_argument('--num_rounds',type=int,default=2,
