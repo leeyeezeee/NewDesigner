@@ -69,15 +69,15 @@ class TokenAwareRewardTests(unittest.TestCase):
         parser = argparse.ArgumentParser()
         add_teacher_forcing_reward_args(parser)
         args = parser.parse_args([])
-        self.assertEqual(args.prompt_token_cost_beta, 0.1)
-        self.assertTrue(resolve_graph_reward_sampling(False, 0, 0.1, 8))
+        self.assertEqual(args.prompt_token_cost_beta, 0.5)
+        self.assertTrue(resolve_graph_reward_sampling(False, 0, 0.5, 8))
         self.assertFalse(resolve_graph_reward_sampling(False, 0, 0, 1))
         self.assertTrue(resolve_graph_reward_sampling(True, 0, 0, 8))
         with self.assertRaises(ValueError):
-            resolve_graph_reward_sampling(False, 0, 0.1, 1)
+            resolve_graph_reward_sampling(False, 0, 0.5, 1)
         reward = experiment_summary_metadata(args, "mmlu")["reward"]
         self.assertEqual(reward["graph"], "centered_correctness_minus_prompt_token_cost")
-        self.assertEqual(reward["prompt_token_cost_beta"], 0.1)
+        self.assertEqual(reward["prompt_token_cost_beta"], 0.5)
 
     def test_graph_and_edge_objectives_have_identical_gradients(self):
         theta = torch.nn.Parameter(torch.tensor([0.2, -0.4, 0.6], dtype=torch.float64))

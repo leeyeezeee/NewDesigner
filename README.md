@@ -52,7 +52,7 @@ optional anchor and nuclear-norm penalties default to 0 and can be enabled with
 Graph utility is `u_k = correctness_k - beta * T_k / max_l(T_l)`, with the
 maximum taken only over samples of the same question. The graph advantage is
 `u_k - mean_l(u_l)`; it is **not** divided by the group standard deviation.
-`--prompt_token_cost_beta` defaults to **0.1**. Positive beta enables grouped
+`--prompt_token_cost_beta` defaults to **0.5**. Positive beta enables grouped
 training (`--graph_sample_count`, default 8, must be at least 2). Set beta to 0
 to disable cost; `--use_graph_tf_reward` still enables centered correctness
 advantages in that case. Without either group option or full-graph TF, the

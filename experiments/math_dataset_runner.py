@@ -110,7 +110,7 @@ async def run_math_dataset(
     full_graph_tf_reward_lambda = float(
         getattr(args, "full_graph_tf_reward_lambda", 0.0)
     )
-    prompt_token_cost_beta = float(getattr(args, "prompt_token_cost_beta", 0.1))
+    prompt_token_cost_beta = float(getattr(args, "prompt_token_cost_beta", 0.5))
     use_multi_graph_reward = resolve_graph_reward_sampling(
         use_graph_tf_reward, full_graph_tf_reward_lambda,
         prompt_token_cost_beta, int(getattr(args, "graph_sample_count", 8)),

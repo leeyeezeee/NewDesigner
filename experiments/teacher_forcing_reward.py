@@ -38,7 +38,7 @@ def add_teacher_forcing_reward_args(parser) -> None:
     parser.add_argument(
         "--prompt_token_cost_beta",
         type=float,
-        default=0.1,
+        default=0.5,
         help=(
             "Graph utility is correctness minus beta * rollout prompt tokens / "
             "the within-question maximum. Positive beta enables grouped sampling "
@@ -192,7 +192,7 @@ def experiment_summary_metadata(args: Any, dataset: str) -> Dict[str, Any]:
     full_graph_tf_lambda = float(
         getattr(args, "full_graph_tf_reward_lambda", 0.0)
     )
-    token_beta = float(getattr(args, "prompt_token_cost_beta", 0.1))
+    token_beta = float(getattr(args, "prompt_token_cost_beta", 0.5))
     use_group_advantage = resolve_graph_reward_sampling(
         bool(getattr(args, "use_graph_tf_reward", False)),
         full_graph_tf_lambda,
@@ -535,7 +535,7 @@ def graph_correctness_advantage_edge_loss(
     advantage_epsilon: float = 1e-6,
     graph_tf_score_groups: Optional[Sequence[Sequence[float]]] = None,
     full_graph_tf_reward_lambda: float = 0.0,
-    prompt_token_cost_beta: float = 0.1,
+    prompt_token_cost_beta: float = 0.5,
 ) -> Tuple[torch.Tensor, List[Dict[str, Any]]]:
     """Combine centered token-aware utility with unchanged graph TF and edge IG."""
     prompt_token_cost_beta = float(prompt_token_cost_beta)
