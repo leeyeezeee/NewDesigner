@@ -15,8 +15,6 @@ class TrainingScheduleTests(unittest.TestCase):
             'datasets/AQuA/AQuA.jsonl',
             'datasets/gsm8k/gsm8k.jsonl',
             'datasets/humaneval/humaneval-py.jsonl',
-            'datasets/MultiArith/MultiArith.json',
-            'datasets/SVAMP/SVAMP.json',
         ]
         for relative in paths:
             path = ROOT / relative
@@ -40,6 +38,16 @@ class TrainingScheduleTests(unittest.TestCase):
                     if updates == 30:
                         self.assertEqual(train_ids, historical_train * 3)
                     self.assertEqual([records[i] for i in eval_ids], [records[i] for i in historical_eval])
+
+    def test_shared_math_schedule_is_independent_of_dataset_length(self):
+        # MultiArith/SVAMP data files are downloaded separately and not tracked.
+        # Both use the same math runner; exercise a range of prefix/suffix sizes.
+        for size in [44, 127, 600, 1000]:
+            for batch_size in [1, 4]:
+                old = fixed_split_schedule(size, batch_size, 10)
+                new = fixed_split_schedule(size, batch_size, 30)
+                self.assertEqual([idx for idx, train in old if not train],
+                                 [idx for idx, train in new if not train])
 
     def test_short_training_and_fixed_baseline_keep_evaluation_suffix(self):
         for updates, enabled in [(0, True), (3, True), (30, False)]:
